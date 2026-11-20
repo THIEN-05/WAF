@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"sync"
@@ -79,16 +80,32 @@ func (h *Histogram) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	out := firstErrorWriter{writer: w}
 	for phase, counts := range h.counts {
 		for i, b := range h.bounds {
-			fmt.Fprintf(w, "edge_phase_duration_seconds_bucket{phase=%q,le=%q} %d\n", phase, strconv.FormatFloat(b, 'f', -1, 64), counts[i])
+			out.Printf("edge_phase_duration_seconds_bucket{phase=%q,le=%q} %d\n", phase, strconv.FormatFloat(b, 'f', -1, 64), counts[i])
 		}
-		fmt.Fprintf(w, "edge_phase_duration_seconds_bucket{phase=%q,le=\"+Inf\"} %d\n", phase, counts[len(h.bounds)])
-		fmt.Fprintf(w, "edge_phase_duration_seconds_sum{phase=%q} %f\n", phase, h.sums[phase])
-		fmt.Fprintf(w, "edge_phase_duration_seconds_count{phase=%q} %d\n", phase, counts[len(h.bounds)])
+		out.Printf("edge_phase_duration_seconds_bucket{phase=%q,le=\"+Inf\"} %d\n", phase, counts[len(h.bounds)])
+		out.Printf("edge_phase_duration_seconds_sum{phase=%q} %f\n", phase, h.sums[phase])
+		out.Printf("edge_phase_duration_seconds_count{phase=%q} %d\n", phase, counts[len(h.bounds)])
 	}
 	for action, count := range h.blocked {
-		fmt.Fprintf(w, "edge_blocked_total{action=%q} %d\n", action, count)
+		out.Printf("edge_blocked_total{action=%q} %d\n", action, count)
 	}
-	fmt.Fprintf(w, "edge_log_dropped_total %d\n", h.logDropped)
+	out.Printf("edge_log_dropped_total %d\n", h.logDropped)
+	if out.err != nil {
+		log.Printf("metrics exporter: lỗi ghi phản hồi: %v", out.err)
+	}
+}
+
+type firstErrorWriter struct {
+	writer http.ResponseWriter
+	err    error
+}
+
+func (w *firstErrorWriter) Printf(format string, args ...any) {
+	if w.err != nil {
+		return
+	}
+	_, w.err = fmt.Fprintf(w.writer, format, args...)
 }

@@ -72,13 +72,14 @@ type AccessConfig struct {
 }
 
 type RateLimit struct {
-	ID      string `json:"id" yaml:"id"`
-	Match   string `json:"match" yaml:"match"`
-	Key     string `json:"key" yaml:"key"`
-	Limit   uint64 `json:"limit" yaml:"limit"`
-	WindowS uint32 `json:"window_s" yaml:"window_s"`
-	Action  string `json:"action" yaml:"action"`
-	BanS    uint32 `json:"ban_s" yaml:"ban_s"`
+	ID        string `json:"id" yaml:"id"`
+	Match     string `json:"match" yaml:"match"`
+	Key       string `json:"key" yaml:"key"`
+	Algorithm string `json:"algorithm,omitempty" yaml:"algorithm,omitempty"`
+	Limit     uint64 `json:"limit" yaml:"limit"`
+	WindowS   uint32 `json:"window_s" yaml:"window_s"`
+	Action    string `json:"action" yaml:"action"`
+	BanS      uint32 `json:"ban_s" yaml:"ban_s"`
 }
 
 type Rule struct {
@@ -200,6 +201,16 @@ func (s Snapshot) Validate() error {
 			}
 			if rl.Limit == 0 || rl.WindowS == 0 {
 				errs = append(errs, fmt.Sprintf("%s.rate_limits[%d]: limit and window_s must be greater than zero", p, j))
+			}
+			if rl.Algorithm != "" && rl.Algorithm != "token_bucket" && rl.Algorithm != "sliding_window" {
+				errs = append(errs, fmt.Sprintf("%s.rate_limits[%d].algorithm: must be token_bucket or sliding_window", p, j))
+			}
+			validKey := rl.Key == "ip" || rl.Key == "ip+path" || rl.Key == "ja3" || rl.Key == "site" || strings.HasPrefix(rl.Key, "header:") || strings.HasPrefix(rl.Key, "cookie:")
+			if !validKey || (strings.HasPrefix(rl.Key, "header:") && strings.TrimSpace(strings.TrimPrefix(rl.Key, "header:")) == "") || (strings.HasPrefix(rl.Key, "cookie:") && strings.TrimSpace(strings.TrimPrefix(rl.Key, "cookie:")) == "") {
+				errs = append(errs, fmt.Sprintf("%s.rate_limits[%d].key: unsupported counter key %q", p, j, rl.Key))
+			}
+			if rl.Action != "block" && rl.Action != "challenge" && rl.Action != "throttle" {
+				errs = append(errs, fmt.Sprintf("%s.rate_limits[%d].action: must be block, challenge, or throttle", p, j))
 			}
 		}
 		for j, cidr := range append(append([]string{}, site.Access.AllowIPs...), site.Access.BlockIPs...) {

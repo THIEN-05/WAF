@@ -13,8 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/example/wafplatform/edge/internal/access"
 	"github.com/example/wafplatform/edge/internal/pipeline"
 	"github.com/example/wafplatform/edge/internal/proxy"
+	"github.com/example/wafplatform/edge/internal/ratelimit"
 	"github.com/example/wafplatform/edge/internal/reqctx"
 	"github.com/example/wafplatform/edge/internal/response"
 	"github.com/example/wafplatform/edge/internal/router"
@@ -25,7 +27,13 @@ type Edge struct {
 	runtime      atomic.Pointer[runtimeConfig]
 	metrics      pipeline.Metrics
 	histogram    *pipeline.Histogram
-	pipeline     *pipeline.Pipeline
+	pipeline     atomic.Pointer[pipeline.Pipeline]
+	trafficMu    sync.Mutex
+	banTable     *access.BanTable
+	geoResolver  access.GeoResolver
+	globalBlocks *access.PrefixTree
+	underAttack  access.UnderAttack
+	rateLimiter  *ratelimit.Limiter
 	ready        atomic.Bool
 	via          string
 	security     response.SecurityHeaders
@@ -45,7 +53,10 @@ func New(s *wafcore.Snapshot, via string) *Edge {
 	h := pipeline.NewHistogram()
 	healthCtx, healthCancel := context.WithCancel(context.Background())
 	e := &Edge{via: via, metrics: h, histogram: h, poolFactory: proxy.NewOriginPool, pools: map[string]*proxy.OriginPool{}, healthCtx: healthCtx, healthCancel: healthCancel}
-	e.pipeline = pipeline.New(e.metrics)
+	e.banTable = access.NewBanTable(100_000, time.Now)
+	e.rateLimiter = ratelimit.NewLimiter(ratelimit.Config{})
+	e.underAttack = access.DisabledUnderAttack{}
+	e.installTrafficPipelineLocked()
 	if s != nil {
 		e.Apply(s)
 	}
@@ -64,6 +75,34 @@ func (e *Edge) Apply(s *wafcore.Snapshot) {
 }
 func (e *Edge) SetReady(v bool)                                     { e.ready.Store(v) }
 func (e *Edge) SetSecurityHeaders(headers response.SecurityHeaders) { e.security = headers }
+func (e *Edge) SetGeoResolver(resolver access.GeoResolver) {
+	e.trafficMu.Lock()
+	defer e.trafficMu.Unlock()
+	e.geoResolver = resolver
+	e.installTrafficPipelineLocked()
+}
+func (e *Edge) SetGlobalBlocklist(tree *access.PrefixTree) {
+	e.trafficMu.Lock()
+	defer e.trafficMu.Unlock()
+	e.globalBlocks = tree
+	e.installTrafficPipelineLocked()
+}
+func (e *Edge) SetUnderAttack(attack access.UnderAttack) {
+	e.trafficMu.Lock()
+	defer e.trafficMu.Unlock()
+	e.underAttack = attack
+	e.installTrafficPipelineLocked()
+}
+func (e *Edge) SetRedisSync(syncer *ratelimit.AsyncRedisSync) {
+	e.rateLimiter.SetRedisSync(syncer)
+}
+func (e *Edge) SetPipeline(p *pipeline.Pipeline) { e.pipeline.Store(p) }
+
+func (e *Edge) installTrafficPipelineLocked() {
+	accessPhase := access.NewPhase(e.geoResolver, e.banTable, e.globalBlocks, e.underAttack)
+	ratePhase := ratelimit.NewPhase(e.rateLimiter, e.banTable)
+	e.pipeline.Store(pipeline.New(e.metrics, accessPhase, ratePhase))
+}
 func (e *Edge) Close() {
 	e.poolMu.Lock()
 	if e.healthCancel != nil {
@@ -112,9 +151,19 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		response.Block(tw, c, status, http.StatusText(status))
 		return
 	}
-	decision := e.pipeline.Run(c)
+	decision := e.pipeline.Load().Run(c)
 	if decision.Terminal() {
 		e.metrics.Blocked(actionName(decision.Action))
+		if decision.Phase == "ratelimit" {
+			log.Printf("giới hạn tốc độ request_id=%s rule_id=%s", c.RequestID, decision.RuleID)
+		}
+		if decision.RetryAfter > 0 {
+			retrySeconds := int64((decision.RetryAfter + time.Second - 1) / time.Second)
+			if retrySeconds < 1 {
+				retrySeconds = 1
+			}
+			tw.Header().Set("Retry-After", fmt.Sprintf("%d", retrySeconds))
+		}
 		if decision.Action == reqctx.ActionChallenge {
 			response.Challenge(tw, c)
 		} else {

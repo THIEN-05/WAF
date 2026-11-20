@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,9 +38,10 @@ func (h *Holder) Apply(raw []byte) error {
 	return nil
 }
 func (h *Holder) LoadLocal(path string) error {
-	raw, err := os.ReadFile(path)
+	cleanPath := filepath.Clean(path)
+	raw, err := os.ReadFile(cleanPath) //nolint:gosec // path comes from operator configuration, not request input
 	if err != nil && h.lastGood != "" {
-		raw, err = os.ReadFile(h.lastGood)
+		raw, err = os.ReadFile(filepath.Clean(h.lastGood)) //nolint:gosec // path comes from operator configuration, not request input
 	}
 	if err != nil {
 		return err
@@ -74,7 +76,7 @@ func (h *Holder) ApplyUnsignedLocalJSON(raw []byte) error { // Local dev snapsho
 func LoadPublicKeys() (map[string]ed25519.PublicKey, error) {
 	data := os.Getenv("EDGE_PUBLIC_KEYS")
 	if file := os.Getenv("EDGE_PUBLIC_KEYS_FILE"); file != "" {
-		b, err := os.ReadFile(file)
+		b, err := os.ReadFile(filepath.Clean(file)) //nolint:gosec // keyring file is explicitly configured by the operator
 		if err != nil {
 			return nil, fmt.Errorf("read public key file: %w", err)
 		}
@@ -109,13 +111,14 @@ func LoadPublicKeys() (map[string]ed25519.PublicKey, error) {
 
 // LoadSignedFile verifies a signed snapshot against the configured keyring.
 func LoadSignedFile(path string, keys map[string]ed25519.PublicKey) (wafcore.Snapshot, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // snapshot path is provided by the operator at startup
 	if err != nil {
 		return wafcore.Snapshot{}, err
 	}
 	return wafcore.VerifySnapshot(raw, keys)
 }
 func persist(path string, raw []byte) error {
+	path = filepath.Clean(path)
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
@@ -124,17 +127,23 @@ func persist(path string, raw []byte) error {
 		return err
 	}
 	tmp := f.Name()
-	defer os.Remove(tmp)
+	defer func() { _ = os.Remove(tmp) }()
 	if _, err = f.Write(raw); err != nil {
-		f.Close()
-		return err
+		writeErr := fmt.Errorf("write temporary snapshot: %w", err)
+		if closeErr := f.Close(); closeErr != nil {
+			return errors.Join(writeErr, fmt.Errorf("close temporary snapshot after write failure: %w", closeErr))
+		}
+		return writeErr
 	}
 	if err = f.Sync(); err != nil {
-		f.Close()
-		return err
+		syncErr := fmt.Errorf("sync temporary snapshot: %w", err)
+		if closeErr := f.Close(); closeErr != nil {
+			return errors.Join(syncErr, fmt.Errorf("close temporary snapshot after sync failure: %w", closeErr))
+		}
+		return syncErr
 	}
 	if err = f.Close(); err != nil {
-		return err
+		return fmt.Errorf("close temporary snapshot: %w", err)
 	}
 	return os.Rename(tmp, path)
 }

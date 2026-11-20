@@ -32,7 +32,7 @@ func punycodeLabel(label string) (string, error) {
 	basic := 0
 	for _, r := range runes {
 		if r < unicode.MaxASCII {
-			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			if !validBasicRune(r) {
 				return "", fmt.Errorf("invalid basic rune")
 			}
 			out.WriteRune(r)
@@ -92,6 +92,10 @@ func punycodeLabel(label string) (string, error) {
 		n++
 	}
 	return "xn--" + out.String(), nil
+}
+
+func validBasicRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-'
 }
 func threshold(k, bias int64) int64 {
 	if k <= bias+punyTMin {

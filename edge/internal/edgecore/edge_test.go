@@ -62,7 +62,7 @@ func TestPanicRespectsFailMode(t *testing.T) {
 			snap := siteSnapshot("active", tc.mode, "http://203.0.113.77:80", 1)
 			e := New(snap, "edge-test")
 			installLocalPool(e, port)
-			e.pipeline = pipeline.New(e.metrics, panicPhase{})
+			e.SetPipeline(pipeline.New(e.metrics, panicPhase{}))
 			r := httptest.NewRequest(http.MethodGet, "http://site.test/", nil)
 			r.RemoteAddr = "192.0.2.9:1234"
 			rr := httptest.NewRecorder()
@@ -103,7 +103,7 @@ func TestReloadDoesNotInterruptInFlightRequest(t *testing.T) {
 			result <- err
 			return
 		}
-		defer resp.Body.Close()
+		closeOnCleanup(t, resp.Body)
 		buf := new(strings.Builder)
 		_, err = io.Copy(buf, resp.Body)
 		if err == nil && !strings.Contains(buf.String(), "completed") {
@@ -136,7 +136,9 @@ func TestSampleSnapshotServesThroughFakeOrigin(t *testing.T) {
 	if err = yaml.Unmarshal(data, &snapshot); err != nil {
 		t.Fatal(err)
 	}
-	origin, port := localOrigin(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "origin=%s proto=%s", r.Host, r.Proto) })
+	origin, port := localOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "origin=%s proto=%s", r.Host, r.Proto)
+	})
 	defer origin.Close()
 	snapshot.Sites[0].Origins = []wafcore.Origin{{URL: "http://203.0.113.77:80", Weight: 1, HostHeader: "example.com", TLSVerify: true}}
 	e := New(&snapshot, "edge-test")
@@ -149,7 +151,7 @@ func TestSampleSnapshotServesThroughFakeOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	closeOnCleanup(t, resp.Body)
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "proto=HTTP/1.1") {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
@@ -174,6 +176,40 @@ func TestHostAndSiteStatusResponses(t *testing.T) {
 	}
 }
 
+func TestRateLimitReturns429RetryAfterAndRuleID(t *testing.T) {
+	snapshot := siteSnapshot("active", "closed", "http://127.0.0.1:1", 1)
+	snapshot.Sites[0].RateLimits = []wafcore.RateLimit{{
+		ID: "rl_login", Match: "http.path == '/login' and http.method == 'POST'", Key: "site", Limit: 1, WindowS: 60, Action: "throttle",
+	}}
+	e := New(snapshot, "edge-test")
+	srv := httptest.NewServer(e)
+	defer srv.Close()
+
+	for i := 0; i < 2; i++ {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/login", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = "site.test"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeOnCleanup(t, resp.Body)
+		if i == 0 && resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("initial request status=%d, want origin validation 502", resp.StatusCode)
+		}
+		if i == 1 {
+			if resp.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("limited request status=%d, want 429", resp.StatusCode)
+			}
+			if resp.Header.Get("Retry-After") != "60" {
+				t.Fatalf("Retry-After=%q, want 60", resp.Header.Get("Retry-After"))
+			}
+		}
+	}
+}
+
 type hijackWriter struct {
 	*httptest.ResponseRecorder
 	conn net.Conn
@@ -185,7 +221,7 @@ func (w *hijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func TestPanicAfterHeadersClosesConnectionAndCountsMetric(t *testing.T) {
 	e := New(siteSnapshot("active", "closed", "http://203.0.113.1", 1), "edge")
 	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
+	closeOnCleanup(t, clientConn)
 	rec := httptest.NewRecorder()
 	rec.WriteHeader(http.StatusOK)
 	tw := &trackingWriter{ResponseWriter: &hijackWriter{ResponseRecorder: rec, conn: serverConn}, wrote: true}
@@ -201,4 +237,13 @@ func TestPanicAfterHeadersClosesConnectionAndCountsMetric(t *testing.T) {
 	if !strings.Contains(metrics.Body.String(), "edge_blocked_total{action=\"panic\"} 1") {
 		t.Fatalf("panic metric missing: %s", metrics.Body.String())
 	}
+}
+
+func closeOnCleanup(t *testing.T, closer interface{ Close() error }) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := closer.Close(); err != nil {
+			t.Errorf("close test connection: %v", err)
+		}
+	})
 }

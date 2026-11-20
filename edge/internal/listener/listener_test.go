@@ -59,12 +59,16 @@ func TestUnknownSNIUsesFallbackThenHTTPRejectsMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer servers.Shutdown(context.Background())
+	t.Cleanup(func() {
+		if err := servers.Shutdown(context.Background()); err != nil {
+			t.Errorf("shutdown servers: %v", err)
+		}
+	})
 	conn, err := tls.Dial("tcp", servers.TLSAddr, &tls.Config{InsecureSkipVerify: true, ServerName: "unknown.test", NextProtos: []string{"http/1.1"}})
 	if err != nil {
 		t.Fatalf("fallback TLS handshake: %v", err)
 	}
-	defer conn.Close()
+	closeOnCleanup(t, conn)
 	_, _ = fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: site.test\r\nConnection: close\r\n\r\n")
 	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
@@ -118,8 +122,8 @@ func (l *queueListener) Addr() net.Addr { return fakeAddr("test") }
 func TestPerIPConnectionLimit(t *testing.T) {
 	server1, client1 := net.Pipe()
 	server2, client2 := net.Pipe()
-	defer client1.Close()
-	defer client2.Close()
+	closeOnCleanup(t, client1)
+	closeOnCleanup(t, client2)
 	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.22"), Port: 9000}
 	base := &queueListener{conns: []net.Conn{fakeConn{server1, remote}, fakeConn{server2, remote}}, closed: make(chan struct{})}
 	close(base.closed)
@@ -128,7 +132,7 @@ func TestPerIPConnectionLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.Close()
+	closeOnCleanup(t, first)
 	if _, err = limited.Accept(); err == nil {
 		t.Fatal("expected listener end after rejecting over-limit connection")
 	}
@@ -140,7 +144,7 @@ func TestPerIPConnectionLimit(t *testing.T) {
 
 func TestReadHeaderTimeoutClosesSlowloris(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
+	closeOnCleanup(t, clientConn)
 	base := &queueListener{conns: []net.Conn{fakeConn{serverConn, &net.TCPAddr{IP: net.ParseIP("192.0.2.3"), Port: 9001}}}, closed: make(chan struct{})}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }), ReadHeaderTimeout: 80 * time.Millisecond}
 	done := make(chan struct{})
@@ -163,7 +167,7 @@ func TestReadHeaderTimeoutClosesSlowloris(t *testing.T) {
 
 func TestProxyProtocolV1OnlyFromTrustedCIDR(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
+	closeOnCleanup(t, clientConn)
 	base := &queueListener{conns: []net.Conn{fakeConn{serverConn, &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 1000}}}, closed: make(chan struct{})}
 	go func() { _, _ = io.WriteString(clientConn, "PROXY TCP4 198.51.100.7 203.0.113.1 42312 443\r\npayload") }()
 	_, trusted, _ := net.ParseCIDR("192.0.2.0/24")
@@ -171,7 +175,7 @@ func TestProxyProtocolV1OnlyFromTrustedCIDR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	closeOnCleanup(t, conn)
 	if got := conn.RemoteAddr().String(); got != "198.51.100.7:42312" {
 		t.Fatalf("trusted source address=%q", got)
 	}
@@ -179,4 +183,13 @@ func TestProxyProtocolV1OnlyFromTrustedCIDR(t *testing.T) {
 	if _, err = io.ReadFull(conn, buf); err != nil || string(buf) != "payload" {
 		t.Fatalf("buffered payload=%q err=%v", buf, err)
 	}
+}
+
+func closeOnCleanup(t *testing.T, closer interface{ Close() error }) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := closer.Close(); err != nil {
+			t.Errorf("close test connection: %v", err)
+		}
+	})
 }

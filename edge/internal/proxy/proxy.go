@@ -134,7 +134,7 @@ func (p *OriginPool) Select() (wafcore.Origin, int, error) {
 	if total == 0 {
 		total = len(p.origins)
 	}
-	slot := int(p.next.Add(1)-1) % total
+	slot := int((p.next.Add(1) - 1) % uint64(total)) //nolint:gosec // total is positive and bounded by max int, so conversion to uint64 is safe.
 	for i, o := range p.origins {
 		weight := o.Weight
 		if weight <= 0 && total == len(p.origins) {
@@ -317,7 +317,10 @@ func (p *OriginPool) HealthCheck(ctx context.Context, interval time.Duration) {
 				cancel()
 				ok := e == nil
 				if resp != nil {
-					resp.Body.Close()
+					if closeErr := resp.Body.Close(); closeErr != nil {
+						log.Printf("origin health check: lỗi đóng response body: %v", closeErr)
+						ok = false
+					}
 				}
 				p.healthy[i].Store(ok)
 				if ok {

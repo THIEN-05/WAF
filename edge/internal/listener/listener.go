@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -141,7 +142,9 @@ func Start(cfg Config, handler http.Handler) (*Servers, error) {
 	}
 	tlsLn, err := net.Listen("tcp", cfg.TLSAddr)
 	if err != nil {
-		httpLn.Close()
+		if closeErr := httpLn.Close(); closeErr != nil {
+			return nil, errors.Join(fmt.Errorf("listen TLS: %w", err), fmt.Errorf("close HTTP listener: %w", closeErr))
+		}
 		return nil, err
 	}
 	trusted := parseCIDRs(cfg.TrustedProxyCIDRs)

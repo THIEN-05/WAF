@@ -71,6 +71,22 @@ func TestWeightedOriginSelection(t *testing.T) {
 		t.Fatalf("weighted selection counts: %#v", counts)
 	}
 }
+
+func TestWeightedOriginSelectionCounterNearUint64Maximum(t *testing.T) {
+	p := NewOriginPool([]wafcore.Origin{
+		{URL: "http://203.0.113.1", Weight: 1},
+		{URL: "http://203.0.113.2", Weight: 1},
+	}, "edge")
+	p.next.Store(^uint64(0))
+
+	origin, _, err := p.Select()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if origin.URL != "http://203.0.113.2" {
+		t.Fatalf("selected origin %q, want second origin after uint64 wraparound", origin.URL)
+	}
+}
 func TestCircuitBreakerFiveFailuresAndHalfOpen(t *testing.T) {
 	p := NewOriginPool([]wafcore.Origin{{URL: "http://203.0.113.1", Weight: 1}}, "edge")
 	now := time.Now()
@@ -133,7 +149,7 @@ func TestProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
 			var origin *httptest.Server
 			switch proto {
 			case "http2":
-				origin = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, r.Proto) }))
+				origin = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = fmt.Fprint(w, r.Proto) }))
 				origin.EnableHTTP2 = true
 				origin.StartTLS()
 			case "websocket":
@@ -144,7 +160,11 @@ func TestProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
 					}
 					h := w.(http.Hijacker)
 					c, rw, _ := h.Hijack()
-					defer c.Close()
+					defer func() {
+						if err := c.Close(); err != nil {
+							t.Errorf("close websocket origin connection: %v", err)
+						}
+					}()
 					_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
 					_ = rw.Flush()
 					line, _ := rw.ReadString('\n')
@@ -155,13 +175,13 @@ func TestProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
 				origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if proto == "sse" {
 						w.Header().Set("Content-Type", "text/event-stream")
-						fmt.Fprint(w, "data: one\n\n")
+						_, _ = fmt.Fprint(w, "data: one\n\n")
 						w.(http.Flusher).Flush()
 						time.Sleep(50 * time.Millisecond)
-						fmt.Fprint(w, "data: two\n\n")
+						_, _ = fmt.Fprint(w, "data: two\n\n")
 						return
 					}
-					fmt.Fprint(w, r.Proto)
+					_, _ = fmt.Fprint(w, r.Proto)
 				}))
 			}
 			defer origin.Close()
@@ -199,7 +219,7 @@ func TestProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer conn.Close()
+				closeOnCleanup(t, conn)
 				_, _ = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: site.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
 				br := bufio.NewReader(conn)
 				line, err := br.ReadString('\n')
@@ -287,7 +307,7 @@ func TestSSEFlushesBeforeOriginCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	closeOnCleanup(t, resp.Body)
 	reader := bufio.NewReader(resp.Body)
 	line := make(chan string, 1)
 	errs := make(chan error, 1)
@@ -307,7 +327,7 @@ func TestSSEFlushesBeforeOriginCompletes(t *testing.T) {
 
 func TestProxyRewritesForwardingHeaders(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "xff=%s|xreal=%s|proto=%s|host=%s|id=%s|via=%s", r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-IP"), r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Request-ID"), r.Header.Get("Via"))
+		_, _ = fmt.Fprintf(w, "xff=%s|xreal=%s|proto=%s|host=%s|id=%s|via=%s", r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-IP"), r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Request-ID"), r.Header.Get("Via"))
 	}))
 	defer origin.Close()
 	_, port, _ := net.SplitHostPort(strings.TrimPrefix(origin.URL, "http://"))
@@ -334,11 +354,20 @@ func TestProxyRewritesForwardingHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	closeOnCleanup(t, resp.Body)
 	body, _ := io.ReadAll(resp.Body)
 	for _, want := range []string{"xff=192.0.2.9", "xreal=", "proto=http", "host=original.test", "id=request-123", "edge-node"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("forwarded response %q missing %q", body, want)
 		}
 	}
+}
+
+func closeOnCleanup(t *testing.T, closer interface{ Close() error }) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := closer.Close(); err != nil {
+			t.Errorf("close test connection: %v", err)
+		}
+	})
 }

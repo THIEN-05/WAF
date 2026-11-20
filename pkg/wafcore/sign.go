@@ -37,7 +37,7 @@ func SignSnapshot(s Snapshot, kid string, key ed25519.PrivateKey) ([]byte, error
 	}
 	var compressed bytes.Buffer
 	zw := gzip.NewWriter(&compressed)
-	zw.Header.ModTime = time.Unix(0, 0)
+	zw.ModTime = time.Unix(0, 0)
 	if _, err = zw.Write(plain); err != nil {
 		return nil, fmt.Errorf("gzip snapshot: %w", err)
 	}
@@ -86,11 +86,17 @@ func VerifySnapshot(data []byte, keys map[string]ed25519.PublicKey) (Snapshot, e
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("open gzip payload: %w", err)
 	}
-	defer zr.Close()
 	const maxPayload = 32 << 20
 	plain, err := io.ReadAll(io.LimitReader(zr, maxPayload+1))
+	closeErr := zr.Close()
 	if err != nil {
+		if closeErr != nil {
+			return Snapshot{}, fmt.Errorf("read gzip payload: %w (close gzip reader: %v)", err, closeErr)
+		}
 		return Snapshot{}, fmt.Errorf("read gzip payload: %w", err)
+	}
+	if closeErr != nil {
+		return Snapshot{}, fmt.Errorf("close gzip payload: %w", closeErr)
 	}
 	if len(plain) > maxPayload {
 		return Snapshot{}, fmt.Errorf("snapshot payload exceeds 32 MiB")

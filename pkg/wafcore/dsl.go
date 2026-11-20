@@ -223,7 +223,6 @@ type fieldNode struct {
 	pos       Position
 	name, arg string
 	kind      ValueKind
-	fn        string
 }
 
 func (n *fieldNode) position() Position { return n.pos }
@@ -328,8 +327,6 @@ func (p *parser) parse(minBP int) (node, error) {
 			if _, e = p.expect(tokRParen, "')'"); e != nil {
 				return nil, e
 			}
-			left = &fieldNode{pos: t.pos, fn: t.text, kind: KindInvalid}
-			_ = arg
 			left = &callNode{pos: t.pos, name: t.text, arg: arg}
 			break
 		}
@@ -560,7 +557,7 @@ func binaryType(x *binaryNode) (ValueKind, error) {
 		}
 		if len(x.r.(*listNode).items) > 0 {
 			item, _ := typeOf(x.r.(*listNode).items[0])
-			if item != a && !(a == KindIP && item == KindCIDR) {
+			if item != a && (a != KindIP || item != KindCIDR) {
 				return KindInvalid, &CompileError{Pos: x.pos, Message: "in set element type does not match left operand"}
 			}
 		}
