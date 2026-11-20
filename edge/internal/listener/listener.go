@@ -1,0 +1,307 @@
+package listener
+
+import (
+	"bufio"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Fingerprinter interface {
+	Fingerprint(*tls.ClientHelloInfo) (ja3, ja4 string)
+}
+type StubFingerprinter struct{}
+
+func (StubFingerprinter) Fingerprint(*tls.ClientHelloInfo) (string, string) { return "", "" }
+
+type CertCache struct {
+	mu      sync.RWMutex
+	certs   map[string]*tls.Certificate
+	Default *tls.Certificate
+}
+
+func NewCertCache() *CertCache { return &CertCache{certs: map[string]*tls.Certificate{}} }
+func NewSelfSignedDefault() (*tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	template := x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "waf edge default"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(24 * time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, DNSNames: []string{"waf.invalid"}}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+}
+func (c *CertCache) Put(host string, cert *tls.Certificate) {
+	c.mu.Lock()
+	c.certs[strings.ToLower(strings.TrimSuffix(host, "."))] = cert
+	c.mu.Unlock()
+}
+func (c *CertCache) Get(host string) *tls.Certificate {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if cert := c.certs[strings.ToLower(strings.TrimSuffix(host, "."))]; cert != nil {
+		return cert
+	}
+	return c.Default
+}
+
+type Config struct {
+	HTTPAddr, TLSAddr              string
+	ReadHeaderTimeout, IdleTimeout time.Duration
+	MaxHeaderBytes, MaxPerIP       int
+	TrustedProxyCIDRs              []string
+	EnableProxyProtocol            bool
+	Cache                          *CertCache
+	HTTPChallengeToken             func(string) (string, bool)
+	Fingerprinter                  Fingerprinter
+}
+type Servers struct {
+	HTTP, TLS         *http.Server
+	limit             *perIPLimiter
+	listeners         []net.Listener
+	HTTPAddr, TLSAddr string
+}
+
+func NewHTTPHandler(challenge func(string) (string, bool), redirectPort string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /.well-known/acme-challenge/", func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.URL.Path, "/.well-known/acme-challenge/")
+		if token == "" || challenge == nil {
+			http.NotFound(w, r)
+			return
+		}
+		value, ok := challenge(token)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, value)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if redirectPort != "443" && redirectPort != "" {
+			host = net.JoinHostPort(strings.Split(r.Host, ":")[0], redirectPort)
+		}
+		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusPermanentRedirect)
+	})
+	return mux
+}
+func Start(cfg Config, handler http.Handler) (*Servers, error) {
+	if cfg.HTTPAddr == "" {
+		cfg.HTTPAddr = ":80"
+	}
+	if cfg.TLSAddr == "" {
+		cfg.TLSAddr = ":443"
+	}
+	if cfg.Cache == nil {
+		cfg.Cache = NewCertCache()
+	}
+	if cfg.Cache.Default == nil {
+		cert, err := NewSelfSignedDefault()
+		if err != nil {
+			return nil, fmt.Errorf("create default certificate: %w", err)
+		}
+		cfg.Cache.Default = cert
+	}
+	if cfg.Fingerprinter == nil {
+		cfg.Fingerprinter = StubFingerprinter{}
+	}
+	if cfg.ReadHeaderTimeout == 0 {
+		cfg.ReadHeaderTimeout = 10 * time.Second
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = 90 * time.Second
+	}
+	if cfg.MaxHeaderBytes == 0 {
+		cfg.MaxHeaderBytes = 48 << 10
+	}
+	if cfg.MaxPerIP == 0 {
+		cfg.MaxPerIP = 200
+	}
+	limiter := newPerIPLimiter(cfg.MaxPerIP)
+	httpLn, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return nil, err
+	}
+	tlsLn, err := net.Listen("tcp", cfg.TLSAddr)
+	if err != nil {
+		httpLn.Close()
+		return nil, err
+	}
+	trusted := parseCIDRs(cfg.TrustedProxyCIDRs)
+	if cfg.EnableProxyProtocol {
+		httpLn = proxyProtocolListener{Listener: httpLn, trusted: trusted}
+		tlsLn = proxyProtocolListener{Listener: tlsLn, trusted: trusted}
+	}
+	httpLn = limiter.Wrap(httpLn)
+	tlsLn = limiter.Wrap(tlsLn)
+	httpSrv := &http.Server{Handler: NewHTTPHandler(cfg.HTTPChallengeToken, "443"), ReadHeaderTimeout: cfg.ReadHeaderTimeout, IdleTimeout: cfg.IdleTimeout, MaxHeaderBytes: cfg.MaxHeaderBytes}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}, GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		_, _ = cfg.Fingerprinter.Fingerprint(hello)
+		return cfg.Cache.Get(hello.ServerName), nil
+	}}
+	tlsSrv := &http.Server{Handler: handler, TLSConfig: tlsCfg, ReadHeaderTimeout: cfg.ReadHeaderTimeout, IdleTimeout: cfg.IdleTimeout, MaxHeaderBytes: cfg.MaxHeaderBytes}
+	servers := &Servers{HTTP: httpSrv, TLS: tlsSrv, limit: limiter, listeners: []net.Listener{httpLn, tlsLn}, HTTPAddr: httpLn.Addr().String(), TLSAddr: tlsLn.Addr().String()}
+	go func() { _ = httpSrv.Serve(httpLn) }()
+	go func() { _ = tlsSrv.Serve(tls.NewListener(tlsLn, tlsCfg)) }()
+	return servers, nil
+}
+func (s *Servers) Shutdown(ctx context.Context) error {
+	e1 := s.HTTP.Shutdown(ctx)
+	e2 := s.TLS.Shutdown(ctx)
+	_ = s.limit
+	for _, ln := range s.listeners {
+		_ = ln.Close()
+	}
+	if e1 != nil {
+		return e1
+	}
+	return e2
+}
+
+type perIPLimiter struct {
+	max    int
+	mu     sync.Mutex
+	counts map[string]int
+	conns  map[net.Conn]string
+}
+
+func newPerIPLimiter(max int) *perIPLimiter {
+	return &perIPLimiter{max: max, counts: map[string]int{}, conns: map[net.Conn]string{}}
+}
+func (l *perIPLimiter) Wrap(base net.Listener) net.Listener {
+	return &limitedListener{Listener: base, limiter: l}
+}
+func (l *perIPLimiter) Close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for c := range l.conns {
+		_ = c.Close()
+	}
+}
+
+type limitedListener struct {
+	net.Listener
+	limiter *perIPLimiter
+}
+
+func (l *limitedListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+		l.limiter.mu.Lock()
+		if l.limiter.counts[host] >= l.limiter.max {
+			l.limiter.mu.Unlock()
+			_ = c.Close()
+			continue
+		}
+		l.limiter.counts[host]++
+		l.limiter.conns[c] = host
+		l.limiter.mu.Unlock()
+		return &limitedConn{Conn: c, onClose: func() {
+			l.limiter.mu.Lock()
+			defer l.limiter.mu.Unlock()
+			delete(l.limiter.conns, c)
+			l.limiter.counts[host]--
+		}}, nil
+	}
+}
+
+type limitedConn struct {
+	net.Conn
+	once    sync.Once
+	onClose func()
+}
+
+func (c *limitedConn) Close() error { err := c.Conn.Close(); c.once.Do(c.onClose); return err }
+
+func parseCIDRs(values []string) []*net.IPNet {
+	out := []*net.IPNet{}
+	for _, v := range values {
+		_, n, e := net.ParseCIDR(v)
+		if e == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+type proxyProtocolListener struct {
+	net.Listener
+	trusted []*net.IPNet
+}
+
+func (l proxyProtocolListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+	remote := net.ParseIP(host)
+	trusted := false
+	for _, n := range l.trusted {
+		if n.Contains(remote) {
+			trusted = true
+			break
+		}
+	}
+	if !trusted {
+		return c, nil
+	}
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	br := bufio.NewReader(c)
+	line, e := br.ReadString('\n')
+	_ = c.SetReadDeadline(time.Time{})
+	if e != nil {
+		return nil, e
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 2 || fields[0] != "PROXY" {
+		return nil, fmt.Errorf("invalid PROXY protocol v1 header")
+	}
+	if fields[1] == "UNKNOWN" {
+		return &bufferedConn{Conn: c, r: br}, nil
+	}
+	if len(fields) != 6 || (fields[1] != "TCP4" && fields[1] != "TCP6") {
+		return nil, fmt.Errorf("invalid PROXY protocol address")
+	}
+	src := net.ParseIP(fields[2])
+	port, e := strconv.Atoi(fields[4])
+	if src == nil || e != nil {
+		return nil, fmt.Errorf("invalid PROXY source")
+	}
+	return &proxyConn{bufferedConn: bufferedConn{Conn: c, r: br}, remote: &net.TCPAddr{IP: src, Port: port}}, nil
+}
+
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+type proxyConn struct {
+	bufferedConn
+	remote net.Addr
+}
+
+func (c *proxyConn) RemoteAddr() net.Addr { return c.remote }

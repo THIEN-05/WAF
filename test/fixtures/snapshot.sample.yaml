@@ -1,0 +1,54 @@
+schema_version: 1
+version: 1842
+generated_at: 2026-11-19T08:00:00Z
+global:
+  blocklists_version: 311
+  managed_ruleset: crs-lite-1.4
+sites:
+  - id: site_001
+    tenant_id: t_100
+    status: active
+    plan: pro
+    entitlements:
+      max_rules: 100
+      max_body_bytes: 65536
+      max_regex_bytes: 256
+      max_counter_keys: 100000
+    domains: [example.com, www.example.com]
+    origins:
+      - url: https://203.0.113.10
+        weight: 1
+        host_header: example.com
+        tls_verify: true
+    fail_mode: open
+    waf:
+      mode: block
+      sensitivity: medium
+      body_limit_kb: 64
+      exclusions: []
+    access:
+      allow_ips: []
+      block_ips: [198.51.100.0/24]
+      block_countries: []
+      block_asns: []
+    rate_limits:
+      - id: rl_login
+        match: "http.path == '/login' and http.method == 'POST'"
+        key: ip
+        limit: 10
+        window_s: 60
+        action: block
+        ban_s: 600
+    rules:
+      - id: r_1
+        priority: 10
+        expr: "http.path starts_with '/admin' and ip.geo.country != 'VN'"
+        action: block
+    bot:
+      mode: challenge
+      threshold: 60
+    cache:
+      enabled: false
+    secrets:
+      challenge_hmac_key_id: k7
+      origin_credential_ids: [origin_1]
