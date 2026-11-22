@@ -32,6 +32,7 @@ Ngày: 2026-11-20
 
 - Các server hiện chỉ cung cấp `/healthz`, bind theo biến môi trường riêng và dừng graceful khi nhận SIGINT/SIGTERM.
 - Docker Compose dùng image có tag cố định và dữ liệu dev local; thông tin đăng nhập mặc định chỉ phục vụ máy phát triển.
+- Thay MinIO trong Compose dev bằng SeaweedFS S3 gateway: tag `4.54` đã có trên Docker Hub và image được ghim cả digest. Tag MinIO `RELEASE.2025-02-07T23-21-09Z` không có manifest; MinIO community không còn cung cấp image ổn định phù hợp cho thiết lập sạch. SeaweedFS được chọn làm S3-compatible local storage, endpoint `localhost:8333`; Compose mặc định không cần đăng nhập registry.
 - CI chạy tuần tự lint → test → govulncheck; dependency Go ghim phiên bản trong `go.mod`/`go.sum`.
 
 ## Quyết định P1 — waf-core

@@ -1,5 +1,12 @@
 # Tiến độ
 
+## Cập nhật Compose storage
+
+- Đã thay MinIO image không tồn tại bằng SeaweedFS S3 image `4.54` ghim digest; cập nhật biến S3 trong `.env.example`.
+- CI Compose kiểm tra `docker compose config -q`, pull image không tùy chọn, rồi khởi động đợi healthcheck và dọn dịch vụ.
+- Tag SeaweedFS `4.54` đã được xác nhận có trên Docker Hub API. `docker manifest inspect` không hoàn tất do kết nối registry bị đóng trong môi trường hiện tại.
+- Đã chạy `docker compose -f deploy/docker-compose.yml config -q` → exit 0. Chưa xác minh `docker compose pull`/`make up`: sau khi cấp quyền truy cập Docker daemon, pull bắt đầu nhưng Docker Hub trả `failed to fetch anonymous token ... EOF` cho `postgres:17.4`, nên các image khác bị `Interrupted`. Chạy lại `docker compose -f deploy/docker-compose.yml pull` rồi `make up-wait` trên mạng/CI có thể truy cập Docker Hub.
+
 ## P0 — Scaffold repository
 
 - Đã tạo cấu trúc thư mục theo AGENTS.md, module Go, Makefile, cấu hình lint/editor/git và `.env.example`.

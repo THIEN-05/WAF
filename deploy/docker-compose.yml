@@ -51,18 +51,18 @@ services:
       timeout: 5s
       retries: 20
 
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-02-07T23-21-09Z
-    command: ["server", "/data", "--console-address", ":9001"]
+  storage:
+    image: chrislusf/seaweedfs:4.54@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15
+    command: ["server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0"]
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-local}
-    ports: ["9000:9000", "9001:9001"]
-    volumes: [minio-data:/data]
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-waf}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-change-me-local}
+    ports: ["8333:8333", "9333:9333"]
+    volumes: [seaweedfs-data:/data]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9333/cluster/healthz >/dev/null"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 20
 
   mailhog:
@@ -79,4 +79,4 @@ volumes:
   redis-data:
   nats-data:
   clickhouse-data:
-  minio-data:
+  seaweedfs-data:
