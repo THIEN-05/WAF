@@ -1,6 +1,6 @@
 module github.com/example/wafplatform
 
-go 1.22.0
+go 1.22.8
 
 require (
 	github.com/oschwald/maxminddb-golang v1.13.1

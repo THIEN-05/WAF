@@ -35,6 +35,13 @@ Ngày: 2026-11-20
 - Thay MinIO trong Compose dev bằng SeaweedFS S3 gateway: tag `4.54` đã có trên Docker Hub và image được ghim cả digest. Tag MinIO `RELEASE.2025-02-07T23-21-09Z` không có manifest; MinIO community không còn cung cấp image ổn định phù hợp cho thiết lập sạch. SeaweedFS được chọn làm S3-compatible local storage, endpoint `localhost:8333`; Compose mặc định không cần đăng nhập registry.
 - CI chạy tuần tự lint → test → govulncheck; dependency Go ghim phiên bản trong `go.mod`/`go.sum`.
 
+## Quyết định CI — 2026-11-22
+
+- Chốt Go **1.22.8** làm phiên bản chung để khớp máy WSL hiện có. `go.mod` khai báo `go 1.22.8`; mọi job CI cài Go từ `go-version-file: go.mod`, do đó cùng dùng 1.22.8.
+- Ghim golangci-lint action ở `golangci/golangci-lint-action@v8` và linter ở `v2.1.6`. Action v6 trong các workflow cũ không hỗ trợ golangci-lint v2.
+- Ghim govulncheck CLI ở `golang.org/x/vuln/cmd/govulncheck@v1.1.4`; workflow cài CLI theo tag cố định thay vì action v1, vốn cài `@latest` mặc định.
+- CI tách lint, `go test -race -count=1 ./...`, govulncheck, Compose và Redis integration thành job độc lập. Compose/mạng không điều kiện tiên quyết cho lint, test hoặc vulnerability scan.
+
 ## Quyết định P1 — waf-core
 
 - Snapshot và log dùng `schema_version: 1`; snapshot phiên bản cấu hình riêng dùng uint64 `version`.

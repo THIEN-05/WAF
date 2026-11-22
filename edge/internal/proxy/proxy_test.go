@@ -142,7 +142,7 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
+func TestLoopbackProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
 	for _, proto := range []string{"http1", "http2", "sse", "websocket"} {
 		t.Run(proto, func(t *testing.T) {
 			var originURL string
@@ -275,7 +275,7 @@ func TestLoopViaRejected(t *testing.T) {
 	}
 }
 
-func TestSSEFlushesBeforeOriginCompletes(t *testing.T) {
+func TestLoopbackSSEFlushesBeforeOriginCompletes(t *testing.T) {
 	first := make(chan struct{})
 	release := make(chan struct{})
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -325,7 +325,7 @@ func TestSSEFlushesBeforeOriginCompletes(t *testing.T) {
 	}
 }
 
-func TestProxyRewritesForwardingHeaders(t *testing.T) {
+func TestLoopbackProxyRewritesForwardingHeaders(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, "xff=%s|xreal=%s|proto=%s|host=%s|id=%s|via=%s", r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-IP"), r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Request-ID"), r.Header.Get("Via"))
 	}))

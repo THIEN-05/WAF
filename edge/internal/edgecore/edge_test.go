@@ -50,7 +50,7 @@ func installLocalPool(e *Edge, port string) {
 	}
 }
 
-func TestPanicRespectsFailMode(t *testing.T) {
+func TestLoopbackPanicRespectsFailMode(t *testing.T) {
 	for _, tc := range []struct {
 		mode string
 		want int
@@ -74,7 +74,7 @@ func TestPanicRespectsFailMode(t *testing.T) {
 	}
 }
 
-func TestReloadDoesNotInterruptInFlightRequest(t *testing.T) {
+func TestLoopbackReloadDoesNotInterruptInFlightRequest(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	origin, port := localOrigin(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -127,7 +127,7 @@ func TestReloadDoesNotInterruptInFlightRequest(t *testing.T) {
 	}
 }
 
-func TestSampleSnapshotServesThroughFakeOrigin(t *testing.T) {
+func TestLoopbackSampleSnapshotServesThroughFakeOrigin(t *testing.T) {
 	data, err := os.ReadFile("../../../test/fixtures/snapshot.sample.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestHostAndSiteStatusResponses(t *testing.T) {
 	}
 }
 
-func TestRateLimitReturns429RetryAfterAndRuleID(t *testing.T) {
+func TestLoopbackRateLimitReturns429RetryAfterAndRuleID(t *testing.T) {
 	snapshot := siteSnapshot("active", "closed", "http://127.0.0.1:1", 1)
 	snapshot.Sites[0].RateLimits = []wafcore.RateLimit{{
 		ID: "rl_login", Match: "http.path == '/login' and http.method == 'POST'", Key: "site", Limit: 1, WindowS: 60, Action: "throttle",
@@ -207,6 +207,16 @@ func TestRateLimitReturns429RetryAfterAndRuleID(t *testing.T) {
 				t.Fatalf("Retry-After=%q, want 60", resp.Header.Get("Retry-After"))
 			}
 		}
+	}
+}
+
+func TestUntrustedForwardedForDoesNotOverrideRemoteAddress(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "http://site.test/", nil)
+	r.RemoteAddr = "198.51.100.24:43122"
+	r.Header.Set("X-Forwarded-For", "203.0.113.99")
+	got := remoteIP(r.RemoteAddr)
+	if want := net.ParseIP("198.51.100.24"); !got.Equal(want) {
+		t.Fatalf("client IP=%v, want remote address %v despite spoofed X-Forwarded-For", got, want)
 	}
 }
 

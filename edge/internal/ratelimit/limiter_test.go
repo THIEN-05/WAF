@@ -99,6 +99,45 @@ func TestCounterKeyLimitAndTTLBatchCleanup(t *testing.T) {
 	}
 }
 
+func TestCounterKeyCapacitySurvivesOneMillionAttackerKeys(t *testing.T) {
+	const capacity = 32
+	limiter := NewLimiter(Config{MaxKeys: capacity, Shards: 8, TTL: time.Hour})
+	for i := 0; i < 1_000_000; i++ {
+		_, _, err := limiter.AllowToken("attacker-site", fmt.Sprintf("generated-%d", i), 1, time.Minute, 0)
+		if i < capacity && err != nil {
+			t.Fatalf("key %d rejected before capacity: %v", i, err)
+		}
+		if i >= capacity && err != ErrCounterCapacity {
+			t.Fatalf("key %d error=%v, want capacity rejection", i, err)
+		}
+	}
+	if limiter.keyCount != capacity {
+		t.Fatalf("retained %d keys, want bounded capacity %d", limiter.keyCount, capacity)
+	}
+}
+
+func TestTokenBucketRejectsOverflowAndClockRollback(t *testing.T) {
+	if _, _, err := NewLimiter(Config{}).AllowToken("site", "overflow", ^uint64(0), time.Second, 0); err == nil {
+		t.Fatal("overflowing token capacity was accepted")
+	}
+	now := time.Unix(100, 0)
+	limiter := NewLimiter(Config{Now: func() time.Time { return now }})
+	if allowed, _, err := limiter.AllowToken("site", "rollback", 1, time.Second, 0); err != nil || !allowed {
+		t.Fatalf("initial request allowed=%v err=%v", allowed, err)
+	}
+	if allowed, _, err := limiter.AllowToken("site", "rollback", 1, time.Second, 0); err != nil || allowed {
+		t.Fatalf("second request allowed=%v err=%v, want exhausted bucket", allowed, err)
+	}
+	now = now.Add(-time.Hour)
+	if allowed, _, err := limiter.AllowToken("site", "rollback", 1, time.Second, 0); err != nil || allowed {
+		t.Fatalf("clock rollback refilled bucket: allowed=%v err=%v", allowed, err)
+	}
+	now = time.Unix(101, 0)
+	if allowed, _, err := limiter.AllowToken("site", "rollback", 1, time.Second, 0); err != nil || !allowed {
+		t.Fatalf("bucket did not refill after a full forward window: allowed=%v err=%v", allowed, err)
+	}
+}
+
 type failingRedis struct {
 	calls atomic.Int64
 }
@@ -224,6 +263,17 @@ func TestAsyncRedisSyncUsesLuaBatchAndRecovers(t *testing.T) {
 	defer cancel()
 	if err := syncer.Close(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func BenchmarkRateLimitAllow(b *testing.B) {
+	limiter := NewLimiter(Config{MaxKeys: 1, Shards: 1})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := limiter.AllowToken("bench-site", "fixed-client", 1_000_000, time.Hour, 0); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

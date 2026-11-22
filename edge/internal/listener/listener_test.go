@@ -48,7 +48,7 @@ func TestMissingCertificateFallsBack(t *testing.T) {
 	}
 }
 
-func TestUnknownSNIUsesFallbackThenHTTPRejectsMismatch(t *testing.T) {
+func TestLoopbackUnknownSNIUsesFallbackThenHTTPRejectsMismatch(t *testing.T) {
 	servers, err := Start(Config{HTTPAddr: "127.0.0.1:0", TLSAddr: "127.0.0.1:0", Cache: NewCertCache()}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS.ServerName != "site.test" || r.Host != "site.test" {
 			http.Error(w, "misdirected", http.StatusMisdirectedRequest)

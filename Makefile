@@ -1,4 +1,4 @@
-.PHONY: up up-wait down test lint build bench gen migrate dev-check
+.PHONY: up up-wait down test test-integration lint build bench gen migrate dev-check
 
 up:
 	docker compose -f deploy/docker-compose.yml up -d
@@ -11,6 +11,9 @@ down:
 
 test:
 	go test -race ./...
+
+test-integration:
+	go test -tags=integration -count=1 -v ./edge/internal/ratelimit
 
 lint:
 	golangci-lint run ./...

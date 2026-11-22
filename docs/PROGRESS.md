@@ -1,5 +1,54 @@
 # Tiến độ
 
+## Kiểm chứng gần nhất — 2026-11-22
+
+### Đã xác minh
+
+- `golangci-lint run ./...` → PASS, `0 issues.`
+- `go vet ./...` → PASS, exit 0.
+- `go test -count=1 ./...` → PASS toàn bộ packages, exit 0 khi cho phép test loopback chạy ngoài sandbox Windows.
+- `go test -count=1 ./pkg/wafcore ./edge/internal/access ./edge/internal/ratelimit ./edge/internal/router ./edge/internal/pipeline ./edge/internal/configsync` → PASS.
+- `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` → package PASS; hai test tích hợp Redis thật đã **SKIP** vì không kết nối được `localhost:6379`. Kết quả này chỉ xác nhận build/tag và các test không phụ thuộc Redis.
+- Benchmark access/rate limit đã chạy 5 lần. Median và allocs/op được ghi trong `docs/BENCHMARKS.md`.
+- `TestSnapshotYAMLRoundTrip` đọc `test/fixtures/snapshot.sample.yaml`, validate, round-trip YAML → JSON → struct và so sánh struct; `TestDSLErrorGolden` có 13 golden case với lỗi chính xác gồm dòng/cột.
+- Test cần loopback đã được đặt tên `TestLoopback...` tại edgecore, listener và proxy. Chúng chỉ chạy được ngoài sandbox Windows có chặn loopback; lần chạy full test xanh ở trên được thực hiện với quyền loopback.
+
+### Chưa xác minh — lệnh tự chạy lại
+
+- **Redis thật:** hiện không có Redis truy cập được; hai test tích hợp thật đã skip, nên Lua đồng thời/PEXPIRE và outage/recovery chưa được xác nhận với server thật. Khởi động Redis rồi chạy `make test-integration`; lệnh tương đương trên máy không có `make` là `go test -tags=integration -count=1 -v ./edge/internal/ratelimit`. Có thể đặt `REDIS_ADDR` (địa chỉ `host:port` hoặc URL Redis); mặc định là `localhost:6379`.
+- **Race detector:** `go test -race -count=1 ./...` hiện dừng với `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`. Cần môi trường có CGO và compiler C, rồi chạy lại lệnh đó.
+- **Loopback trong sandbox:** test cần loopback bị Windows sandbox chặn. Đặt tên test `TestLoopback...`; chạy `go test -count=1 ./...` ngoài sandbox Windows để xác minh chúng.
+
+Các mục lịch sử bên dưới ghi phạm vi phase; trạng thái xác minh hiện tại trong mục này là nguồn mới nhất.
+
+## Điều tra CI đỏ và cấu hình mới — 2026-11-22
+
+### Workflow tại từng commit đỏ
+
+- `d3b293c` (#1): workflow ghim `golangci-lint-action@v6` cùng golangci-lint `v2.0.2`. Đây là cặp action/linter không tương thích (action v6 không hỗ trợ dòng v2). Không có log của run này trong dữ liệu hiện có, nên không khẳng định nguyên văn thông báo lỗi. Job `test` phụ thuộc lint; `govulncheck` phụ thuộc test. Compose là job độc lập, không có `needs`.
+- `94fba84` (#2): workflow ghim action v6 cùng linter `v2.1.6`, trùng cặp phiên bản trong log lỗi người dùng cung cấp. Không có run ID đi kèm log để gán chắc chắn thông báo đó riêng cho #2 hay #3. Nếu lint đỏ, job test và govulncheck bị chặn bởi `needs`; Compose vẫn là job độc lập.
+- `3d4fba5` (#3): vẫn ghim action v6 và linter `v2.1.6`, nên cấu hình có cùng nguyên nhân tương thích. Workflow có thêm các bước Compose `config`, `pull`, `up --wait`, nhưng job Compose không phụ thuộc lint và có thể chạy độc lập. Chưa có log để nói nó pass hay fail.
+
+Lấy log còn thiếu cho từng run: `gh run list --commit <commit>`, sau đó `gh run view <run-id> --log-failed`. Không suy đoán lỗi của test-race, govulncheck hoặc Compose khi chưa có log.
+
+### Thay đổi workflow hiện tại
+
+- Lint dùng `golangci-lint-action@v8` với linter `v2.1.6`.
+- Lint, race test, govulncheck, Compose và integration là các job độc lập. Race test vẫn chạy `go test -race -count=1 ./...`; không bỏ lint, race hay test.
+- Govulncheck cài CLI `golang.org/x/vuln/cmd/govulncheck@v1.1.4` theo phiên bản cố định; không dùng action mặc định cài `@latest`.
+- Integration có job Redis riêng (Redis 7.4.2) và chạy `go test -tags=integration -count=1 -v ./edge/internal/ratelimit`.
+- `go.mod` và `actions/setup-go` cùng ghim Go 1.22.8, khớp môi trường WSL người dùng. Quyết định được ghi tại `docs/DECISIONS.md`.
+
+### Kiểm tra thay đổi hiện tại
+
+- `golangci-lint run ./...` → PASS, `0 issues.` Local linter: v2.1.6.
+- `go vet ./...` → PASS, exit 0.
+- `go test -count=1 ./...` → PASS toàn bộ packages khi chạy ngoài sandbox loopback.
+- `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` → các test thường PASS; hai test Redis thật SKIP do không có server tại `localhost:6379`.
+- `go test -race -count=1 ./...` trên Windows chưa chạy được: `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`; máy hiện có `CGO_ENABLED=0`, không tìm thấy gcc/clang. Workflow Ubuntu đã giữ nguyên race test làm job độc lập, nhưng thay đổi workflow chưa có kết quả GitHub Actions vì chưa được chạy trên remote.
+- Bộ phiên bản: CI/setup-go lấy 1.22.8 từ `go.mod`, trùng WSL. Windows hiện dùng Go 1.26.5; kết quả local không thay thế race run trên Ubuntu 1.22.8.
+- Lấy log workflow sau khi push: `gh run list --commit <commit>`, rồi `gh run view <run-id> --log-failed`. Chỉ kết luận nguyên nhân từ log thực tế.
+
 ## Cập nhật Compose storage
 
 - Đã thay MinIO image không tồn tại bằng SeaweedFS S3 image `4.54` ghim digest; cập nhật biến S3 trong `.env.example`.
@@ -79,11 +128,8 @@
 - Redis dùng go-redis ghim `v9.7.3`, Lua `INCR`/`PEXPIRE` theo batch bất đồng bộ và cache ngưỡng phân tán eventual. Local limiter luôn quyết định không chờ Redis; khi Redis batch lỗi, cache Redis bị bỏ qua và local tiếp tục enforcement.
 - Đã nối access rồi rate-limit vào pipeline edge mặc định. `block`/`throttle` trả 429; `challenge` dùng challenge response. Rate limit ghi `request_id` và `rule_id` vào log tiếng Việt.
 - Đã thêm k6 script `test/k6/ratelimit.js` để xác nhận POST `/login` nhận 429 khi vượt hạn mức.
-- **Đã xác minh:** golangci-lint v2.1.6 → `0 issues`; `go vet ./...` PASS; `go build ./...` PASS; `go test -count=1 ./...` PASS. Test mới gồm: IPv4/IPv6 radix, thứ tự access + Geo lazy/cache, entitlement theo gói, ban TTL/cap, fake Geo + lỗi mở MMDB, token bucket đồng hồ giả, concurrency 100 goroutine, sliding window, cap/cleanup TTL, tất cả key type, `ban_s`, `Retry-After` 429, batch Lua và Redis-down fallback local.
-- **Chưa xác minh:** `go test -race -count=1 ./...` không chạy trên máy này: Go báo `-race requires cgo`, `CGO_ENABLED=0`, không có GCC/Clang khả dụng. CI đã chạy lệnh race trên Ubuntu nhưng chưa có run result mới.
-- **Chưa chạy ngoài máy:** k6 chưa cài; Redis thật qua Compose không kiểm chứng được vì Docker API trả `permission denied`; không có file MaxMind MMDB thật để test lookup (fake resolver được test, và test xác nhận file MMDB hỏng bị từ chối).
-- Lệnh tự chạy lại: `golangci-lint run ./...`; `go vet ./...`; `go build ./...`; `go test -count=1 ./...`; `go test -race -count=1 ./...`; sau khi chạy edge với snapshot/policy `POST /login`, `k6 run -e BASE_URL=http://127.0.0.1:8080 -e SITE_HOST=site.test test/k6/ratelimit.js`.
-- Benchmark P3: chưa chạy; không có số liệu hiệu năng được báo cáo.
+- **Đã xác minh:** access/rate-limit tests gồm một triệu key tấn công với cap giữ nguyên; tràn capacity và đồng hồ lùi; X-Forwarded-For giả từ nguồn không tin cậy; IPv4-mapped IPv6; allow-list ưu tiên block/ban; GeoResolver lỗi theo `fail_mode`; ban hết hạn và cleanup; benchmark access/rate limit được ghi trong `docs/BENCHMARKS.md`.
+- **Chưa xác minh:** Redis thật, race detector và benchmark request/edge; xem các lệnh tự chạy lại ở mục “Kiểm chứng gần nhất” phía trên.
 
 ### TODO P3
 

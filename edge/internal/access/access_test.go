@@ -1,6 +1,7 @@
 package access
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -129,6 +130,70 @@ func TestAccessASNPolicyAndPlanEntitlement(t *testing.T) {
 	}
 }
 
+func TestAccessGeoResolverErrorUsesSiteFailMode(t *testing.T) {
+	resolver := failingGeoResolver{}
+	for _, tc := range []struct {
+		mode   string
+		action reqctx.Action
+		ruleID string
+	}{{"open", reqctx.ActionAllow, "access_allow"}, {"closed", reqctx.ActionBlock, "geo_unavailable"}} {
+		t.Run(tc.mode, func(t *testing.T) {
+			site := wafcore.Site{ID: "site-" + tc.mode, Plan: "pro", FailMode: tc.mode,
+				Access: wafcore.AccessConfig{BlockCountries: []string{"VN"}}}
+			decision := NewPhase(resolver, nil, nil, nil).Handle(newAccessContext(site, "192.0.2.77"))
+			if decision.Action != tc.action || decision.RuleID != tc.ruleID || decision.Phase != "access" {
+				t.Fatalf("decision=%+v, want action=%v rule=%s", decision, tc.action, tc.ruleID)
+			}
+		})
+	}
+}
+
+type failingGeoResolver struct{}
+
+func (failingGeoResolver) Resolve(net.IP) (GeoInfo, error) {
+	return GeoInfo{}, errors.New("database unavailable")
+}
+
+func TestAccessIPv4MappedIPv6AndAllowPrecedence(t *testing.T) {
+	allow := net.ParseIP("192.0.2.9")
+	tree, err := NewPrefixTree([]string{"::ffff:192.0.2.0/120"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tree.Contains(net.ParseIP("::ffff:192.0.2.9")) || !tree.Contains(allow) {
+		t.Fatal("IPv4-mapped IPv6 prefix did not match mapped and native IPv4 addresses")
+	}
+	bans := NewBanTable(4, time.Now)
+	if err := bans.Ban(allow, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	site := wafcore.Site{ID: "precedence", Plan: "pro", Access: wafcore.AccessConfig{
+		AllowIPs: []string{"192.0.2.9"}, BlockIPs: []string{"192.0.2.0/24"},
+	}}
+	decision := NewPhase(nil, bans, tree, nil).Handle(newAccessContext(site, "::ffff:192.0.2.9"))
+	if decision.Action != reqctx.ActionAllow || decision.RuleID != "allow_ip" {
+		t.Fatalf("allow list did not take precedence over ban/block: %+v", decision)
+	}
+}
+
+func TestTemporaryBanCleanupRemovesExpiredEntries(t *testing.T) {
+	now := time.Unix(100, 0)
+	bans := NewBanTable(2, func() time.Time { return now })
+	if err := bans.Ban(net.ParseIP("192.0.2.1"), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := bans.Ban(net.ParseIP("192.0.2.2"), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Second)
+	if removed := bans.Cleanup(); removed != 1 {
+		t.Fatalf("cleanup removed %d entries, want 1", removed)
+	}
+	if bans.IsBanned(net.ParseIP("192.0.2.1")) || !bans.IsBanned(net.ParseIP("192.0.2.2")) {
+		t.Fatal("cleanup did not preserve only the active ban")
+	}
+}
+
 func TestTemporaryBanExpiresAndRespectsCapacity(t *testing.T) {
 	now := time.Unix(100, 0)
 	bans := NewBanTable(1, func() time.Time { return now })
@@ -174,4 +239,15 @@ func TestFakeGeoResolverAndMMDBOpenErrors(t *testing.T) {
 
 func newAccessContext(site wafcore.Site, clientIP string) *reqctx.RequestCtx {
 	return &reqctx.RequestCtx{Site: &site, ClientIP: net.ParseIP(clientIP)}
+}
+
+func BenchmarkAccessCheck(b *testing.B) {
+	site := wafcore.Site{ID: "bench", Plan: "pro", Access: wafcore.AccessConfig{BlockIPs: []string{"198.51.100.0/24"}}}
+	phase := NewPhase(nil, nil, nil, nil)
+	ctx := newAccessContext(site, "192.0.2.10")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = phase.Handle(ctx)
+	}
 }

@@ -73,7 +73,9 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 		return accessDecision(reqctx.ActionBlock, "block_ip", "client IP matches site blocklist")
 	}
 	if len(policy.blockCountries) != 0 || len(policy.blockASNs) != 0 {
-		p.resolveGeo(ctx)
+		if err := p.resolveGeo(ctx); err != nil && ctx.Site.FailMode == "closed" {
+			return accessDecision(reqctx.ActionBlock, "geo_unavailable", "geo resolver failed and site fail_mode is closed")
+		}
 		if _, blocked := policy.blockCountries[strings.ToUpper(ctx.GeoCountry)]; blocked && ctx.GeoCountry != "" {
 			return accessDecision(reqctx.ActionBlock, "block_country", "client country is blocked")
 		}
@@ -101,20 +103,21 @@ func accessDecision(action reqctx.Action, ruleID, reason string) reqctx.Decision
 	return reqctx.Decision{Action: action, RuleID: ruleID, Phase: "access", Score: 0, Reason: reason}
 }
 
-func (p *Phase) resolveGeo(ctx *reqctx.RequestCtx) {
+func (p *Phase) resolveGeo(ctx *reqctx.RequestCtx) error {
 	if ctx.GeoResolved {
-		return
+		return nil
 	}
 	ctx.GeoResolved = true
 	if p.Resolver == nil || ctx.ClientIP == nil {
-		return
+		return fmt.Errorf("geo resolver or client IP unavailable")
 	}
 	info, err := p.Resolver.Resolve(ctx.ClientIP)
 	if err != nil {
-		return // Geo data is optional; resolver failure defaults to allow for geo-only policies.
+		return err
 	}
 	ctx.GeoCountry = strings.ToUpper(info.Country)
 	ctx.GeoASN = info.ASN
+	return nil
 }
 
 func (p *Phase) policy(ctx *reqctx.RequestCtx) sitePolicy {
