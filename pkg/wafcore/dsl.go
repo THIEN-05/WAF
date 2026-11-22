@@ -433,6 +433,21 @@ var fieldTypes = map[string]ValueKind{
 	"http.host": KindString, "http.method": KindString, "http.path": KindString, "http.query": KindString, "http.uri": KindString, "http.user_agent": KindString, "http.referer": KindString, "http.body": KindString, "req.size": KindNumber, "ip.src": KindIP, "ip.geo.country": KindString, "ip.geo.asn": KindNumber, "tls.ja3": KindString, "bot.score": KindNumber, "waf.score": KindNumber,
 }
 
+// ExpressionUsesField reports whether an expression contains a field token,
+// excluding text inside quoted literals.
+func ExpressionUsesField(expression, field string) bool {
+	tokens, err := newLexer(expression).tokens()
+	if err != nil {
+		return false
+	}
+	for _, token := range tokens {
+		if token.kind == tokIdent && token.text == field {
+			return true
+		}
+	}
+	return false
+}
+
 func Compile(expression string, limits Limits) (func(Ctx) bool, error) {
 	defaults := DefaultLimits()
 	if limits.MaxExpressionBytes <= 0 {

@@ -35,3 +35,15 @@ func TestStopsOnTerminalAndObservesEachPhase(t *testing.T) {
 		}
 	}
 }
+
+func TestSkipPhaseAndAccumulatedDecision(t *testing.T) {
+	ctx := reqctx.New(httptest.NewRequest("GET", "http://x/", nil), nil, "id", nil)
+	first := testPhase{"rules", reqctx.Decision{Action: reqctx.ActionAllow, Score: 2, Tags: []string{"custom"}}}
+	second := testPhase{"waf", reqctx.Decision{Action: reqctx.ActionBlock, RuleID: "managed", Score: 5, Tags: []string{"waf"}}}
+	p := New(nil, first, second)
+	ctx.SkipPhase("waf")
+	got := p.Run(ctx)
+	if got.Action != reqctx.ActionAllow || got.Score != 2 || len(got.Tags) != 1 || got.Tags[0] != "custom" {
+		t.Fatalf("skipped phase decision=%+v", got)
+	}
+}

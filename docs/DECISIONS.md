@@ -37,9 +37,11 @@ Ngày: 2026-11-20
 
 ## Quyết định CI — 2026-11-22
 
-- Chốt Go **1.22.8** làm phiên bản chung để khớp máy WSL hiện có. `go.mod` khai báo `go 1.22.8`; mọi job CI cài Go từ `go-version-file: go.mod`, do đó cùng dùng 1.22.8.
-- Ghim golangci-lint action ở `golangci/golangci-lint-action@v8` và linter ở `v2.1.6`. Action v6 trong các workflow cũ không hỗ trợ golangci-lint v2.
-- Ghim govulncheck CLI ở `golang.org/x/vuln/cmd/govulncheck@v1.1.4`; workflow cài CLI theo tag cố định thay vì action v1, vốn cài `@latest` mặc định.
+- Bản Go phải luôn là bản vá mới nhất còn được hỗ trợ trong nhánh đang chọn; không giữ bản vá cũ chỉ để khớp máy phát triển. Cập nhật `go.mod` và xác minh lỗ hổng thư viện chuẩn định kỳ.
+- Dùng Go **1.26.11** hiện tại trong `go.mod`; tất cả job CI dùng `actions/setup-go` với `go-version-file: go.mod`. Go 1.22.8 của WSL trước đây không còn là phiên bản chuẩn do các cảnh báo bảo mật thư viện chuẩn.
+- Ghim golangci-lint action ở `golangci/golangci-lint-action@v8` và linter ở `v2.15.0` (bản phát hành tương thích Go 1.26); action v6 trong workflows cũ không hỗ trợ golangci-lint v2.
+- Ghim govulncheck CLI ở `golang.org/x/vuln/cmd/govulncheck@v1.10.0`; workflow cài CLI theo tag cố định thay vì dùng `@latest`.
+- `govulncheck ./...` là cổng CI bắt buộc. Không tắt job, không dùng `continue-on-error`, và không chấp nhận lỗ hổng bị gọi tới như kết quả xanh.
 - CI tách lint, `go test -race -count=1 ./...`, govulncheck, Compose và Redis integration thành job độc lập. Compose/mạng không điều kiện tiên quyết cho lint, test hoặc vulnerability scan.
 
 ## Quyết định P1 — waf-core

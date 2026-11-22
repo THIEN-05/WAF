@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,6 +70,7 @@ type Config struct {
 	EnableProxyProtocol            bool
 	Cache                          *CertCache
 	HTTPChallengeToken             func(string) (string, bool)
+	CanonicalHTTPHost              func(string) (string, bool)
 	Fingerprinter                  Fingerprinter
 }
 type Servers struct {
@@ -78,30 +80,43 @@ type Servers struct {
 	HTTPAddr, TLSAddr string
 }
 
-func NewHTTPHandler(challenge func(string) (string, bool), redirectPort string) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /.well-known/acme-challenge/", func(w http.ResponseWriter, r *http.Request) {
-		token := strings.TrimPrefix(r.URL.Path, "/.well-known/acme-challenge/")
-		if token == "" || challenge == nil {
-			http.NotFound(w, r)
+func NewHTTPHandler(challenge func(string) (string, bool), redirectPort string, canonicalHost func(string) (string, bool)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const challengePrefix = "/.well-known/acme-challenge/"
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, challengePrefix) {
+			token := strings.TrimPrefix(r.URL.Path, challengePrefix)
+			if token == "" || challenge == nil {
+				http.NotFound(w, r)
+				return
+			}
+			value, ok := challenge(token)
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, value)
 			return
 		}
-		value, ok := challenge(token)
-		if !ok {
-			http.NotFound(w, r)
+		host, ok := "", false
+		if canonicalHost != nil {
+			host, ok = canonicalHost(r.Host)
+		}
+		if !ok || host == "" {
+			http.Error(w, "unknown host", http.StatusMisdirectedRequest)
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = io.WriteString(w, value)
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
 		if redirectPort != "443" && redirectPort != "" {
-			host = net.JoinHostPort(strings.Split(r.Host, ":")[0], redirectPort)
+			host = net.JoinHostPort(host, redirectPort)
 		}
-		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusPermanentRedirect)
+		requestPath := r.URL.Path
+		if requestPath == "" {
+			requestPath = "/"
+		}
+		location := url.URL{Scheme: "https", Host: host, Path: requestPath, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
+		w.Header().Set("Location", location.String())
+		w.WriteHeader(http.StatusPermanentRedirect)
 	})
-	return mux
 }
 func Start(cfg Config, handler http.Handler) (*Servers, error) {
 	if cfg.HTTPAddr == "" {
@@ -154,7 +169,7 @@ func Start(cfg Config, handler http.Handler) (*Servers, error) {
 	}
 	httpLn = limiter.Wrap(httpLn)
 	tlsLn = limiter.Wrap(tlsLn)
-	httpSrv := &http.Server{Handler: NewHTTPHandler(cfg.HTTPChallengeToken, "443"), ReadHeaderTimeout: cfg.ReadHeaderTimeout, IdleTimeout: cfg.IdleTimeout, MaxHeaderBytes: cfg.MaxHeaderBytes}
+	httpSrv := &http.Server{Handler: NewHTTPHandler(cfg.HTTPChallengeToken, "443", cfg.CanonicalHTTPHost), ReadHeaderTimeout: cfg.ReadHeaderTimeout, IdleTimeout: cfg.IdleTimeout, MaxHeaderBytes: cfg.MaxHeaderBytes}
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}, GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		_, _ = cfg.Fingerprinter.Fingerprint(hello)
 		return cfg.Cache.Get(hello.ServerName), nil

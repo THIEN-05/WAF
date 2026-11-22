@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -135,6 +136,36 @@ func TestTokenBucketRejectsOverflowAndClockRollback(t *testing.T) {
 	now = time.Unix(101, 0)
 	if allowed, _, err := limiter.AllowToken("site", "rollback", 1, time.Second, 0); err != nil || !allowed {
 		t.Fatalf("bucket did not refill after a full forward window: allowed=%v err=%v", allowed, err)
+	}
+}
+
+func TestTokenBucketCapsExtremeRefillAndClockSpan(t *testing.T) {
+	capacity, err := toMicroTokens(uint64(math.MaxInt64 / microTokens))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := addRefill(0, ^uint64(0), capacity); got != capacity {
+		t.Fatalf("extreme refill produced %d, want capacity %d", got, capacity)
+	}
+	if got := addRefill(capacity, ^uint64(0), capacity); got != capacity {
+		t.Fatalf("full bucket refill produced %d, want capacity %d", got, capacity)
+	}
+	if got := addRefill(capacity-1, ^uint64(0), capacity); got != capacity {
+		t.Fatalf("nearly full bucket refill produced %d, want capacity %d", got, capacity)
+	}
+
+	entry := &counterEntry{}
+	entry.token.Store(&tokenState{tokens: 0, lastNS: math.MinInt64})
+	allowed, _ := consumeToken(entry, math.MaxInt64, capacity, time.Duration(math.MaxInt64))
+	if !allowed {
+		t.Fatal("overflowing forward clock span should saturate the bucket before consuming one token")
+	}
+	state := entry.token.Load()
+	if state.tokens != capacity-uint64(microTokens) || state.tokens > capacity {
+		t.Fatalf("tokens after extreme clock span=%d capacity=%d", state.tokens, capacity)
+	}
+	if retry := tokenRetryAfter(capacity, capacity, math.MaxInt64); retry <= 0 {
+		t.Fatalf("extreme retry duration is not positive: %s", retry)
 	}
 }
 

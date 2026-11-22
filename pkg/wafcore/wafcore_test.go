@@ -227,6 +227,16 @@ func TestSnapshotValidationErrors(t *testing.T) {
 		t.Fatalf("unexpected error %v", err)
 	}
 }
+
+func TestWAFConfigValidation(t *testing.T) {
+	s := validSnapshot()
+	s.Sites[0].Entitlements.MaxBodyBytes = 8192
+	s.Sites[0].WAF.Sensitivity = "extreme"
+	s.Sites[0].WAF.BodyLimitKB = 16
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "waf.sensitivity") || !strings.Contains(err.Error(), "body_limit_kb") {
+		t.Fatalf("expected WAF sensitivity and entitlement validation, got %v", err)
+	}
+}
 func TestLogAndStatsValidate(t *testing.T) {
 	e := LogEvent{SchemaVersion: 1, TS: time.Now(), RequestID: "r", SiteID: "s", TenantID: "t", ClientIP: "192.0.2.1"}
 	if err := e.Validate(); err != nil {

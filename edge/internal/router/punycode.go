@@ -107,10 +107,11 @@ func threshold(k, bias int64) int64 {
 	return k - bias
 }
 func encodeDigit(d int64) byte {
-	if d < 26 {
-		return byte('a' + d)
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	if d < 0 || d >= int64(len(alphabet)) {
+		return '?'
 	}
-	return byte('0' + d - 26)
+	return alphabet[d]
 }
 func adapt(delta, numPoints int64, first bool) int64 {
 	if first {

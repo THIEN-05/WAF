@@ -58,10 +58,18 @@ type Origin struct {
 }
 
 type WAFConfig struct {
-	Mode        string   `json:"mode" yaml:"mode"`
-	Sensitivity string   `json:"sensitivity" yaml:"sensitivity"`
-	BodyLimitKB int      `json:"body_limit_kb" yaml:"body_limit_kb"`
-	Exclusions  []string `json:"exclusions" yaml:"exclusions"`
+	Mode        string         `json:"mode" yaml:"mode"`
+	Sensitivity string         `json:"sensitivity" yaml:"sensitivity"`
+	BodyLimitKB int            `json:"body_limit_kb" yaml:"body_limit_kb"`
+	Paranoia    int            `json:"paranoia,omitempty" yaml:"paranoia,omitempty"`
+	BudgetMS    int            `json:"budget_ms,omitempty" yaml:"budget_ms,omitempty"`
+	Exclusions  []WAFExclusion `json:"exclusions" yaml:"exclusions"`
+}
+
+type WAFExclusion struct {
+	RuleID string `json:"rule_id" yaml:"rule_id"`
+	Path   string `json:"path,omitempty" yaml:"path,omitempty"`
+	Param  string `json:"param,omitempty" yaml:"param,omitempty"`
 }
 
 type AccessConfig struct {
@@ -83,11 +91,15 @@ type RateLimit struct {
 }
 
 type Rule struct {
-	ID         string `json:"id" yaml:"id"`
-	Priority   int    `json:"priority" yaml:"priority"`
-	Expression string `json:"expr" yaml:"expr"`
-	Action     string `json:"action" yaml:"action"`
-	Mode       string `json:"mode,omitempty" yaml:"mode,omitempty"`
+	ID         string     `json:"id" yaml:"id"`
+	Priority   int        `json:"priority" yaml:"priority"`
+	Expression string     `json:"expr" yaml:"expr"`
+	Action     string     `json:"action" yaml:"action"`
+	Mode       string     `json:"mode,omitempty" yaml:"mode,omitempty"`
+	Policy     string     `json:"policy,omitempty" yaml:"policy,omitempty"`
+	Tag        string     `json:"tag,omitempty" yaml:"tag,omitempty"`
+	Phase      string     `json:"phase,omitempty" yaml:"phase,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty" yaml:"expires_at,omitempty"`
 }
 
 type BotConfig struct {
@@ -164,11 +176,28 @@ func (s Snapshot) Validate() error {
 				errs = append(errs, fmt.Sprintf("%s.origins[%d].weight: must not be negative", p, j))
 			}
 		}
-		if site.WAF.Mode != "" && site.WAF.Mode != "off" && site.WAF.Mode != "monitor" && site.WAF.Mode != "block" {
-			errs = append(errs, p+".waf.mode: must be off, monitor, or block")
+		if site.WAF.Mode != "" && site.WAF.Mode != "off" && site.WAF.Mode != "monitor" && site.WAF.Mode != "block" && site.WAF.Mode != "challenge" {
+			errs = append(errs, p+".waf.mode: must be off, monitor, block, or challenge")
 		}
 		if site.WAF.BodyLimitKB < 0 {
 			errs = append(errs, p+".waf.body_limit_kb: must not be negative")
+		}
+		if site.WAF.Sensitivity != "" && site.WAF.Sensitivity != "low" && site.WAF.Sensitivity != "medium" && site.WAF.Sensitivity != "high" {
+			errs = append(errs, p+".waf.sensitivity: must be low, medium, or high")
+		}
+		if site.WAF.BodyLimitKB > 0 && site.Entitlements.MaxBodyBytes > 0 && site.WAF.BodyLimitKB*1024 > site.Entitlements.MaxBodyBytes {
+			errs = append(errs, p+".waf.body_limit_kb: exceeds entitlement max_body_bytes")
+		}
+		if site.WAF.Paranoia < 0 || site.WAF.Paranoia > 4 {
+			errs = append(errs, p+".waf.paranoia: must be between 1 and 4 when set")
+		}
+		if site.WAF.BudgetMS < 0 {
+			errs = append(errs, p+".waf.budget_ms: must not be negative")
+		}
+		for j, exclusion := range site.WAF.Exclusions {
+			if exclusion.RuleID == "" || (exclusion.Path == "" && exclusion.Param == "") {
+				errs = append(errs, fmt.Sprintf("%s.waf.exclusions[%d]: rule_id and path or param are required", p, j))
+			}
 		}
 		if site.Entitlements.MaxRules > 0 && len(site.Rules) > site.Entitlements.MaxRules {
 			errs = append(errs, fmt.Sprintf("%s.rules: %d rules exceed entitlement max_rules %d", p, len(site.Rules), site.Entitlements.MaxRules))
@@ -193,6 +222,21 @@ func (s Snapshot) Validate() error {
 			}
 			if r.Action != "allow" && r.Action != "block" && r.Action != "challenge" && r.Action != "log" && r.Action != "rate_limit" && r.Action != "tag" && r.Action != "skip" {
 				errs = append(errs, fmt.Sprintf("%s.rules[%d].action: unsupported action %q", p, j, r.Action))
+			}
+			if r.Mode != "" && r.Mode != "log" {
+				errs = append(errs, fmt.Sprintf("%s.rules[%d].mode: must be log when set", p, j))
+			}
+			if r.Action == "rate_limit" && r.Policy == "" {
+				errs = append(errs, fmt.Sprintf("%s.rules[%d].policy: required for rate_limit action", p, j))
+			}
+			if r.Action == "tag" && r.Tag == "" {
+				errs = append(errs, fmt.Sprintf("%s.rules[%d].tag: required for tag action", p, j))
+			}
+			if r.Action == "skip" && r.Phase == "" {
+				errs = append(errs, fmt.Sprintf("%s.rules[%d].phase: required for skip action", p, j))
+			}
+			if r.Action == "skip" && r.Phase != "ratelimit" && r.Phase != "rules" && r.Phase != "waf" && r.Phase != "bot" && r.Phase != "cache" && r.Phase != "proxy" {
+				errs = append(errs, fmt.Sprintf("%s.rules[%d].phase: unsupported phase %q", p, j, r.Phase))
 			}
 		}
 		for j, rl := range site.RateLimits {

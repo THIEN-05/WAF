@@ -96,6 +96,7 @@ func run() error {
 		servers, err := listener.Start(listener.Config{
 			HTTPAddr: server.Env("EDGE_HTTP_ADDR", ":8080"), TLSAddr: tlsAddr, Cache: cache,
 			HTTPChallengeToken: func(token string) (string, bool) { value, ok := challenges[token]; return value, ok },
+			CanonicalHTTPHost:  core.CanonicalHTTPHost,
 		}, core)
 		if err != nil {
 			return fmt.Errorf("khởi động listener edge: %w", err)

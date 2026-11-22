@@ -4,22 +4,42 @@
 
 ### Đã xác minh
 
-- `golangci-lint run ./...` → PASS, `0 issues.`
+- `go.mod` ghim Go 1.26.11 (bản vá mới nhất nhánh 1.26 đã phát hành tại thời điểm này); `go get -u ./...` và `go mod tidy` hoàn tất.
+- `go build ./...` → PASS, exit 0 (Go 1.26.11 Windows/amd64).
+- `golangci-lint run ./...` (v2.15.0, build bằng Go 1.26.11) → PASS, `0 issues.`
 - `go vet ./...` → PASS, exit 0.
-- `go test -count=1 ./...` → PASS toàn bộ packages, exit 0 khi cho phép test loopback chạy ngoài sandbox Windows.
+- `go test -count=1 ./...` → PASS toàn bộ packages trên Go 1.26.11 Windows/amd64 khi chạy ngoài sandbox để cho phép loopback.
+- `/usr/local/go/bin/go test -race -count=1 ./...` → PASS toàn bộ packages trong WSL Linux/amd64 với toolchain Go 1.26.11; race detector bật.
+- `govulncheck ./...` (v1.10.0) → PASS, `No vulnerabilities found.`; `govulncheck -show verbose ./...` quét 19 root packages, 7 modules và standard library Go 1.26.11, không thấy vulnerability bị gọi tới.
+- Redis integration sau nâng go-redis v9.23.0: `redis-cli ... ping` → `PONG`; `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` trong WSL → PASS, gồm Lua concurrent và outage/fallback/recovery.
+- P4 follow-up về lint/security (Go 1.26.11, WSL): `golangci-lint v2.15.0 run ./...` → `0 issues.`; `go vet ./...` → exit 0; `go test -race -count=1 ./...` → PASS toàn bộ; `go test -tags=integration -race -count=5 ./edge/internal/ratelimit` → PASS (`28.195s`); `govulncheck ./...` → `No vulnerabilities found.`
+- G710: listener xác thực host bằng router hiện hành, chỉ dùng hostname canonical từ site trong snapshot để dựng absolute Location; host sai trả 421. Test kiểm tra evil.com, userinfo/ký tự lạ, nhiều dấu hai chấm, path/query mã hóa và path `//evil.com` vẫn không đổi authority.
+- G706/G705: edge bỏ qua `X-Request-ID` client và tự sinh ID hex; proxy chỉ log ID đã kiểm tra dạng hex với `%q`, error body text/plain không phản chiếu ID, có `nosniff`; test bơm CR/LF xác nhận không tạo dòng/header giả và ID không vào body. Còn đúng một `//nolint:gosec` hẹp ở log: G706 không phân tích sanitizer hex tùy chỉnh; lý do cụ thể đặt tại dòng code, còn `TestProxyErrorDoesNotLogOrReflectUnsafeRequestID` chứng minh chuỗi điều khiển bị thay bằng ID rỗng trước log.
+- G115: token bucket lưu tokens unsigned, clamp refill theo khoảng trống của bucket trước cộng, saturate khi đồng hồ tiến qua span tràn số; test `TestTokenBucketCapsExtremeRefillAndClockSpan` dùng refill `MaxUint64`, bucket gần/đầy và đồng hồ MinInt64→MaxInt64. Dọn key limiter giữ shard index unsigned, không còn suppression ép kiểu.
+- SA1019: dùng `httputil.ReverseProxy.Rewrite`; Rewrite bỏ mọi `X-Forwarded-*`/`X-Real-IP` client gửi, đặt lại IP/proto/host/request ID, ghi Via edge sau khi kiểm tra loop; thư viện xử lý hop-by-hop headers. Test forwarding headers/hop headers/HostHeader cùng các test WebSocket, SSE và retry GET/HEAD giữ PASS.
+- Punycode: digit dùng bảng tra với kiểm tra miền; test phủ 0..35 và -1/36/giá trị lớn.
+- Dependency update thực tế: `github.com/redis/go-redis/v9` 9.7.3 → 9.23.0; `github.com/cespare/xxhash/v2` 2.2.0 → 2.3.0; `golang.org/x/sys` 0.21.0 → 0.50.0; bỏ `go-rendezvous` và thêm `go.uber.org/atomic` 1.12.0. Govulncheck verbose xác nhận 7 module được nạp sạch; không có third-party vulnerability cần sửa thêm.
+- Các finding lint mới đã được xử lý tại gốc, không tắt/nới rule: `ReverseProxy.Rewrite`, canonical host redirect, ID hex do edge sinh, body lỗi text-only/nosniff, bucket arithmetic unsigned/saturating, và punycode lookup bounds.
+- Workflow `lint`, `test-race`, `govulncheck`, `test-integration`, `compose` đều cài Go bằng `actions/setup-go@v5` + `go-version-file: go.mod`; govulncheck là cổng bắt buộc, không có `continue-on-error`. Redis integration và Compose vẫn là job riêng.
 - `go test -count=1 ./pkg/wafcore ./edge/internal/access ./edge/internal/ratelimit ./edge/internal/router ./edge/internal/pipeline ./edge/internal/configsync` → PASS.
 - `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` → PASS, gồm cả hai test Redis thật; Redis tại `localhost:6379` truy cập được trong lần chạy này.
 - Benchmark access/rate limit đã chạy 5 lần. Median và allocs/op được ghi trong `docs/BENCHMARKS.md`.
 - `TestSnapshotYAMLRoundTrip` đọc `test/fixtures/snapshot.sample.yaml`, validate, round-trip YAML → JSON → struct và so sánh struct; `TestDSLErrorGolden` có 13 golden case với lỗi chính xác gồm dòng/cột.
-- Test cần loopback đã được đặt tên `TestLoopback...` tại edgecore, listener và proxy. Chúng chỉ chạy được ngoài sandbox Windows có chặn loopback; lần chạy full test xanh ở trên được thực hiện với quyền loopback.
+- P4 lượt 1: đã thêm custom rules phase theo priority, mode log, expiry, allow/block/challenge/log/rate_limit/tag/skip; body được phát hiện qua token DSL, đọc lazy một lần trong giới hạn entitlement và phát lại đầy đủ cho origin. WAF khung có loader YAML (chỉ 3 luật mẫu sqli/xss/traversal), normalizer decode tối đa 3 vòng/cờ double-encode, HTML entity/NUL/path/lowercase/whitespace/SQL comment, Aho-Corasick tiền lọc rồi RE2, scoring/sensitivity/paranoia/exclusions/budget/fail_mode/early stop.
+- P4 benchmark số liệu tại `docs/BENCHMARKS.md` được đo trước nâng toolchain trên Go 1.26.5; không đại diện cho Go 1.26.11.
+- Các test `TestLoopback...` chỉ chạy được ngoài sandbox Windows; lần xác minh full suite xanh này đã được chạy ngoài sandbox.
 
 ### Chưa xác minh — lệnh tự chạy lại
 
-- **Loopback trong sandbox:** test cần loopback bị Windows sandbox chặn. Đặt tên test `TestLoopback...`; chạy `go test -count=1 ./...` ngoài sandbox Windows để xác minh chúng.
+- **Chưa xác minh:** kết quả GitHub Actions sau khi push thay đổi này. Cấu hình đã ghim Go 1.26.11 chung cho các job.
+- Không có bước nào trong yêu cầu hiện tại cần người dùng chạy lại trong WSL: lint, vet, full race và Redis integration 5 lần đã chạy thành công ở WSL với Go 1.26.11. Chạy CI GitHub sau khi push để xác minh workflow hosted.
+- Chạy lại các lệnh xác minh khi có thay đổi tiếp theo: `go build ./...`, `golangci-lint run ./...`, `go vet ./...`, `go test -count=1 ./...`, `/usr/local/go/bin/go test -race -count=1 ./...`, `govulncheck ./...`.
 
 Các mục lịch sử bên dưới ghi phạm vi phase; trạng thái xác minh hiện tại trong mục này là nguồn mới nhất.
 
 ## Điều tra CI đỏ và cấu hình mới — 2026-11-22
+
+> Phần này là bản ghi lịch sử trước lỗi govulncheck; các version 1.22.8 / v2.1.6 / v1.1.4 bên dưới đã được thay thế bởi kiểm chứng mới nhất ở đầu tài liệu.
 
 ### Workflow tại từng commit đỏ
 
@@ -31,9 +51,9 @@ Lấy log còn thiếu cho từng run: `gh run list --commit <commit>`, sau đó
 
 ### Thay đổi workflow hiện tại
 
-- Lint dùng `golangci-lint-action@v8` với linter `v2.1.6`.
+- Lint lúc đó dùng `golangci-lint-action@v8` với linter `v2.1.6`.
 - Lint, race test, govulncheck, Compose và integration là các job độc lập. Race test vẫn chạy `go test -race -count=1 ./...`; không bỏ lint, race hay test.
-- Govulncheck cài CLI `golang.org/x/vuln/cmd/govulncheck@v1.1.4` theo phiên bản cố định; không dùng action mặc định cài `@latest`.
+- Govulncheck lúc đó cài CLI `golang.org/x/vuln/cmd/govulncheck@v1.1.4` theo phiên bản cố định; cấu hình hiện tại là v1.10.0.
 - Integration có job Redis riêng (Redis 7.4.2) và chạy `go test -tags=integration -count=1 -v ./edge/internal/ratelimit`.
 - `go.mod` và `actions/setup-go` cùng ghim Go 1.22.8, khớp môi trường WSL người dùng. Quyết định được ghi tại `docs/DECISIONS.md`.
 

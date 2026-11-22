@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -208,7 +210,7 @@ func TestLoopbackProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
 			}
 			if proto == "websocket" {
 				proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					ctx := reqctx.New(r, nil, "req-ws", net.ParseIP("192.0.2.9"))
+					ctx := reqctx.New(r, nil, "0123456789abcdef0123456789abcdef", net.ParseIP("192.0.2.9"))
 					ctx.Site = &wafcore.Site{Origins: []wafcore.Origin{{URL: originURL, Weight: 1}}}
 					defer reqctx.Release(ctx)
 					p.Serve(w, ctx)
@@ -243,7 +245,7 @@ func TestLoopbackProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
 				return
 			}
 			rw := httptest.NewRecorder()
-			c := reqctx.New(req, nil, "req-test", net.ParseIP("192.0.2.9"))
+			c := reqctx.New(req, nil, "0123456789abcdef0123456789abcdef", net.ParseIP("192.0.2.9"))
 			c.Site = &wafcore.Site{Origins: []wafcore.Origin{{URL: originURL, Weight: 1}}}
 			p.Serve(rw, c)
 			if proto == "sse" {
@@ -275,6 +277,33 @@ func TestLoopViaRejected(t *testing.T) {
 	}
 }
 
+func TestProxyErrorDoesNotLogOrReflectUnsafeRequestID(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://site.test/", nil)
+	ctx := reqctx.New(request, nil, "attacker-id\r\nX-Forged: yes", net.ParseIP("192.0.2.4"))
+	ctx.Site = &wafcore.Site{Origins: []wafcore.Origin{{URL: "http://203.0.113.8:80", Weight: 1}}}
+	pool := NewOriginPool(ctx.Site.Origins, "edge")
+	pool.resolve = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.8")}, nil }
+	pool.dialIP = func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("connection refused") }
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previous)
+	rr := httptest.NewRecorder()
+	pool.Serve(rr, ctx)
+	if strings.Contains(logs.String(), "attacker-id") || strings.Contains(logs.String(), "X-Forged") {
+		t.Fatalf("unsafe request ID entered log: %q", logs.String())
+	}
+	if strings.Contains(rr.Body.String(), "attacker-id") || strings.Contains(rr.Body.String(), "X-Forged") || rr.Header().Get("X-Request-ID") != "" {
+		t.Fatalf("unsafe request ID reflected: headers=%v body=%q", rr.Header(), rr.Body.String())
+	}
+	if !strings.Contains(logs.String(), `request_id=""`) {
+		t.Fatalf("unsafe request ID was not replaced in quoted log field: %q", logs.String())
+	}
+	if rr.Header().Get("Content-Type") != "text/plain; charset=utf-8" || rr.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("missing safe error response headers: %v", rr.Header())
+	}
+}
+
 func TestLoopbackSSEFlushesBeforeOriginCompletes(t *testing.T) {
 	first := make(chan struct{})
 	release := make(chan struct{})
@@ -296,7 +325,7 @@ func TestLoopbackSSEFlushesBeforeOriginCompletes(t *testing.T) {
 		return d.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
 	})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := reqctx.New(r, nil, "sse-id", net.ParseIP("192.0.2.1"))
+		ctx := reqctx.New(r, nil, "0123456789abcdef0123456789abcdef", net.ParseIP("192.0.2.1"))
 		defer reqctx.Release(ctx)
 		ctx.Site = &wafcore.Site{Origins: []wafcore.Origin{{URL: "http://203.0.113.80:80", Weight: 1}}}
 		p.Serve(w, ctx)
@@ -327,19 +356,19 @@ func TestLoopbackSSEFlushesBeforeOriginCompletes(t *testing.T) {
 
 func TestLoopbackProxyRewritesForwardingHeaders(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, "xff=%s|xreal=%s|proto=%s|host=%s|id=%s|via=%s", r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-IP"), r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Request-ID"), r.Header.Get("Via"))
+		_, _ = fmt.Fprintf(w, "xff=%s|xreal=%s|proto=%s|host=%s|id=%s|via=%s|fwdcustom=%s|hop=%s|connection=%s|originhost=%s", r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-IP"), r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Request-ID"), r.Header.Get("Via"), r.Header.Get("X-Forwarded-Custom"), r.Header.Get("X-Hop-Secret"), r.Header.Get("Connection"), r.Host)
 	}))
 	defer origin.Close()
 	_, port, _ := net.SplitHostPort(strings.TrimPrefix(origin.URL, "http://"))
 	target := "http://203.0.113.88:80"
-	p := NewOriginPool([]wafcore.Origin{{URL: target, Weight: 1}}, "edge-node")
+	p := NewOriginPool([]wafcore.Origin{{URL: target, Weight: 1, HostHeader: "origin-header.test"}}, "edge-node")
 	p.SetResolver(func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.88")}, nil })
 	p.SetDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
 		d := net.Dialer{}
 		return d.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
 	})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c := reqctx.New(r, nil, "request-123", net.ParseIP("192.0.2.9"))
+		c := reqctx.New(r, nil, "0123456789abcdef0123456789abcdef", net.ParseIP("192.0.2.9"))
 		defer reqctx.Release(c)
 		c.Site = &wafcore.Site{Origins: []wafcore.Origin{{URL: target, Weight: 1}}}
 		p.Serve(w, c)
@@ -350,13 +379,17 @@ func TestLoopbackProxyRewritesForwardingHeaders(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "203.0.113.200")
 	req.Header.Set("X-Real-IP", "203.0.113.201")
 	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Custom", "forged")
+	req.Header.Set("Via", "1.1 client-proxy")
+	req.Header.Set("Connection", "X-Hop-Secret")
+	req.Header.Set("X-Hop-Secret", "must-not-reach-origin")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	closeOnCleanup(t, resp.Body)
 	body, _ := io.ReadAll(resp.Body)
-	for _, want := range []string{"xff=192.0.2.9", "xreal=", "proto=http", "host=original.test", "id=request-123", "edge-node"} {
+	for _, want := range []string{"xff=192.0.2.9", "xreal=", "proto=http", "host=original.test", "id=0123456789abcdef0123456789abcdef", "via=1.1 edge-node", "fwdcustom=", "hop=", "connection=", "originhost=origin-header.test"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("forwarded response %q missing %q", body, want)
 		}

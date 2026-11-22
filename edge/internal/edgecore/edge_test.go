@@ -3,6 +3,7 @@ package edgecore
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -116,7 +117,9 @@ func TestLoopbackReloadDoesNotInterruptInFlightRequest(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("origin request did not start")
 	}
-	e.Apply(siteSnapshot("active", "closed", "http://203.0.113.77:80", 2))
+	if err := e.Apply(siteSnapshot("active", "closed", "http://203.0.113.77:80", 2)); err != nil {
+		t.Fatal(err)
+	}
 	close(release)
 	wg.Wait()
 	if err := <-result; err != nil {
@@ -173,6 +176,50 @@ func TestHostAndSiteStatusResponses(t *testing.T) {
 		if rr.Code != tc.code {
 			t.Errorf("host %s got %d want %d", tc.host, rr.Code, tc.code)
 		}
+	}
+}
+
+func TestCanonicalHTTPHostUsesRouterAndRejectsMalformedHosts(t *testing.T) {
+	snapshot := siteSnapshot("active", "closed", "http://203.0.113.77:80", 1)
+	snapshot.Sites[0].Domains = []string{"*.example.test"}
+	e := New(snapshot, "edge")
+	for _, tc := range []struct {
+		host string
+		want string
+		ok   bool
+	}{{"API.EXAMPLE.TEST.:80", "api.example.test", true}, {"evil.com", "", false}, {"api.example.test:bad", "", false}, {"api.example.test:80:evil", "", false}, {"user@api.example.test", "", false}, {"api.example.test/evil", "", false}} {
+		got, ok := e.CanonicalHTTPHost(tc.host)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("CanonicalHTTPHost(%q)=(%q,%v) want (%q,%v)", tc.host, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestRequestIDIsAlwaysHex(t *testing.T) {
+	id := requestID()
+	decoded, err := hex.DecodeString(id)
+	if err != nil || len(decoded) != 16 {
+		t.Fatalf("request ID=%q err=%v decoded bytes=%d", id, err, len(decoded))
+	}
+}
+
+func TestLoopbackEdgeGeneratesRequestIDAndIgnoresClientHeader(t *testing.T) {
+	origin, port := localOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Origin-Request-ID", r.Header.Get("X-Request-ID"))
+		_, _ = io.WriteString(w, "origin response")
+	})
+	defer origin.Close()
+	e := New(siteSnapshot("active", "closed", "http://203.0.113.77:80", 1), "edge-test")
+	installLocalPool(e, port)
+	r := httptest.NewRequest(http.MethodGet, "http://site.test/path", nil)
+	r.RemoteAddr = "192.0.2.9:1234"
+	r.Header.Set("X-Request-ID", "client-id\r\nX-Injected: yes")
+	rr := httptest.NewRecorder()
+	e.ServeHTTP(rr, r)
+	got := rr.Header().Get("X-Origin-Request-ID")
+	decoded, err := hex.DecodeString(got)
+	if rr.Code != http.StatusOK || err != nil || len(decoded) != 16 || strings.Contains(rr.Body.String(), "client-id") {
+		t.Fatalf("status=%d request id=%q body=%q", rr.Code, got, rr.Body.String())
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -17,24 +18,64 @@ import (
 )
 
 func TestHTTPChallengeAndRedirect(t *testing.T) {
-	h := NewHTTPHandler(func(token string) (string, bool) { return "proof-" + token, token == "good" }, "443")
+	h := NewHTTPHandler(func(token string) (string, bool) { return "proof-" + token, token == "good" }, "443", canonicalTestHTTPHost)
 	for _, tc := range []struct {
 		path   string
 		status int
 		body   string
 	}{{"/.well-known/acme-challenge/good", 200, "proof-good"}, {"/.well-known/acme-challenge/missing", 404, ""}, {"/path?q=1", 308, ""}} {
 		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://example.test"+tc.path, nil))
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://known.test"+tc.path, nil))
 		if rr.Code != tc.status {
 			t.Errorf("%s status=%d", tc.path, rr.Code)
 		}
 		if tc.body != "" && !strings.Contains(rr.Body.String(), tc.body) {
 			t.Errorf("body=%q", rr.Body.String())
 		}
-		if tc.status == 308 && rr.Header().Get("Location") != "https://example.test/path?q=1" {
+		if tc.status == 308 && rr.Header().Get("Location") != "https://known.test/path?q=1" {
 			t.Errorf("location=%q", rr.Header().Get("Location"))
 		}
 	}
+}
+
+func TestHTTPRedirectRejectsUnknownHost(t *testing.T) {
+	h := NewHTTPHandler(nil, "443", canonicalTestHTTPHost)
+	for _, host := range []string{"evil.com", "known.test@evil.com", "known.test:80:evil", "known.test:bad", "user@known.test", "known.test/evil"} {
+		r := httptest.NewRequest(http.MethodGet, "http://known.test/path", nil)
+		r.Host = host
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, r)
+		if rr.Code != http.StatusMisdirectedRequest || rr.Header().Get("Location") != "" {
+			t.Errorf("Host=%q status=%d location=%q", host, rr.Code, rr.Header().Get("Location"))
+		}
+	}
+}
+
+func TestHTTPRedirectUsesCanonicalHostAndKeepsPathQuery(t *testing.T) {
+	h := NewHTTPHandler(nil, "443", canonicalTestHTTPHost)
+	r := httptest.NewRequest(http.MethodGet, "http://known.test/a%2Fb?q=a%2Fb&x=1", nil)
+	r.Host = "KNOWN.TEST.:80"
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	if got, want := rr.Header().Get("Location"), "https://known.test/a%2Fb?q=a%2Fb&x=1"; rr.Code != http.StatusPermanentRedirect || got != want {
+		t.Fatalf("status=%d location=%q want %q", rr.Code, got, want)
+	}
+
+	r = httptest.NewRequest(http.MethodGet, "http://known.test/", nil)
+	r.URL.Path = "//evil.com/path"
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	u, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil || u.Host != "known.test" || !strings.HasPrefix(u.Path, "//evil.com/") {
+		t.Fatalf("external redirect location=%q parsed=%+v err=%v", rr.Header().Get("Location"), u, err)
+	}
+}
+
+func canonicalTestHTTPHost(host string) (string, bool) {
+	if host == "known.test" || host == "KNOWN.TEST.:80" {
+		return "known.test", true
+	}
+	return "", false
 }
 func TestMissingCertificateFallsBack(t *testing.T) {
 	cache := NewCertCache()

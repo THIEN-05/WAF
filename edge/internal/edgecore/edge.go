@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +23,9 @@ import (
 	"github.com/example/wafplatform/edge/internal/reqctx"
 	"github.com/example/wafplatform/edge/internal/response"
 	"github.com/example/wafplatform/edge/internal/router"
+	"github.com/example/wafplatform/edge/internal/rules"
+	"github.com/example/wafplatform/edge/internal/waf"
+	"github.com/example/wafplatform/edge/rulesets"
 	"github.com/example/wafplatform/pkg/wafcore"
 )
 
@@ -38,6 +44,7 @@ type Edge struct {
 	via          string
 	security     response.SecurityHeaders
 	poolFactory  func([]wafcore.Origin, string) *proxy.OriginPool
+	managedWAF   []waf.Rule
 	poolMu       sync.Mutex
 	pools        map[string]*proxy.OriginPool
 	healthCtx    context.Context
@@ -47,7 +54,10 @@ type Edge struct {
 type runtimeConfig struct {
 	snapshot *wafcore.Snapshot
 	router   *router.Router
+	pipeline *pipeline.Pipeline
 }
+
+var fallbackRequestIDCounter atomic.Uint64
 
 func New(s *wafcore.Snapshot, via string) *Edge {
 	h := pipeline.NewHistogram()
@@ -56,14 +66,29 @@ func New(s *wafcore.Snapshot, via string) *Edge {
 	e.banTable = access.NewBanTable(100_000, time.Now)
 	e.rateLimiter = ratelimit.NewLimiter(ratelimit.Config{})
 	e.underAttack = access.DisabledUnderAttack{}
-	e.installTrafficPipelineLocked()
-	if s != nil {
-		e.Apply(s)
+	managed, err := rulesets.LoadEmbedded(wafcore.DefaultLimits().MaxRegexBytes)
+	if err != nil {
+		panic(fmt.Errorf("load embedded managed WAF rules: %w", err))
 	}
-	e.ready.Store(true)
+	e.managedWAF = managed
+	if s != nil {
+		if err := e.Apply(s); err != nil {
+			log.Printf("snapshot chưa được áp dụng: %v", err)
+		}
+	}
+	e.ready.Store(e.runtime.Load() != nil)
 	return e
 }
-func (e *Edge) Apply(s *wafcore.Snapshot) {
+func (e *Edge) Apply(s *wafcore.Snapshot) error {
+	e.trafficMu.Lock()
+	defer e.trafficMu.Unlock()
+	if s == nil {
+		return fmt.Errorf("snapshot is nil")
+	}
+	pipe, err := e.buildPipeline(s)
+	if err != nil {
+		return err
+	}
 	e.poolMu.Lock()
 	if e.healthCancel != nil {
 		e.healthCancel()
@@ -71,7 +96,9 @@ func (e *Edge) Apply(s *wafcore.Snapshot) {
 	e.healthCtx, e.healthCancel = context.WithCancel(context.Background())
 	e.pools = map[string]*proxy.OriginPool{}
 	e.poolMu.Unlock()
-	e.runtime.Store(&runtimeConfig{snapshot: s, router: router.New(s)})
+	e.runtime.Store(&runtimeConfig{snapshot: s, router: router.New(s), pipeline: pipe})
+	e.ready.Store(true)
+	return nil
 }
 func (e *Edge) SetReady(v bool)                                     { e.ready.Store(v) }
 func (e *Edge) SetSecurityHeaders(headers response.SecurityHeaders) { e.security = headers }
@@ -79,29 +106,50 @@ func (e *Edge) SetGeoResolver(resolver access.GeoResolver) {
 	e.trafficMu.Lock()
 	defer e.trafficMu.Unlock()
 	e.geoResolver = resolver
-	e.installTrafficPipelineLocked()
+	e.rebuildPipelineLocked()
 }
 func (e *Edge) SetGlobalBlocklist(tree *access.PrefixTree) {
 	e.trafficMu.Lock()
 	defer e.trafficMu.Unlock()
 	e.globalBlocks = tree
-	e.installTrafficPipelineLocked()
+	e.rebuildPipelineLocked()
 }
 func (e *Edge) SetUnderAttack(attack access.UnderAttack) {
 	e.trafficMu.Lock()
 	defer e.trafficMu.Unlock()
 	e.underAttack = attack
-	e.installTrafficPipelineLocked()
+	e.rebuildPipelineLocked()
 }
 func (e *Edge) SetRedisSync(syncer *ratelimit.AsyncRedisSync) {
 	e.rateLimiter.SetRedisSync(syncer)
 }
 func (e *Edge) SetPipeline(p *pipeline.Pipeline) { e.pipeline.Store(p) }
 
-func (e *Edge) installTrafficPipelineLocked() {
+func (e *Edge) buildPipeline(snapshot *wafcore.Snapshot) (*pipeline.Pipeline, error) {
 	accessPhase := access.NewPhase(e.geoResolver, e.banTable, e.globalBlocks, e.underAttack)
 	ratePhase := ratelimit.NewPhase(e.rateLimiter, e.banTable)
-	e.pipeline.Store(pipeline.New(e.metrics, accessPhase, ratePhase))
+	rulesPhase, err := rules.NewPhase(snapshot, ratePhase, nil)
+	if err != nil {
+		return nil, err
+	}
+	wafPhase, err := waf.NewPhase(e.managedWAF, nil)
+	if err != nil {
+		return nil, err
+	}
+	return pipeline.New(e.metrics, accessPhase, ratePhase, rulesPhase, wafPhase), nil
+}
+
+func (e *Edge) rebuildPipelineLocked() {
+	state := e.runtime.Load()
+	if state == nil {
+		return
+	}
+	pipe, err := e.buildPipeline(state.snapshot)
+	if err != nil {
+		log.Printf("không thể biên dịch pipeline snapshot %d: %v", state.snapshot.Version, err)
+		return
+	}
+	e.runtime.Store(&runtimeConfig{snapshot: state.snapshot, router: state.router, pipeline: pipe})
 }
 func (e *Edge) Close() {
 	e.poolMu.Lock()
@@ -111,6 +159,32 @@ func (e *Edge) Close() {
 	e.poolMu.Unlock()
 }
 func (e *Edge) Metrics() http.Handler { return e.histogram }
+func (e *Edge) CanonicalHTTPHost(host string) (string, bool) {
+	state := e.runtime.Load()
+	if state == nil || state.router == nil {
+		return "", false
+	}
+	name := host
+	if strings.Contains(name, ":") {
+		parsedHost, port, err := net.SplitHostPort(name)
+		if err != nil {
+			return "", false
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return "", false
+		}
+		name = parsedHost
+	}
+	if strings.ContainsAny(name, "@/\\?#[]") {
+		return "", false
+	}
+	canonical := router.NormalizeHost(name)
+	if canonical == "" || state.router.Route(canonical) == nil {
+		return "", false
+	}
+	return canonical, true
+}
 func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
 		w.WriteHeader(http.StatusOK)
@@ -132,10 +206,7 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := state.snapshot
-	id := r.Header.Get("X-Request-ID")
-	if id == "" {
-		id = requestID()
-	}
+	id := requestID()
 	clientIP := remoteIP(r.RemoteAddr)
 	c := reqctx.New(r, snap, id, clientIP)
 	defer reqctx.Release(c)
@@ -151,7 +222,11 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		response.Block(tw, c, status, http.StatusText(status))
 		return
 	}
-	decision := e.pipeline.Load().Run(c)
+	requestPipeline := state.pipeline
+	if override := e.pipeline.Load(); override != nil {
+		requestPipeline = override
+	}
+	decision := requestPipeline.Run(c)
 	if decision.Terminal() {
 		e.metrics.Blocked(actionName(decision.Action))
 		if decision.Phase == "ratelimit" {
@@ -272,7 +347,8 @@ func (w *trackingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter 
 func requestID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("req-%d", time.Now().UnixNano())
+		copy(b[:8], "wafedge0")
+		binary.BigEndian.PutUint64(b[8:], fallbackRequestIDCounter.Add(1))
 	}
 	return hex.EncodeToString(b)
 }

@@ -1,0 +1,29 @@
+- id: waf-sqli-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, remove_sql_comments]
+  pattern: '(?:union\s+(?:all\s+)?select|(?:''|%27)\s*(?:or|and)\s+\d+\s*=\s*\d+|sleep\s*\(|benchmark\s*\()'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a03, sqli]
+  prefilter: [union, select, sleep, benchmark]
+
+- id: waf-xss-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, html_entity_decode, lowercase]
+  pattern: '(?:<\s*script\b|on(?:error|load)\s*=|javascript\s*:|data\s*:\s*text/html|svg\s+onload)'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a03, xss]
+  prefilter: [script, onerror, onload, javascript:, data:text/html, svg]
+
+- id: waf-traversal-001
+  phase: request
+  targets: [path, args]
+  transforms: [url_decode, path_normalize, lowercase]
+  pattern: '(?:\.\./|/etc/passwd|boot\.ini|php://|file://)'
+  severity: critical
+  paranoia: 1
+  tags: [traversal, lfi]
+  prefilter: ['../', '%2e%2e', '/etc/passwd', boot.ini, 'php://', 'file://']

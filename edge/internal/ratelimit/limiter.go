@@ -50,7 +50,7 @@ type counterEntry struct {
 }
 
 type tokenState struct {
-	tokens int64
+	tokens uint64
 	lastNS int64
 }
 
@@ -110,8 +110,11 @@ func (l *Limiter) AllowToken(siteID, key string, limit uint64, window time.Durat
 	return allowed, retry, nil
 }
 
-func consumeToken(entry *counterEntry, nowNS, capacity int64, window time.Duration) (bool, time.Duration) {
+func consumeToken(entry *counterEntry, nowNS int64, capacity uint64, window time.Duration) (bool, time.Duration) {
 	windowNS := int64(window)
+	if capacity == 0 || windowNS <= 0 {
+		return false, 0
+	}
 	for {
 		old := entry.token.Load()
 		if old == nil {
@@ -122,51 +125,64 @@ func consumeToken(entry *counterEntry, nowNS, capacity int64, window time.Durati
 		}
 		tokens := old.tokens
 		lastNS := old.lastNS
-		elapsed := nowNS - lastNS
-		if elapsed > 0 {
-			if elapsed >= windowNS {
+		if nowNS > lastNS {
+			elapsed := nowNS - lastNS
+			if elapsed < 0 || elapsed >= windowNS {
 				tokens = capacity
 				lastNS = nowNS
 			} else {
-				hi, lo := bits.Mul64(uint64(elapsed), uint64(capacity)) //nolint:gosec // elapsed and capacity are positive and bounded by their checked int64 values.
-				refill, _ := bits.Div64(hi, lo, uint64(windowNS))       //nolint:gosec // windowNS is validated positive and at most MaxInt64.
+				hi, lo := bits.Mul64(uint64(elapsed), capacity)
+				refill, _ := bits.Div64(hi, lo, uint64(windowNS))
 				if refill > 0 {
-					if uint64(tokens)+refill >= uint64(capacity) { //nolint:gosec // tokens and refill cannot exceed the validated capacity.
-						tokens = capacity
-					} else {
-						tokens += int64(refill)
-					}
+					tokens = addRefill(tokens, refill, capacity)
 					lastNS = nowNS // sub-micro-token remainder is intentionally discarded.
 				}
 			}
 		}
-		if tokens < microTokens {
+		if tokens < uint64(microTokens) {
 			next := &tokenState{tokens: tokens, lastNS: lastNS}
 			if entry.token.CompareAndSwap(old, next) {
 				return false, tokenRetryAfter(capacity-tokens, capacity, windowNS)
 			}
 			continue
 		}
-		next := &tokenState{tokens: tokens - microTokens, lastNS: lastNS}
+		next := &tokenState{tokens: tokens - uint64(microTokens), lastNS: lastNS}
 		if entry.token.CompareAndSwap(old, next) {
 			return true, 0
 		}
 	}
 }
 
-func tokenRetryAfter(missing, capacity, windowNS int64) time.Duration {
-	hi, lo := bits.Mul64(uint64(missing), uint64(windowNS)) //nolint:gosec // missing and windowNS are positive and bounded by validated values.
-	ns, remainder := bits.Div64(hi, lo, uint64(capacity))   //nolint:gosec // capacity is a positive micro-token count validated against MaxInt64.
+func addRefill(tokens, refill, capacity uint64) uint64 {
+	if tokens >= capacity {
+		return capacity
+	}
+	if refill >= capacity-tokens {
+		return capacity
+	}
+	return tokens + refill
+}
+
+func tokenRetryAfter(missing, capacity uint64, windowNS int64) time.Duration {
+	if windowNS <= 0 || capacity == 0 {
+		return 0
+	}
+	window := uint64(windowNS)
+	hi, lo := bits.Mul64(missing, window)
+	ns, remainder := bits.Div64(hi, lo, capacity)
 	if remainder != 0 {
 		ns++
 	}
 	if ns == 0 {
 		ns = 1
 	}
-	if ns > uint64(windowNS) { //nolint:gosec // windowNS is positive and no larger than MaxInt64.
-		ns = uint64(windowNS) //nolint:gosec // windowNS is validated positive and no larger than MaxInt64.
+	if ns > window {
+		ns = window
 	}
-	return time.Duration(ns) //nolint:gosec // ns is clamped to the positive window, which is a time.Duration.
+	if ns > math.MaxInt64 {
+		ns = math.MaxInt64
+	}
+	return time.Duration(ns)
 }
 
 func (l *Limiter) AllowSliding(siteID, key string, limit uint64, window time.Duration, siteMaxKeys int) (bool, time.Duration, error) {
@@ -229,11 +245,11 @@ func validatePolicy(limit uint64, window time.Duration) error {
 	return nil
 }
 
-func toMicroTokens(limit uint64) (int64, error) {
+func toMicroTokens(limit uint64) (uint64, error) {
 	if limit > uint64(math.MaxInt64/microTokens) {
 		return 0, fmt.Errorf("rate limit exceeds micro-token capacity")
 	}
-	return int64(limit) * microTokens, nil
+	return limit * uint64(microTokens), nil
 }
 
 func (l *Limiter) get(siteID, key string, siteMaxKeys int, now time.Time) (*counterEntry, error) {
@@ -302,14 +318,14 @@ func (l *Limiter) maybeCleanup() {
 		if len(l.shards) == 0 {
 			return
 		}
-		start := int(l.cleanupAt.Add(4) % uint64(len(l.shards))) //nolint:gosec // modulo bounds the result to fewer shards than max int.
-		for i := 0; i < 4; i++ {
-			l.cleanupShard((start+i)%len(l.shards), 64)
+		start := l.cleanupAt.Add(4) % uint64(len(l.shards))
+		for i := uint64(0); i < 4; i++ {
+			l.cleanupShard((start+i)%uint64(len(l.shards)), 64)
 		}
 	}
 }
 
-func (l *Limiter) cleanupShard(index, scanLimit int) int {
+func (l *Limiter) cleanupShard(index uint64, scanLimit int) int {
 	shard := &l.shards[index]
 	now := l.now()
 	shard.mu.Lock()

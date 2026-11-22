@@ -30,18 +30,44 @@ func New(observer Metrics, phases ...Phase) *Pipeline {
 	return &Pipeline{phases: append([]Phase(nil), phases...), observer: observer}
 }
 func (p *Pipeline) Run(c *reqctx.RequestCtx) reqctx.Decision {
+	score := 0
+	tags := make([]string, 0, 8)
+	seenTags := make(map[string]struct{})
+	var logOnly reqctx.Decision
+	hasLogOnly := false
 	for _, ph := range p.phases {
+		if c.PhaseSkipped(ph.Name()) {
+			continue
+		}
 		start := time.Now()
 		d := ph.Handle(c)
 		if p.observer != nil {
 			p.observer.ObservePhase(ph.Name(), time.Since(start))
 		}
+		score += d.Score
+		for _, tag := range d.Tags {
+			if _, exists := seenTags[tag]; !exists && len(tags) < 32 {
+				seenTags[tag] = struct{}{}
+				tags = append(tags, tag)
+			}
+		}
+		d.Score = score
+		d.Tags = append([]string(nil), tags...)
 		c.SetDecision(d)
 		if d.Terminal() {
 			return d
 		}
+		if d.Action == reqctx.ActionLogOnly {
+			logOnly = d
+			hasLogOnly = true
+		}
 	}
-	d := reqctx.Decision{Action: reqctx.ActionAllow, Phase: "pipeline", Reason: "no terminal decision"}
+	d := reqctx.Decision{Action: reqctx.ActionAllow, Phase: "pipeline", Reason: "no terminal decision", Score: score, Tags: tags}
+	if hasLogOnly {
+		logOnly.Score = score
+		logOnly.Tags = append([]string(nil), tags...)
+		d = logOnly
+	}
 	c.SetDecision(d)
 	return d
 }

@@ -46,10 +46,30 @@ func NewPhase(limiter *Limiter, bans BanWriter) *Phase {
 func (p *Phase) Name() string { return "ratelimit" }
 
 func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
+	return p.handle(ctx, "")
+}
+
+// HandlePolicy applies one named snapshot policy for a matching custom rule.
+func (p *Phase) HandlePolicy(ctx *reqctx.RequestCtx, policyID string) reqctx.Decision {
+	if policyID == "" {
+		return rateDecision(reqctx.ActionBlock, "", 0, "rate limit policy id is required")
+	}
+	return p.handle(ctx, policyID)
+}
+
+func (p *Phase) handle(ctx *reqctx.RequestCtx, selectedPolicy string) reqctx.Decision {
 	if ctx.Site == nil {
+		if selectedPolicy != "" {
+			return rateDecision(reqctx.ActionBlock, selectedPolicy, 0, "rate limit policy site is unavailable")
+		}
 		return reqctx.Decision{Action: reqctx.ActionAllow, RuleID: "ratelimit_no_site", Phase: p.Name(), Score: 0, Reason: "no routed site"}
 	}
+	found := selectedPolicy == ""
 	for _, policy := range p.policy(ctx) {
+		if selectedPolicy != "" && policy.config.ID != selectedPolicy {
+			continue
+		}
+		found = true
 		if policy.err != nil {
 			return rateDecision(reqctx.ActionBlock, policy.config.ID, 0, "rate limit policy invalid: "+policy.err.Error())
 		}
@@ -86,6 +106,9 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 			retry = window
 		}
 		return rateDecision(action, policy.config.ID, retry, "rate limit exceeded ("+policy.config.Action+")")
+	}
+	if !found {
+		return rateDecision(reqctx.ActionBlock, selectedPolicy, 0, "rate limit policy not found")
 	}
 	return reqctx.Decision{Action: reqctx.ActionAllow, RuleID: "ratelimit_allow", Phase: p.Name(), Score: 0, Reason: "no rate limit matched"}
 }
