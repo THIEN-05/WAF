@@ -8,15 +8,13 @@
 - `go vet ./...` → PASS, exit 0.
 - `go test -count=1 ./...` → PASS toàn bộ packages, exit 0 khi cho phép test loopback chạy ngoài sandbox Windows.
 - `go test -count=1 ./pkg/wafcore ./edge/internal/access ./edge/internal/ratelimit ./edge/internal/router ./edge/internal/pipeline ./edge/internal/configsync` → PASS.
-- `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` → package PASS; hai test tích hợp Redis thật đã **SKIP** vì không kết nối được `localhost:6379`. Kết quả này chỉ xác nhận build/tag và các test không phụ thuộc Redis.
+- `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` → PASS, gồm cả hai test Redis thật; Redis tại `localhost:6379` truy cập được trong lần chạy này.
 - Benchmark access/rate limit đã chạy 5 lần. Median và allocs/op được ghi trong `docs/BENCHMARKS.md`.
 - `TestSnapshotYAMLRoundTrip` đọc `test/fixtures/snapshot.sample.yaml`, validate, round-trip YAML → JSON → struct và so sánh struct; `TestDSLErrorGolden` có 13 golden case với lỗi chính xác gồm dòng/cột.
 - Test cần loopback đã được đặt tên `TestLoopback...` tại edgecore, listener và proxy. Chúng chỉ chạy được ngoài sandbox Windows có chặn loopback; lần chạy full test xanh ở trên được thực hiện với quyền loopback.
 
 ### Chưa xác minh — lệnh tự chạy lại
 
-- **Redis thật:** hiện không có Redis truy cập được; hai test tích hợp thật đã skip, nên Lua đồng thời/PEXPIRE và outage/recovery chưa được xác nhận với server thật. Khởi động Redis rồi chạy `make test-integration`; lệnh tương đương trên máy không có `make` là `go test -tags=integration -count=1 -v ./edge/internal/ratelimit`. Có thể đặt `REDIS_ADDR` (địa chỉ `host:port` hoặc URL Redis); mặc định là `localhost:6379`.
-- **Race detector:** `go test -race -count=1 ./...` hiện dừng với `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`. Cần môi trường có CGO và compiler C, rồi chạy lại lệnh đó.
 - **Loopback trong sandbox:** test cần loopback bị Windows sandbox chặn. Đặt tên test `TestLoopback...`; chạy `go test -count=1 ./...` ngoài sandbox Windows để xác minh chúng.
 
 Các mục lịch sử bên dưới ghi phạm vi phase; trạng thái xác minh hiện tại trong mục này là nguồn mới nhất.
@@ -44,10 +42,20 @@ Lấy log còn thiếu cho từng run: `gh run list --commit <commit>`, sau đó
 - `golangci-lint run ./...` → PASS, `0 issues.` Local linter: v2.1.6.
 - `go vet ./...` → PASS, exit 0.
 - `go test -count=1 ./...` → PASS toàn bộ packages khi chạy ngoài sandbox loopback.
-- `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` → các test thường PASS; hai test Redis thật SKIP do không có server tại `localhost:6379`.
+- `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` → PASS, gồm test Lua đồng thời và test outage/recovery với Redis thật.
 - `go test -race -count=1 ./...` trên Windows chưa chạy được: `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`; máy hiện có `CGO_ENABLED=0`, không tìm thấy gcc/clang. Workflow Ubuntu đã giữ nguyên race test làm job độc lập, nhưng thay đổi workflow chưa có kết quả GitHub Actions vì chưa được chạy trên remote.
 - Bộ phiên bản: CI/setup-go lấy 1.22.8 từ `go.mod`, trùng WSL. Windows hiện dùng Go 1.26.5; kết quả local không thay thế race run trên Ubuntu 1.22.8.
 - Lấy log workflow sau khi push: `gh run list --commit <commit>`, rồi `gh run view <run-id> --log-failed`. Chỉ kết luận nguyên nhân từ log thực tế.
+
+## Điều tra Redis integration outage — 2026-11-22
+
+- Nguyên nhân là timeout không được áp vào thao tác mạng. `AsyncRedisSync.flush` đã tạo context có timeout 150 ms và chuyển lỗi backend thành `Healthy=false`/tăng `FailedBatches`; limiter bỏ cache Redis khi unhealthy và tiếp tục dùng bộ đếm local. Nhưng `NewRedisClientBackend` tạo go-redis v9.7.3 với mặc định `ContextTimeoutEnabled=false`; trong cấu hình đó go-redis thay context của lệnh bằng `context.Background()` khi đọc/ghi socket. Redis mặc định đợi 3 giây để đọc phản hồi, trong khi test pause ghi 1.8 giây và chỉ đợi 1 giây. Lệnh bị pause vì vậy hoàn tất thành công sau khi Redis tiếp tục, không có lỗi để syncer đánh dấu degraded. Đây là mismatch timeout hiệu lực (nguyên nhân gần với mục c), không phải queue rỗng hay lỗi bị syncer nuốt.
+- Đã bật `ContextTimeoutEnabled` ở Redis client, giảm timeout batch mặc định xuống 200 ms và thêm `Degraded()` accessor. Khi batch báo lỗi, `flush` giữ trạng thái degraded; limiter tiếp tục quyết định bằng counter local; batch Redis thành công kế tiếp đặt lại healthy. Test giữ nguyên các assertion outage/fallback/recovery, chờ trạng thái bằng polling và không skip khi Redis thiếu.
+- Đã xác minh: `go test -tags=integration -count=1 -v ./edge/internal/ratelimit` PASS với Redis thật truy cập ở `localhost:6379`; outage được quan sát và recovery thành công. `go test -tags=integration -count=5 ./edge/internal/ratelimit` cũng PASS 5 lần liên tiếp.
+- Lint sau gofmt: `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → PASS; `go test -count=1 ./...` → PASS.
+- WSL đã được mở ngoài sandbox; Go 1.22.8 ở `/usr/local/go/bin/go` (không nằm trong PATH) và Redis báo `8.0.5`. Lệnh `/usr/local/go/bin/go test -tags=integration -race -count=5 ./edge/internal/ratelimit` → PASS trong 28.340s.
+- Lệnh verbose cũng PASS trong WSL: `/usr/local/go/bin/go test -tags=integration -count=1 -v ./edge/internal/ratelimit`; cả Lua concurrent và outage/fallback/recovery đều PASS.
+- Lệnh người dùng chạy trong WSL/Ubuntu (host này cần gọi Go qua path đầy đủ vì binary không nằm trong PATH): `/usr/local/go/bin/go test -tags=integration -race -count=5 ./edge/internal/ratelimit`.
 
 ## Cập nhật Compose storage
 
@@ -129,12 +137,12 @@ Lấy log còn thiếu cho từng run: `gh run list --commit <commit>`, sau đó
 - Đã nối access rồi rate-limit vào pipeline edge mặc định. `block`/`throttle` trả 429; `challenge` dùng challenge response. Rate limit ghi `request_id` và `rule_id` vào log tiếng Việt.
 - Đã thêm k6 script `test/k6/ratelimit.js` để xác nhận POST `/login` nhận 429 khi vượt hạn mức.
 - **Đã xác minh:** access/rate-limit tests gồm một triệu key tấn công với cap giữ nguyên; tràn capacity và đồng hồ lùi; X-Forwarded-For giả từ nguồn không tin cậy; IPv4-mapped IPv6; allow-list ưu tiên block/ban; GeoResolver lỗi theo `fail_mode`; ban hết hạn và cleanup; benchmark access/rate limit được ghi trong `docs/BENCHMARKS.md`.
-- **Chưa xác minh:** Redis thật, race detector và benchmark request/edge; xem các lệnh tự chạy lại ở mục “Kiểm chứng gần nhất” phía trên.
+- **Chưa xác minh:** race detector trên WSL/Ubuntu và benchmark request/edge; xem các lệnh tự chạy lại ở mục “Kiểm chứng gần nhất” phía trên.
 
 ### TODO P3
 
 1. Chạy CI race trên runner Ubuntu để xác nhận data race bằng `go test -race -count=1 ./...`.
-2. Chạy k6 và test Lua với Redis service thật trong môi trường Docker có quyền truy cập daemon.
+2. Chạy k6 với Redis service thật trong môi trường Docker có quyền truy cập daemon.
 3. Kiểm thử GeoIP/ASN lookup với bộ MMDB hợp lệ được cấp phép; không commit dữ liệu MMDB vào repo.
 4. Chuyển global blocklist từ biến môi trường sang danh sách có chữ ký đi cùng snapshot/ConfigSync; nối hook Under Attack với state/override từ CP.
 

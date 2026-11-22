@@ -45,7 +45,7 @@ func openIntegrationRedis(t *testing.T) (*RedisClientBackend, *redis.Client) {
 	if err := admin.Ping(ctx).Err(); err != nil {
 		_ = backend.Close()
 		_ = admin.Close()
-		t.Skipf("Redis is unavailable at %s: %v", integrationRedisAddr(), err)
+		t.Fatalf("required Redis is unavailable at %s: %v", integrationRedisAddr(), err)
 	}
 	t.Cleanup(func() { _ = backend.Close(); _ = admin.Close() })
 	return backend, admin
@@ -117,10 +117,10 @@ func TestIntegrationRedisOutageFallsBackAndRecovers(t *testing.T) {
 	key := fmt.Sprintf("waf:test:outage:%d", time.Now().UnixNano())
 	syncer.Queue(RedisIncrement{Key: key, TTL: time.Minute, Limit: 1})
 	deadline := time.Now().Add(time.Second)
-	for syncer.Healthy() && time.Now().Before(deadline) {
+	for !syncer.Degraded() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if syncer.Healthy() || syncer.FailedBatches() == 0 {
+	if !syncer.Degraded() || syncer.FailedBatches() == 0 {
 		t.Fatal("Redis outage was not observed by the syncer")
 	}
 	if allowed, _, err := limiter.AllowToken("site", "local-fallback", 1, time.Minute, 0); err != nil || !allowed {

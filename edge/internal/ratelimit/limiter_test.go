@@ -167,7 +167,7 @@ func TestRedisFailureFallsBackToLocalLimiter(t *testing.T) {
 	for syncer.Healthy() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if syncer.Healthy() || syncer.FailedBatches() == 0 {
+	if !syncer.Degraded() || syncer.FailedBatches() == 0 {
 		t.Fatal("Redis failure was not observed")
 	}
 	allowed, retry, err := limiter.AllowToken("site", "ip:192.0.2.1", 1, time.Minute, 0)
@@ -250,8 +250,8 @@ func TestAsyncRedisSyncUsesLuaBatchAndRecovers(t *testing.T) {
 	for backend.calls.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if backend.calls.Load() != 1 || !syncer.Healthy() {
-		t.Fatalf("batch calls=%d healthy=%v", backend.calls.Load(), syncer.Healthy())
+	if backend.calls.Load() != 1 || syncer.Degraded() {
+		t.Fatalf("batch calls=%d degraded=%v", backend.calls.Load(), syncer.Degraded())
 	}
 	if exceeded, _ := syncer.RemoteExceeded("k2", 1, time.Now()); !exceeded {
 		t.Fatal("asynchronously synchronized Redis count did not enforce remote threshold")
@@ -263,6 +263,17 @@ func TestAsyncRedisSyncUsesLuaBatchAndRecovers(t *testing.T) {
 	defer cancel()
 	if err := syncer.Close(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRedisClientBackendHonorsContextTimeout(t *testing.T) {
+	backend, err := NewRedisClientBackend("redis://127.0.0.1:6379/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = backend.Close() }()
+	if !backend.client.Options().ContextTimeoutEnabled {
+		t.Fatal("Redis backend must apply AsyncRedisSync context deadlines to socket operations")
 	}
 }
 

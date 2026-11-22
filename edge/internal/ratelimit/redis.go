@@ -38,6 +38,9 @@ func NewRedisClientBackend(rawURL string) (*RedisClientBackend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse Redis URL: %w", err)
 	}
+	// AsyncRedisSync supplies a short per-batch context deadline. go-redis
+	// otherwise replaces it with context.Background() for socket I/O.
+	options.ContextTimeoutEnabled = true
 	return &RedisClientBackend{client: redis.NewClient(options)}, nil
 }
 
@@ -131,7 +134,7 @@ func NewAsyncRedisSync(backend RedisBackend, cfg RedisSyncConfig) *AsyncRedisSyn
 		cfg.FlushEvery = 25 * time.Millisecond
 	}
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 2 * time.Second
+		cfg.Timeout = 200 * time.Millisecond
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	syncer := &AsyncRedisSync{backend: backend, queue: make(chan RedisIncrement, cfg.QueueSize), cfg: cfg, ctx: ctx, cancel: cancel, done: make(chan struct{}), remote: map[string]remoteCounter{}}
@@ -152,6 +155,9 @@ func (s *AsyncRedisSync) Queue(increment RedisIncrement) {
 }
 
 func (s *AsyncRedisSync) Healthy() bool { return s != nil && s.healthy.Load() }
+func (s *AsyncRedisSync) Degraded() bool {
+	return s != nil && !s.Healthy()
+}
 func (s *AsyncRedisSync) FailedBatches() uint64 {
 	if s == nil {
 		return 0
