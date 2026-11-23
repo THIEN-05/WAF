@@ -47,3 +47,64 @@ func TestSkipPhaseAndAccumulatedDecision(t *testing.T) {
 		t.Fatalf("skipped phase decision=%+v", got)
 	}
 }
+
+func TestWAFEventsAreAuditedAsynchronously(t *testing.T) {
+	metrics := NewHistogram()
+	defer metrics.Close()
+	p := New(metrics,
+		testPhase{"waf", reqctx.Decision{Action: reqctx.ActionAllow, RuleID: "waf_budget", Tags: []string{AuditWAFBudgetExceeded, AuditWAFBodyTruncated}}},
+	)
+	ctx := reqctx.New(httptest.NewRequest("POST", "http://x/", strings.NewReader("body")), nil, "audit", nil)
+	_ = p.Run(ctx)
+	reqctx.Release(ctx)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		counts := metrics.AuditCounts()
+		if counts[AuditWAFBudgetExceeded] == 1 && counts[AuditWAFBodyTruncated] == 1 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("async audit events were not recorded: %v", metrics.AuditCounts())
+}
+
+type blockedAuditWriter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w blockedAuditWriter) WriteAudit(AuditEvent) {
+	select {
+	case w.started <- struct{}{}:
+	default:
+	}
+	<-w.release
+}
+
+func TestAsyncAuditDropsWhenQueueFullWithoutBlockingEmitter(t *testing.T) {
+	writer := blockedAuditWriter{started: make(chan struct{}, 1), release: make(chan struct{})}
+	sink := NewAsyncAuditSink(writer, 1)
+	if !sink.Emit(AuditEvent{Kind: "first"}) {
+		t.Fatal("first audit event dropped")
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("audit worker did not start")
+	}
+	if !sink.Emit(AuditEvent{Kind: "queued"}) {
+		t.Fatal("second event should fit bounded queue")
+	}
+	started := time.Now()
+	if sink.Emit(AuditEvent{Kind: "overflow"}) {
+		t.Fatal("full queue accepted overflow event")
+	}
+	if time.Since(started) > 20*time.Millisecond {
+		t.Fatal("audit enqueue blocked request path")
+	}
+	if got := sink.Dropped(); got != 1 {
+		t.Fatalf("dropped=%d want=1", got)
+	}
+	close(writer.release)
+	sink.Close()
+}

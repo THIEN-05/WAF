@@ -187,7 +187,7 @@
   paranoia: 4
   tags: [owasp-a06, virtual-patching, template, virtual_patch]
   prefilter: [cve-2099-0000-replace-with-reviewed-indicator]
-- id: waf-sqli-heldout-001
+- id: waf-sqli-p4c-001
   phase: request
   targets: [args, body, cookies]
   transforms: [url_decode, lowercase, remove_sql_comments, compress_whitespace]
@@ -197,7 +197,7 @@
   tags: [owasp-a03, sqli]
   prefilter: [or, and, select, pg_sleep, benchmark]
 
-- id: waf-xss-heldout-001
+- id: waf-xss-p4c-001
   phase: request
   targets: [args, body, cookies]
   transforms: [url_decode, html_entity_decode, lowercase, remove_nul]
@@ -207,7 +207,7 @@
   tags: [owasp-a03, xss]
   prefilter: [onbegin, ontoggle, onfocus, onmouseover, onanimationstart, foreignobject]
 
-- id: waf-rce-heldout-001
+- id: waf-rce-p4c-001
   phase: request
   targets: [args, body, cookies]
   transforms: [url_decode, lowercase, compress_whitespace]
@@ -217,7 +217,7 @@
   tags: [owasp-a03, rce]
   prefilter: [python, /bin/id, /usr/bin, '${ifs}', perl, ruby]
 
-- id: waf-ssrf-heldout-001
+- id: waf-ssrf-p4c-001
   phase: request
   targets: [args, body, cookies]
   transforms: [url_decode, lowercase]
@@ -227,7 +227,7 @@
   tags: [owasp-a10, ssrf]
   prefilter: ['::1', fe80, 0177, 2130706433, 0x7f000001]
 
-- id: waf-sensitive-files-heldout-001
+- id: waf-sensitive-files-p4c-001
   phase: request
   targets: [path]
   transforms: [url_decode, path_normalize, lowercase]
@@ -237,7 +237,7 @@
   tags: [owasp-a01, sensitive-file, sensitive]
   prefilter: [.hg, .docker, .npmrc, server-status, actuator, debug/vars, backup, tfstate, id_ed25519]
 
-- id: waf-scanner-ua-heldout-001
+- id: waf-scanner-ua-p4c-001
   phase: request
   targets: [headers]
   transforms: [lowercase]
@@ -246,3 +246,153 @@
   paranoia: 1
   tags: [owasp-a05, scanner]
   prefilter: [wpscan, arachni, whatweb, feroxbuster, ffuf, nuclei, openvas]
+
+- id: waf-sqli-p2-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, remove_sql_comments, compress_whitespace]
+  pattern: '(?:\b(?:or|and)\b\s+\d+\s*(?:=|>|<)\s*\d+|''\s*(?:or|and)\s*''[^'']{1,24}''\s*=\s*''[^'']{1,24}''|\b(?:or|and)\b\s+[^\s]{1,24}\s*(?:like|regexp|rlike)\s+[^\s]{1,24}|\bhaving\s+\d+\s*=\s*\d+|\b(?:waitfor\s+delay|pg_sleep|dbms_lock\.sleep)\s*\()'
+  severity: error
+  paranoia: 2
+  tags: [owasp-a03, sqli, sqli-boolean]
+  prefilter: [or, and, having, regexp, rlike, waitfor, pg_sleep, dbms_lock]
+
+- id: waf-sqli-p3-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, remove_sql_comments, compress_whitespace]
+  pattern: '(?:\bunion\s+(?:distinct\s+)?select\b.{0,100}\b(?:from|information_schema)\b|\b(?:extractvalue|updatexml)\s*\()'
+  severity: critical
+  paranoia: 3
+  tags: [owasp-a03, sqli, sqli-union]
+  prefilter: [union, select, extractvalue, updatexml]
+
+- id: waf-sqli-p4-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, remove_sql_comments, compress_whitespace]
+  pattern: '(?:\b(?:benchmark|sleep|pg_sleep)\s*\([^)]{0,80}\)|\binto\s+(?:dumpfile|outfile)\b|\bload_file\s*\()'
+  severity: critical
+  paranoia: 4
+  tags: [owasp-a03, sqli, sqli-exfiltration]
+  prefilter: [benchmark, sleep, pg_sleep, dumpfile, outfile, load_file]
+
+- id: waf-rce-p2-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, compress_whitespace]
+  pattern: '(?:;\s*(?:printf|printenv|env)\b.{0,80}(?:\$|path|home|http)|(?:%0a|\n)\s*(?:id|whoami|uname)\b)'
+  severity: error
+  paranoia: 2
+  tags: [owasp-a03, rce, shell-enumeration]
+  prefilter: [printf, printenv, env, '%0a', id, whoami, uname]
+
+- id: waf-rce-p3-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, compress_whitespace]
+  pattern: '(?:\b(?:curl|wget)\b.{0,100}\|\s*(?:sh|bash)\b|\b(?:nc|ncat|netcat)\b.{0,80}(?:-e|--exec)\s*/bin/)'
+  severity: critical
+  paranoia: 3
+  tags: [owasp-a03, rce, shell-pipeline]
+  prefilter: [curl, wget, nc, ncat, netcat]
+
+- id: waf-rce-p4-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, compress_whitespace]
+  pattern: '(?:\b(?:base64\s+-d|chmod\s+\+x|mkfifo)\b.{0,80}(?:/bin/|\$\(|;)|\$\{ifs\}.{0,20}(?:curl|wget|bash|sh))'
+  severity: critical
+  paranoia: 4
+  tags: [owasp-a03, rce, shell-obfuscation]
+  prefilter: [base64, chmod, mkfifo, '${ifs}']
+
+- id: waf-traversal-p2-001
+  phase: request
+  targets: [path, args, body]
+  transforms: [url_decode, path_normalize, lowercase]
+  pattern: '(?:\.\.%2f|\.\.%5c|%2e%2e%2f|%2e%2e%5c|\.\.;[/\\])'
+  severity: error
+  paranoia: 2
+  tags: [owasp-a01, traversal, encoded-traversal]
+  prefilter: ['..%2f', '..%5c', '%2e%2e']
+
+- id: waf-traversal-p3-001
+  phase: request
+  targets: [path, args]
+  transforms: [url_decode, path_normalize, lowercase]
+  pattern: '(?:%u(?:002e|2215)|%c0%ae|%c1%9c|%252e%252e|\.\.\\\.\.)'
+  severity: critical
+  paranoia: 3
+  tags: [owasp-a01, traversal, unicode-traversal]
+  prefilter: ['%u', '%c0', '%c1', '%252e']
+
+- id: waf-traversal-p4-001
+  phase: request
+  targets: [path, args]
+  transforms: [url_decode, path_normalize, lowercase]
+  pattern: '(?:\\\.\\.|\.\.%00|\.\.%c0%af|(?:/|\\)(?:etc/(?:shadow|passwd)|proc/self/environ))'
+  severity: critical
+  paranoia: 4
+  tags: [owasp-a01, traversal, lfi]
+  prefilter: ['%00', '%c0', shadow, passwd, environ]
+
+- id: waf-deser-p2-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:o:\s*[0-9]{1,3}:"[^" ]{1,60}"|!!(?:python|java)/object|java\.util\.priorityqueue|\$type\\?"?\s*:\\?"[^" ]{1,60}")'
+  severity: error
+  paranoia: 2
+  tags: [owasp-a08, deserialization, serialized-object]
+  prefilter: ['o:', '!!python', '!!java', priorityqueue, '$type']
+
+- id: waf-xss-p2-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, html_entity_decode, lowercase, remove_nul]
+  pattern: '\bon(?:pageshow|pagehide|animationstart|animationend|pointerenter|pointerleave)\s*='
+  severity: error
+  paranoia: 2
+  tags: [owasp-a03, xss, event-handler]
+  prefilter: [onpageshow, onpagehide, onanimation, onpointer]
+
+- id: waf-rfi-p2-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:(?:https?|ftp)://[^\s]{1,160}\.(?:php|phtml|jsp)(?:[?&]|$)|(?:php|data)://)'
+  severity: critical
+  paranoia: 2
+  tags: [owasp-a10, rfi, remote-include]
+  prefilter: [http, ftp, php://, data://]
+
+- id: waf-ssrf-p2-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:https?://(?:10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|169\.254\.[0-9]{1,3}\.[0-9]{1,3})(?:[:/]|$))'
+  severity: critical
+  paranoia: 2
+  tags: [owasp-a10, ssrf, private-network]
+  prefilter: [http://10., http://192.168., http://172., http://169.254.]
+
+- id: waf-deser-p3-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:__reduce__|__globals__|invokertransformer|commons\.collections\.functors)'
+  severity: critical
+  paranoia: 3
+  tags: [owasp-a08, deserialization, gadget-chain]
+  prefilter: [__reduce__, __globals__, invokertransformer, commons.collections]
+
+- id: waf-deser-p4-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:java\.security\.signedobject|org\.apache\.commons\.collections|system\.management\.automation\.psobject)'
+  severity: critical
+  paranoia: 4
+  tags: [owasp-a08, deserialization, gadget-chain]
+  prefilter: [signedobject, org.apache.commons, psobject]

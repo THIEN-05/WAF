@@ -157,6 +157,9 @@ func (e *Edge) Close() {
 		e.healthCancel()
 	}
 	e.poolMu.Unlock()
+	if e.histogram != nil {
+		e.histogram.Close()
+	}
 }
 func (e *Edge) Metrics() http.Handler { return e.histogram }
 func (e *Edge) CanonicalHTTPHost(host string) (string, bool) {

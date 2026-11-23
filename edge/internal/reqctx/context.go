@@ -179,7 +179,17 @@ func (c *RequestCtx) Number(field string) float64 {
 
 // BodyText reads a bounded request body once and restores it for the origin.
 func (c *RequestCtx) BodyText() string {
+	return c.BodyPrefix(0)
+}
+
+// BodyPrefix reads at most maxBytes for inspection, then restores those bytes
+// and leaves the unread body attached for the origin to stream.
+func (c *RequestCtx) BodyPrefix(maxBytes int) string {
 	if c.bodyLoaded {
+		if maxBytes > 0 && len(c.bodyText) > maxBytes {
+			c.bodyTruncated = true
+			return c.bodyText[:maxBytes]
+		}
 		return c.bodyText
 	}
 	c.bodyLoaded = true
@@ -196,11 +206,14 @@ func (c *RequestCtx) BodyText() string {
 	if limit < 1 {
 		limit = 8 * 1024
 	}
+	if maxBytes > 0 && int64(maxBytes) < limit {
+		limit = int64(maxBytes)
+	}
 	original := c.Request.Body
 	captured, err := io.ReadAll(io.LimitReader(original, limit+1))
 	c.bodyReadErr = err
-	c.bodyTruncated = int64(len(captured)) > limit
-	if c.bodyTruncated {
+	c.bodyTruncated = int64(len(captured)) > limit || err != nil
+	if int64(len(captured)) > limit {
 		c.bodyText = string(captured[:limit])
 	} else {
 		c.bodyText = string(captured)

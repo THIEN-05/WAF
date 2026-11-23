@@ -27,6 +27,14 @@ type Normalized struct {
 // Normalize applies bounded URL decoding, HTML entity decoding, NUL removal,
 // path canonicalization, lowercasing, whitespace folding, and SQL comment removal.
 func Normalize(input string, isPath bool) Normalized {
+	value, _ := normalizeBounded(input, isPath, nil)
+	return value
+}
+
+func normalizeBounded(input string, isPath bool, expired func() bool) (Normalized, bool) {
+	if expired != nil && expired() {
+		return Normalized{}, false
+	}
 	if len(input) > maxTargetBytes {
 		input = input[:maxTargetBytes]
 	}
@@ -34,11 +42,17 @@ func Normalize(input string, isPath bool) Normalized {
 	decoded := input
 	out.DoubleEncoded = strings.Contains(strings.ToLower(input), "%25")
 	for i := 0; i < 3; i++ {
+		if expired != nil && expired() {
+			return Normalized{}, false
+		}
 		next, err := url.PathUnescape(decoded)
 		if err != nil || next == decoded {
 			break
 		}
 		decoded = next
+	}
+	if expired != nil && expired() {
+		return Normalized{}, false
 	}
 	decoded = html.UnescapeString(decoded)
 	out.HadNUL = strings.ContainsRune(decoded, '\x00')
@@ -46,6 +60,9 @@ func Normalize(input string, isPath bool) Normalized {
 	out.Traversal = traversalRE.MatchString(decoded)
 	out.Decoded = decoded
 	if isPath && decoded != "" {
+		if expired != nil && expired() {
+			return Normalized{}, false
+		}
 		wasAbsolute := strings.HasPrefix(decoded, "/")
 		decoded = path.Clean(decoded)
 		if wasAbsolute && !strings.HasPrefix(decoded, "/") {
@@ -53,7 +70,10 @@ func Normalize(input string, isPath bool) Normalized {
 		}
 	}
 	decoded = strings.ToLower(decoded)
+	if expired != nil && expired() {
+		return Normalized{}, false
+	}
 	decoded = sqlComments.ReplaceAllString(decoded, " ")
 	out.Value = strings.Join(strings.Fields(decoded), " ")
-	return out
+	return out, true
 }

@@ -58,12 +58,14 @@ type Origin struct {
 }
 
 type WAFConfig struct {
-	Mode        string         `json:"mode" yaml:"mode"`
-	Sensitivity string         `json:"sensitivity" yaml:"sensitivity"`
-	BodyLimitKB int            `json:"body_limit_kb" yaml:"body_limit_kb"`
-	Paranoia    int            `json:"paranoia,omitempty" yaml:"paranoia,omitempty"`
-	BudgetMS    int            `json:"budget_ms,omitempty" yaml:"budget_ms,omitempty"`
-	Exclusions  []WAFExclusion `json:"exclusions" yaml:"exclusions"`
+	Mode               string         `json:"mode" yaml:"mode"`
+	Sensitivity        string         `json:"sensitivity" yaml:"sensitivity"`
+	BodyLimitKB        int            `json:"body_limit_kb" yaml:"body_limit_kb"`
+	Paranoia           int            `json:"paranoia,omitempty" yaml:"paranoia,omitempty"`
+	BudgetMS           int            `json:"budget_ms,omitempty" yaml:"budget_ms,omitempty"`
+	ScanLimitBytes     int            `json:"scan_limit_bytes,omitempty" yaml:"scan_limit_bytes,omitempty"`
+	TruncatedBodyScore int            `json:"truncated_body_score,omitempty" yaml:"truncated_body_score,omitempty"`
+	Exclusions         []WAFExclusion `json:"exclusions" yaml:"exclusions"`
 }
 
 type WAFExclusion struct {
@@ -193,6 +195,12 @@ func (s Snapshot) Validate() error {
 		}
 		if site.WAF.BudgetMS < 0 {
 			errs = append(errs, p+".waf.budget_ms: must not be negative")
+		}
+		if site.WAF.ScanLimitBytes < 0 || site.WAF.ScanLimitBytes > 4*1024 {
+			errs = append(errs, p+".waf.scan_limit_bytes: must be between 0 and 4096")
+		}
+		if site.WAF.TruncatedBodyScore < 0 || site.WAF.TruncatedBodyScore > 5 {
+			errs = append(errs, p+".waf.truncated_body_score: must be between 0 and 5")
 		}
 		for j, exclusion := range site.WAF.Exclusions {
 			if exclusion.RuleID == "" || (exclusion.Path == "" && exclusion.Param == "") {

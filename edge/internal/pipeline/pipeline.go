@@ -49,6 +49,11 @@ func (p *Pipeline) Run(c *reqctx.RequestCtx) reqctx.Decision {
 			if _, exists := seenTags[tag]; !exists && len(tags) < 32 {
 				seenTags[tag] = struct{}{}
 				tags = append(tags, tag)
+				if sink, ok := p.observer.(interface{ EnqueueAudit(AuditEvent) bool }); ok {
+					if tag == AuditWAFBudgetExceeded || tag == AuditWAFBodyTruncated {
+						sink.EnqueueAudit(AuditEvent{Kind: tag, At: time.Now()})
+					}
+				}
 			}
 		}
 		d.Score = score
@@ -73,17 +78,38 @@ func (p *Pipeline) Run(c *reqctx.RequestCtx) reqctx.Decision {
 }
 
 type Histogram struct {
-	mu         sync.Mutex
-	counts     map[string][]uint64
-	sums       map[string]float64
-	bounds     []float64
-	blocked    map[string]uint64
-	logDropped uint64
+	mu          sync.Mutex
+	counts      map[string][]uint64
+	sums        map[string]float64
+	bounds      []float64
+	blocked     map[string]uint64
+	logDropped  uint64
+	audit       *AsyncAuditSink
+	auditMemory *MemoryAuditWriter
 }
 
 func NewHistogram() *Histogram {
-	return &Histogram{counts: map[string][]uint64{}, sums: map[string]float64{}, bounds: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}, blocked: map[string]uint64{}}
+	writer := NewMemoryAuditWriter()
+	return NewHistogramWithAudit(writer, 256)
 }
+
+func NewHistogramWithAudit(writer AuditWriter, capacity int) *Histogram {
+	h := &Histogram{counts: map[string][]uint64{}, sums: map[string]float64{}, bounds: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}, blocked: map[string]uint64{}}
+	if memory, ok := writer.(*MemoryAuditWriter); ok {
+		h.auditMemory = memory
+	}
+	h.audit = NewAsyncAuditSink(writer, capacity)
+	return h
+}
+
+func (h *Histogram) EnqueueAudit(event AuditEvent) bool { return h.audit.Emit(event) }
+func (h *Histogram) AuditCounts() map[string]uint64 {
+	if h.auditMemory == nil {
+		return nil
+	}
+	return h.auditMemory.Counts()
+}
+func (h *Histogram) Close() { h.audit.Close() }
 
 func (h *Histogram) Blocked(action string) { h.mu.Lock(); h.blocked[action]++; h.mu.Unlock() }
 func (h *Histogram) LogDropped(n uint64)   { h.mu.Lock(); h.logDropped += n; h.mu.Unlock() }
@@ -119,6 +145,10 @@ func (h *Histogram) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		out.Printf("edge_blocked_total{action=%q} %d\n", action, count)
 	}
 	out.Printf("edge_log_dropped_total %d\n", h.logDropped)
+	auditCounts := h.AuditCounts()
+	out.Printf("edge_waf_budget_exceeded_total %d\n", auditCounts[AuditWAFBudgetExceeded])
+	out.Printf("edge_waf_body_truncated_total %d\n", auditCounts[AuditWAFBodyTruncated])
+	out.Printf("edge_waf_audit_dropped_total %d\n", h.audit.Dropped())
 	if out.err != nil {
 		log.Printf("metrics exporter: lỗi ghi phản hồi: %v", out.err)
 	}
