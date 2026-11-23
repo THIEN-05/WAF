@@ -4,6 +4,14 @@
 
 ### Đã xác minh
 
+- **P4 lượt 2/2:** mở rộng `edge/rulesets/managed.yml` thành 19 luật mẫu, phủ SQLi, XSS, traversal/LFI, RFI, RCE, SSRF (metadata/loopback/private IPv4), XXE, SSTI, deserialization, giao thức (thiếu Host/phương thức lạ/CL+TE/Content-Length trùng), scanner UA, tệp nhạy cảm và marker virtual patching. Mỗi rule có ID riêng, targets, transforms, RE2, severity, paranoia 1–4 và OWASP tag. Loader kiểm tra regex và size, targets/transforms/tags, ID trùng trong file và ID trùng toàn ruleset khi nạp/biên dịch; test xác nhận ruleset nhúng biên dịch.
+- Attack corpus tự viết `test/corpus/waf/attacks.tsv`: 20–21 mẫu cho mỗi 13 nhóm; clean corpus `test/corpus/waf/clean.tsv`: 46 mẫu form/JSON/search/path/header/body. `TestManagedCorpusTPRFPR` in TPR/FPR theo nhóm và paranoia; trần FPR cấu hình qua `WAF_FPR_MAX` (mặc định 0), baseline TPR ghi tại `test/corpus/waf/tpr-baseline.json`, có thể tăng trần kiểm tra qua `WAF_TPR_MIN` nhưng không hạ baseline. Đo thật: TPR 100% cho mọi nhóm/paranoia, ngoại trừ marker virtual patch có chủ ý chỉ bật ở P4 (0% ở P1–P3, 100% ở P4); FPR 0/46 tại cả bốn mức. Test né tránh double encoding, case, SQL comments, whitespace, NUL, Unicode và CL+TE đều PASS.
+- `go test -count=1 -v ./edge/internal/waf ./edge/rulesets` → PASS; log có bảng TPR/FPR theo từng nhóm và P1–P4. `go test -count=1 ./...` → PASS toàn bộ packages (Go 1.26.11 Windows/amd64, chạy ngoài sandbox để cho phép loopback).
+- `golangci-lint run ./...` (golangci-lint v2.15.0) → PASS, `0 issues.` `go vet ./...` → PASS, exit 0.
+- `/usr/local/go/bin/go test -race -count=1 ./...` trong WSL/Linux (Go 1.26.11, CGO bật) → PASS toàn bộ packages trên trạng thái source cuối cùng.
+- Benchmark 5 lần trên Windows/amd64, Go 1.26.11, Intel Core i5-11400H: `BenchmarkWAFManagedClean` median **25,462 ns/op, 6,831 B/op, 28 allocs/op**; `BenchmarkWAFManagedEarlyExit` median **10,134 ns/op, 7,093 B/op, 38 allocs/op**. Hai benchmark dùng bộ 19 rule và ngân sách 2 ms; chi tiết và bảng TPR/FPR ở `docs/BENCHMARKS.md`.
+- **Test loopback** (`TestLoopback...` ở edgecore/listener/proxy) chạy được ngoài sandbox Windows; suite thường chạy trong sandbox bị từ chối bind/connect localhost. Đã chạy full test ngoài sandbox thành công.
+
 - `go.mod` ghim Go 1.26.11 (bản vá mới nhất nhánh 1.26 đã phát hành tại thời điểm này); `go get -u ./...` và `go mod tidy` hoàn tất.
 - `go build ./...` → PASS, exit 0 (Go 1.26.11 Windows/amd64).
 - `golangci-lint run ./...` (v2.15.0, build bằng Go 1.26.11) → PASS, `0 issues.`
@@ -32,7 +40,8 @@
 ### Chưa xác minh — lệnh tự chạy lại
 
 - **Chưa xác minh:** kết quả GitHub Actions sau khi push thay đổi này. Cấu hình đã ghim Go 1.26.11 chung cho các job.
-- Không có bước nào trong yêu cầu hiện tại cần người dùng chạy lại trong WSL: lint, vet, full race và Redis integration 5 lần đã chạy thành công ở WSL với Go 1.26.11. Chạy CI GitHub sau khi push để xác minh workflow hosted.
+- **Chưa xác minh:** đối chiếu Coraza/OWASP CRS, cần mạng để tải bộ so sánh (TODO-1 trong `docs/BENCHMARKS.md`).
+- Windows có `CGO_ENABLED=0` nên không chạy được race tại host đó; race đã được xác minh trong WSL. Lint chạy trên Windows bằng `golangci-lint run ./...`, test thường bằng `go test -count=1 ./...`; các lệnh tương ứng với target `make lint test`. Chạy CI GitHub sau khi push để xác minh workflow hosted.
 - Chạy lại các lệnh xác minh khi có thay đổi tiếp theo: `go build ./...`, `golangci-lint run ./...`, `go vet ./...`, `go test -count=1 ./...`, `/usr/local/go/bin/go test -race -count=1 ./...`, `govulncheck ./...`.
 
 Các mục lịch sử bên dưới ghi phạm vi phase; trạng thái xác minh hiện tại trong mục này là nguồn mới nhất.

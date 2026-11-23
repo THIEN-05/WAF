@@ -1,29 +1,189 @@
 - id: waf-sqli-001
   phase: request
   targets: [args, body, cookies]
-  transforms: [url_decode, lowercase, remove_sql_comments]
+  transforms: [url_decode, lowercase, remove_sql_comments, compress_whitespace]
   pattern: '(?:union\s+(?:all\s+)?select|(?:''|%27)\s*(?:or|and)\s+\d+\s*=\s*\d+|sleep\s*\(|benchmark\s*\()'
   severity: critical
   paranoia: 1
   tags: [owasp-a03, sqli]
-  prefilter: [union, select, sleep, benchmark]
+  prefilter: [union, select, or, and, sleep, benchmark]
+
+- id: waf-sqli-002
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, remove_sql_comments, compress_whitespace]
+  pattern: '(?:information_schema|load_file\s*\(|into\s+outfile|extractvalue\s*\(|updatexml\s*\()'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a03, sqli]
+  prefilter: [information_schema, load_file, outfile, extractvalue, updatexml]
 
 - id: waf-xss-001
   phase: request
   targets: [args, body, cookies]
-  transforms: [url_decode, html_entity_decode, lowercase]
+  transforms: [url_decode, html_entity_decode, lowercase, remove_nul]
   pattern: '(?:<\s*script\b|on(?:error|load)\s*=|javascript\s*:|data\s*:\s*text/html|svg\s+onload)'
   severity: error
   paranoia: 1
   tags: [owasp-a03, xss]
-  prefilter: [script, onerror, onload, javascript:, data:text/html, svg]
+  prefilter: [script, onerror, onload, javascript, data, svg]
+
+- id: waf-xss-002
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, html_entity_decode, lowercase]
+  pattern: '(?:<\s*(?:iframe|object|embed)\b|srcdoc\s*=|expression\s*\(|\bdocument\s*\.\s*cookie)'
+  severity: warning
+  paranoia: 1
+  tags: [owasp-a03, xss]
+  prefilter: [iframe, object, embed, srcdoc, expression, document]
 
 - id: waf-traversal-001
   phase: request
   targets: [path, args]
   transforms: [url_decode, path_normalize, lowercase]
-  pattern: '(?:\.\./|/etc/passwd|boot\.ini|php://|file://)'
+  pattern: '(?:\.\./|/etc/passwd|boot\.ini|php://|file://|/proc/self)'
   severity: critical
   paranoia: 1
-  tags: [traversal, lfi]
-  prefilter: ['../', '%2e%2e', '/etc/passwd', boot.ini, 'php://', 'file://']
+  tags: [owasp-a01, traversal, lfi]
+  prefilter: ['..', '../', '%2e%2e', '/etc/passwd', boot.ini, 'php://', 'file://', '/proc/self']
+
+- id: waf-traversal-002
+  phase: request
+  targets: [args, path]
+  transforms: [url_decode, path_normalize, lowercase]
+  pattern: '(?:/windows/system32|c:.*windows.*system32|/etc/shadow|/var/log/|\.\.%2f|\.\.)'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a01, traversal, lfi]
+  prefilter: ['..', system32, shadow, '/var/log', '%2f']
+
+- id: waf-rfi-001
+  phase: request
+  targets: [args, body]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:(?:https?|ftp)://[^[:space:]]+\.(?:php|phtml|jsp)(?:[?&]|$)|(?:php|data)://)'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a10, rfi]
+  prefilter: [http, ftp://, php://, data://]
+
+- id: waf-rce-001
+  phase: request
+  targets: [args, body]
+  transforms: [url_decode, lowercase, remove_sql_comments, compress_whitespace]
+  pattern: '(?:;\s*(?:cat|id|uname|whoami|curl|wget|nc|bash|sh)\b|\$\([^)]{1,80}\)|`[^`]{1,80}`|\|\s*(?:sh|bash)\b)'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a03, rce]
+  prefilter: [';cat', ';id', ';whoami', ';curl', ';wget', ';nc', ';uname', '$(', '`', '|sh', '|bash']
+
+- id: waf-rce-002
+  phase: request
+  targets: [args, body]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:\b(?:powershell|cmd\.exe)\b.{0,40}(?:/c| -enc)|\bbash\b.{0,30}\s-c\b|\b(?:runtime\.getruntime|processbuilder)\b)'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a03, rce]
+  prefilter: [powershell, cmd.exe, bash, runtime.getruntime, processbuilder]
+
+- id: waf-ssrf-001
+  phase: request
+  targets: [args, body]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:(?:https?|ftp)://(?:169\.254\.169\.254|127\.0\.0\.1|localhost)(?:[:/]|$)|(?:169\.254\.169\.254|127\.0\.0\.1|localhost))'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a10, ssrf]
+  prefilter: [169.254.169.254, 127.0.0.1, localhost]
+
+- id: waf-ssrf-002
+  phase: request
+  targets: [args, body]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:(?:https?|ftp)://(?:10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})(?:[:/]|$))'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a10, ssrf]
+  prefilter: [http://10., https://10., http://192.168., https://192.168., http://172., https://172., ftp://127.]
+
+- id: waf-xxe-001
+  phase: request
+  targets: [body]
+  transforms: [url_decode, lowercase, html_entity_decode]
+  pattern: '<!doctype[^>]{0,160}\[\s*<!entity'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a05, xxe]
+  prefilter: [<!doctype, <!entity]
+
+- id: waf-ssti-001
+  phase: request
+  targets: [args, body]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:\{\{[^}]{0,80}\}\}|\$\{[^}]{0,80}\}|<%=?[^%]{1,80}%>)'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a03, ssti]
+  prefilter: ['{{', '${', '<%']
+
+- id: waf-deserialization-001
+  phase: request
+  targets: [args, body]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:aced0005|\$type\s*"\s*:\s*"[^" ]{1,40}|java\.io\.objectinputstream|ro0ab[A-Za-z0-9+/]{3})'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a08, deserialization]
+  prefilter: [aced0005, '$type', objectinputstream, rO0AB]
+
+- id: waf-protocol-001
+  phase: request
+  targets: [protocol]
+  transforms: [lowercase]
+  pattern: '^(?:missing_host|unusual_method=)'
+  severity: warning
+  paranoia: 1
+  tags: [owasp-a04, protocol-anomaly, protocol]
+  prefilter: [missing_host, unusual_method]
+
+- id: waf-protocol-002
+  phase: request
+  targets: [protocol]
+  transforms: [lowercase]
+  pattern: '^(?:content_length_transfer_encoding|duplicate_content_length)$'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a04, request-smuggling, protocol]
+  prefilter: [content_length_transfer_encoding, duplicate_content_length]
+
+- id: waf-scanner-ua-001
+  phase: request
+  targets: [headers]
+  transforms: [lowercase]
+  pattern: '(?:sqlmap|nikto|nmap|masscan|acunetix|nessus|zgrab|gobuster|dirbuster)'
+  severity: warning
+  paranoia: 1
+  tags: [owasp-a05, scanner]
+  prefilter: [sqlmap, nikto, nmap, masscan, acunetix, nessus, zgrab, gobuster, dirbuster]
+
+- id: waf-sensitive-files-001
+  phase: request
+  targets: [path]
+  transforms: [url_decode, path_normalize, lowercase]
+  pattern: '(?:/\.env(?:\.|/|$)|/\.git(?:/|$)|/\.aws/(?:credentials|config)|/wp-config\.php(?:\.bak)?$|/\.ssh/|/id_rsa$)'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a01, sensitive-file, sensitive]
+  prefilter: [.env, .git, .aws, wp-config, .ssh, id_rsa]
+
+- id: waf-virtual-patch-001
+  phase: request
+  targets: [args, body]
+  transforms: [url_decode, lowercase]
+  pattern: 'cve-2099-0000-replace-with-reviewed-indicator'
+  severity: error
+  paranoia: 4
+  tags: [owasp-a06, virtual-patching, template, virtual_patch]
+  prefilter: [cve-2099-0000-replace-with-reviewed-indicator]

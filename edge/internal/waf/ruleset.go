@@ -64,8 +64,20 @@ func LoadYAML(reader io.Reader, maxRegexBytes int) ([]Rule, error) {
 		if rule.Paranoia < 1 || rule.Paranoia > 4 {
 			return nil, fmt.Errorf("rule %s: paranoia must be between 1 and 4", rule.ID)
 		}
+		hasOWASPTag := false
+		for _, tag := range rule.Tags {
+			if strings.TrimSpace(tag) == "" {
+				return nil, fmt.Errorf("rule %s: tags must not be empty", rule.ID)
+			}
+			if strings.HasPrefix(tag, "owasp-") {
+				hasOWASPTag = true
+			}
+		}
+		if !hasOWASPTag {
+			return nil, fmt.Errorf("rule %s: at least one owasp-* tag is required", rule.ID)
+		}
 		for _, target := range rule.Targets {
-			if target != "path" && target != "args" && target != "body" && target != "cookies" && target != "headers" {
+			if target != "path" && target != "args" && target != "body" && target != "cookies" && target != "headers" && target != "protocol" {
 				return nil, fmt.Errorf("rule %s: unsupported target %q", rule.ID, target)
 			}
 		}
@@ -86,7 +98,15 @@ func LoadYAML(reader io.Reader, maxRegexBytes int) ([]Rule, error) {
 func compileRules(rules []Rule) ([]compiledRule, *automaton, error) {
 	compiled := make([]compiledRule, 0, len(rules))
 	words := make([]string, 0)
+	ids := make(map[string]struct{}, len(rules))
 	for _, rule := range rules {
+		if rule.ID == "" {
+			return nil, nil, fmt.Errorf("managed WAF rule has empty id")
+		}
+		if _, exists := ids[rule.ID]; exists {
+			return nil, nil, fmt.Errorf("duplicate managed WAF rule id %q", rule.ID)
+		}
+		ids[rule.ID] = struct{}{}
 		pattern, err := regexp.Compile(rule.Pattern)
 		if err != nil {
 			return nil, nil, fmt.Errorf("rule %s: %w", rule.ID, err)

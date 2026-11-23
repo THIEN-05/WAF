@@ -19,6 +19,7 @@ func LoadEmbedded(maxRegexBytes int) ([]waf.Rule, error) {
 	}
 	sort.Strings(files)
 	var all []waf.Rule
+	seen := make(map[string]struct{})
 	for _, name := range files {
 		file, err := embedded.Open(name)
 		if err != nil {
@@ -31,6 +32,12 @@ func LoadEmbedded(maxRegexBytes int) ([]waf.Rule, error) {
 		}
 		if closeErr != nil {
 			return nil, closeErr
+		}
+		for _, rule := range rules {
+			if _, exists := seen[rule.ID]; exists {
+				return nil, fmt.Errorf("load managed ruleset %s: duplicate rule id %q", name, rule.ID)
+			}
+			seen[rule.ID] = struct{}{}
 		}
 		all = append(all, rules...)
 	}

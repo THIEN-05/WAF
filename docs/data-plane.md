@@ -311,6 +311,8 @@ ip.src in_cidr {203.0.113.0/24, 198.51.100.0/24}
 
 **Bước 1 – Chọn mục tiêu quét**: đường dẫn, tên và giá trị tham số query, các header chọn lọc (User-Agent, Referer, Cookie, X-Forwarded-For, header tùy chỉnh), cookie, và **body** nếu Content-Type thuộc nhóm hỗ trợ (form, JSON, XML, multipart, text) và kích thước trong giới hạn của gói (gợi ý: Free 8 KB, Pro 64 KB, Business/Enterprise 128–256 KB; vượt thì chỉ quét phần đầu và gắn cờ).
 
+Loader YAML hỗ trợ `path`, `args`, `body`, `cookies`, `headers` và `protocol`. Target `protocol` quét tín hiệu chuẩn hóa do edge dựng từ request (thiếu Host, method ngoài danh sách, Content-Length đi cùng Transfer-Encoding, Content-Length lặp), không lấy một chuỗi protocol tùy ý từ client.
+
 **Bước 2 – Chuẩn hóa (normalize)** theo chuỗi biến đổi, vì kẻ tấn công thường mã hóa để né luật:
 
 * Giải mã URL lặp tối đa 3 lần (phát hiện mã hóa kép là một tín hiệu đáng ngờ).  
@@ -361,7 +363,7 @@ ip.src in_cidr {203.0.113.0/24, 198.51.100.0/24}
   tags: [owasp-a03, sqli]
 ```
 
-**Kiểm thử**: bộ mẫu tấn công (payload từ các nguồn công khai như PayloadsAllTheThings, dùng trong lab), bộ mẫu lưu lượng sạch để đo chặn nhầm (false positive), so sánh với Coraza/CRS, quét bằng OWASP ZAP và sqlmap trên DVWA của chính nhóm.
+**Kiểm thử**: bộ mẫu tấn công tự viết ngắn và bộ lưu lượng sạch trong `test/corpus/waf`; đo TPR/FPR theo nhóm/paranoia với baseline đã ghi và trần FPR cấu hình được. So sánh Coraza/CRS là TODO riêng cần mạng; mọi thử nghiệm công cụ chỉ chạy trên DVWA/lab của nhóm.
 
 ## ***5.8 Bot management (P8)***
 

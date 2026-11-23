@@ -1,0 +1,46 @@
+form	args	name=An+Nguyen&message=Please+select+a+union+of+dates
+form	args	query=select+the+union+of+available+options
+form	args	comment=I+will+drop+by+tomorrow
+form	args	search=select+blue+widgets
+form	args	message=O%27Neil+and+Smith+attended
+form	args	name=D%27Angelo
+form	args	filter=union+membership
+form	args	text=drop+down+menu
+form	args	q=ordinary+search+terms
+form	args	q=select+union+drop
+json	body	{"name":"O'Neil","action":"select","status":"active"}
+json	body	{"query":"union of local book clubs","limit":20}
+json	body	{"message":"Please drop the package at reception"}
+json	body	{"search":"select a product from the catalog"}
+json	body	{"author":"D'Angelo","title":"A user's guide"}
+json	body	{"filters":{"status":"open","sort":"ascending"}}
+json	body	{"text":"SQL is a language used to select data"}
+json	body	{"description":"The union met after work"}
+json	body	{"choice":"drop off at the north entrance"}
+json	body	{"path":"/users/profile/settings"}
+search	args	q=select+the+union+chapter
+search	args	q=drop+ceiling+tile+sizes
+search	args	q=O%27Connor+family+history
+search	args	q=select+union+drop+in+the+dictionary
+search	args	q=union+station+opening+hours
+search	args	q=drop+off+locations
+search	args	q=the+word+select+in+English
+search	args	q=SQL+union+history+book
+search	args	q=people+named+O%27Brien
+search	args	q=union+of+two+sets+math
+path	path	/products/blue-widget
+path	path	/users/123/profile
+path	path	/search/select-options
+path	path	/docs/union-membership
+path	path	/articles/drop-in-center
+path	path	/files/report-2026.pdf
+path	path	/blog/oconnor-family
+path	path	/catalog/items?page=2
+header	header	Mozilla/5.0 (compatible; ExampleBrowser/1.0)
+header	header	application/json; charset=utf-8
+header	header	Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
+body	body	name=O'Neil&message=hello+world
+body	body	{"search":"select union drop words normally"}
+body	body	{"comment":"The union will drop its old rules"}
+body	body	plain text with a single apostrophe: it's fine
+body	body	{"text":"A'B is a valid short label"}

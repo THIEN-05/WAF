@@ -1,0 +1,15 @@
+{
+  "sqli/1": 1.0, "sqli/2": 1.0, "sqli/3": 1.0, "sqli/4": 1.0,
+  "xss/1": 1.0, "xss/2": 1.0, "xss/3": 1.0, "xss/4": 1.0,
+  "traversal/1": 1.0, "traversal/2": 1.0, "traversal/3": 1.0, "traversal/4": 1.0,
+  "rfi/1": 1.0, "rfi/2": 1.0, "rfi/3": 1.0, "rfi/4": 1.0,
+  "rce/1": 1.0, "rce/2": 1.0, "rce/3": 1.0, "rce/4": 1.0,
+  "ssrf/1": 1.0, "ssrf/2": 1.0, "ssrf/3": 1.0, "ssrf/4": 1.0,
+  "xxe/1": 1.0, "xxe/2": 1.0, "xxe/3": 1.0, "xxe/4": 1.0,
+  "ssti/1": 1.0, "ssti/2": 1.0, "ssti/3": 1.0, "ssti/4": 1.0,
+  "deserialization/1": 1.0, "deserialization/2": 1.0, "deserialization/3": 1.0, "deserialization/4": 1.0,
+  "protocol/1": 1.0, "protocol/2": 1.0, "protocol/3": 1.0, "protocol/4": 1.0,
+  "scanner/1": 1.0, "scanner/2": 1.0, "scanner/3": 1.0, "scanner/4": 1.0,
+  "sensitive/1": 1.0, "sensitive/2": 1.0, "sensitive/3": 1.0, "sensitive/4": 1.0,
+  "virtual_patch/1": 0.0, "virtual_patch/2": 0.0, "virtual_patch/3": 0.0, "virtual_patch/4": 1.0
+}

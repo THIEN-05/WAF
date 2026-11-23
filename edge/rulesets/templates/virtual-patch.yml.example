@@ -1,0 +1,12 @@
+# Copy this template into a managed .yml ruleset and replace the marker with a
+# reviewed, narrowly scoped indicator for a specific application vulnerability.
+# The example marker is intentionally inert and is not embedded or loaded.
+- id: waf-virtual-patch-replace-me
+  phase: request
+  targets: [path, args, body]
+  transforms: [url_decode, lowercase]
+  pattern: 'REPLACE_WITH_REVIEWED_RE2_INDICATOR'
+  severity: error
+  paranoia: 2
+  tags: [owasp-a06, virtual-patching]
+  prefilter: [replace_with_reviewed_indicator]

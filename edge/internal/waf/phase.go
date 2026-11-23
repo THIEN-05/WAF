@@ -3,6 +3,7 @@ package waf
 import (
 	"fmt"
 	"mime"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -163,6 +164,7 @@ func collectTargets(ctx *reqctx.RequestCtx, includeBody bool) []scanTarget {
 		for _, cookie := range ctx.Request.Cookies() {
 			targets = append(targets, scanTarget{kind: "cookies", param: cookie.Name, raw: cookie.Name + "=" + cookie.Value})
 		}
+		targets = append(targets, collectProtocolTargets(ctx.Request)...)
 		if includeBody && supportedBodyType(ctx.Request.Header.Get("Content-Type")) {
 			body := ctx.BodyText()
 			if strings.HasPrefix(strings.ToLower(ctx.Request.Header.Get("Content-Type")), "application/x-www-form-urlencoded") {
@@ -176,6 +178,28 @@ func collectTargets(ctx *reqctx.RequestCtx, includeBody bool) []scanTarget {
 			}
 			targets = append(targets, scanTarget{kind: "body", raw: body})
 		}
+	}
+	return targets
+}
+
+func collectProtocolTargets(r *http.Request) []scanTarget {
+	var targets []scanTarget
+	if r.Host == "" {
+		targets = append(targets, scanTarget{kind: "protocol", param: "host", raw: "missing_host"})
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodDelete, http.MethodOptions, http.MethodConnect:
+	default:
+		targets = append(targets, scanTarget{kind: "protocol", param: "method", raw: "unusual_method=" + r.Method})
+	}
+	_, hasCL := r.Header[http.CanonicalHeaderKey("Content-Length")]
+	_, hasTE := r.Header[http.CanonicalHeaderKey("Transfer-Encoding")]
+	if hasCL && (hasTE || len(r.TransferEncoding) > 0) {
+		targets = append(targets, scanTarget{kind: "protocol", param: "framing", raw: "content_length_transfer_encoding"})
+	}
+	if len(r.Header.Values("Content-Length")) > 1 {
+		targets = append(targets, scanTarget{kind: "protocol", param: "framing", raw: "duplicate_content_length"})
 	}
 	return targets
 }
