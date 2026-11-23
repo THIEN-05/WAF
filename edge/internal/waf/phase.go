@@ -142,6 +142,7 @@ func (p *Phase) overBudget(start time.Time, budget time.Duration) bool {
 
 func (p *Phase) budgetFailure(ctx *reqctx.RequestCtx, score int, reason string) reqctx.Decision {
 	ctx.WAFScore = score
+	ctx.AddTag("waf.budget_exceeded")
 	if ctx.Site.FailMode == "closed" {
 		return wafDecision(reqctx.ActionBlock, "waf_budget", score, reason+" (fail closed)", ctx.Tags())
 	}

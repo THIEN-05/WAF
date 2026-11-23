@@ -187,3 +187,62 @@
   paranoia: 4
   tags: [owasp-a06, virtual-patching, template, virtual_patch]
   prefilter: [cve-2099-0000-replace-with-reviewed-indicator]
+- id: waf-sqli-heldout-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, remove_sql_comments, compress_whitespace]
+  pattern: '(?:(?:''|%27|\")\s*(?:or|and)\s+(?:[''"]?\w+[''"]?\s*(?:=|like|>|<)\s*[''"]?\w+|\d+\s*(?:=|>|<)\s*\d+)|;\s*(?:select|with)\b.{0,100}\b(?:pg_sleep|sleep|benchmark)\s*\()'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a03, sqli]
+  prefilter: [or, and, select, pg_sleep, benchmark]
+
+- id: waf-xss-heldout-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, html_entity_decode, lowercase, remove_nul]
+  pattern: '(?:<\s*(?:math|details|animate|foreignobject)\b[^>]{0,160}\bon[a-z]{3,}\s*=|\bon(?:begin|toggle|focus|mouseover|animationstart)\s*=)'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a03, xss]
+  prefilter: [onbegin, ontoggle, onfocus, onmouseover, onanimationstart, foreignobject]
+
+- id: waf-rce-heldout-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase, compress_whitespace]
+  pattern: '(?:&&?\s*(?:python[0-9.]*|perl|ruby|php)\s+-c\b|(?:^|\s)/(?:usr/)?bin/(?:id|whoami|uname)\b|\$\{ifs\}\s*(?:sh|bash)|\|\s*\$\{ifs\}\s*(?:sh|bash))'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a03, rce]
+  prefilter: [python, /bin/id, /usr/bin, '${ifs}', perl, ruby]
+
+- id: waf-ssrf-heldout-001
+  phase: request
+  targets: [args, body, cookies]
+  transforms: [url_decode, lowercase]
+  pattern: '(?:(?:https?|ftp)://\[(?:::1|fe[89ab][0-9a-f]:|f[cd][0-9a-f]{2}:)|(?:https?|ftp)://(?:0177\.0\.0\.1|2130706433|0x7f000001)(?:[:/]|$))'
+  severity: critical
+  paranoia: 1
+  tags: [owasp-a10, ssrf]
+  prefilter: ['::1', fe80, 0177, 2130706433, 0x7f000001]
+
+- id: waf-sensitive-files-heldout-001
+  phase: request
+  targets: [path]
+  transforms: [url_decode, path_normalize, lowercase]
+  pattern: '(?:/\.hg/|/\.docker/|/\.npmrc$|/server-status$|/actuator/(?:env|heapdump)|/debug/vars$|/config\.php\.(?:save|old|orig)$|/backup/[^/]+\.(?:sql|tar|zip)|\.tfstate(?:\.backup)?$|/id_ed25519$)'
+  severity: error
+  paranoia: 1
+  tags: [owasp-a01, sensitive-file, sensitive]
+  prefilter: [.hg, .docker, .npmrc, server-status, actuator, debug/vars, backup, tfstate, id_ed25519]
+
+- id: waf-scanner-ua-heldout-001
+  phase: request
+  targets: [headers]
+  transforms: [lowercase]
+  pattern: '(?:wpscan|arachni|whatweb|feroxbuster|ffuf|httpx/|nuclei/|openvas)'
+  severity: warning
+  paranoia: 1
+  tags: [owasp-a05, scanner]
+  prefilter: [wpscan, arachni, whatweb, feroxbuster, ffuf, nuclei, openvas]

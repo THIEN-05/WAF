@@ -1,5 +1,40 @@
 # Tiến độ
 
+## P4c — kiểm chứng chất lượng WAF — 2026-11-23
+
+### Đã xác minh
+
+- Corpus đã tách `test/corpus/waf/dev/` và `test/corpus/waf/heldout/`. Dev hiện có 261 mẫu tấn công gốc. Held-out v1 có 40 mẫu/nhóm; sau khi xem kết quả v1, các phát hiện thiếu coverage được dùng để bổ sung rule SQLi/XSS/RCE/SSRF và scanner/file nhạy cảm. V1 được lưu ở `dev/heldout-v1-attacks.tsv`, không còn được tính là held-out.
+- Held-out v2 được tạo sau các bổ sung trên, 480 mẫu (40 × 12 nhóm), bao gồm args, JSON, form, multipart, cookie, path, UA và protocol; 330 mẫu sạch realistic (form, JSON, tìm kiếm Anh/Việt, URL dài, code/văn bản kỹ thuật, email, multipart, path hợp lệ, GraphQL, base64/JWT). Hai chuỗi `C:/Windows/System32/...` và `/var/log/...` được đặt trong text body để đánh giá dạng nội dung hợp lệ; khi là URI path, rule traversal chủ ý bắt và ghi nhận là request nhạy cảm chứ không tính benign. Không sửa rule sau khi đo v2; baseline TPR riêng nằm ở `test/corpus/waf/heldout/tpr-baseline.json`.
+- Kết quả dev: 261/261 mẫu bắt được ở P1–P4 với ngoại lệ marker virtual patch có chủ ý: 0% P1–P3, 100% P4. Held-out v2 theo nhóm và FPR từng paranoia nằm trong `docs/BENCHMARKS.md`: TPR held-out chưa đạt 100% (SQLi 65%, XSS 90%, traversal 50%, RCE 42.5%, SSRF 80%, các nhóm khác 27.5–100%); FPR là 0/330 ở P1, P2, P3, P4. Không dùng số dev để tuyên bố chất lượng thực.
+- Mutation test sinh 347 biến thể từ dev, bắt 347/347 (100%) ở các phép biến đổi còn giữ ngữ nghĩa. Test sẽ in đầy đủ danh sách miss nếu kết quả đổi.
+- Sáu rule bổ sung có test dương và âm riêng. Test input xấu xác minh body chính xác 8/64/256 KB đi qua fail-mode khi trễ quá 2 ms; test hình dạng 200 tham số, keyword Aho lặp, JSON lồng sâu, multipart nhiều phần xác minh budget/fail-mode. Test 3.000 request sau warm-up giữ heap tăng dưới 4 MiB.
+- Benchmark WAF đã chạy thật trên Windows amd64 / Go 1.26.11; số `ns/op`, `B/op`, `allocs/op` được ghi ở `docs/BENCHMARKS.md`. Body 64–256 KB vượt 2 ms rõ rệt, body 8 KB sát/vượt 2 ms.
+- `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → exit 0.
+- `go test -count=1 ./...` trong WSL Ubuntu, Go 1.26.11 → PASS tất cả package. `go test -race -count=1 ./...` trong WSL Ubuntu, Go 1.26.11 → PASS tất cả package. Lần chạy cùng lệnh trong sandbox Windows thất bại ở test loopback do Windows trả `connectex ... forbidden by its access permissions`; WSL ngoài sandbox đã xác minh lại xanh.
+
+### Chưa xác minh
+
+- Bộ held-out v2 không hoàn toàn blind: tôi đã xem pattern khi xử lý kết quả v1 trước khi tự soạn v2. Không sửa rule theo kết quả v2, nhưng cần một reviewer độc lập tạo corpus v3 mà không xem managed rules để đáp ứng kiểm chứng mù nghiêm ngặt.
+- Chưa so sánh với Coraza/OWASP CRS; cần mạng (TODO-1 trong `docs/BENCHMARKS.md`). Corpus hoàn toàn tự viết nên số đo không đại diện traffic thực.
+- Chưa xác minh GitHub Actions sau push.
+
+### Nợ kỹ thuật
+
+- Latency body lớn hơn ngân sách 2 ms: `BodyText` đọc có giới hạn kích thước nhưng đồng bộ; phase chỉ phát hiện vượt ngân sách sau bước đọc và chọn fail-open/fail-closed. Chưa thể ngắt việc đọc theo deadline.
+- `waf_budget_exceeded` được phơi qua Decision/Tag để pipeline quan sát, nhưng hiện chưa có sink audit bất đồng bộ ghi sự kiện này. Không khẳng định “đã log” bền vững; cần nối với logging pipeline theo quy tắc không chặn request.
+- Held-out thấp ở deserialization (27.5%), RCE (42.5%), traversal (50%), SQLi (65%) và một số nhóm khác. Đã lưu baseline thực; không điều chỉnh theo held-out v2. Vòng kế tiếp cần corpus held-out mới sau khi cải thiện rules trên dev.
+
+### Lệnh tự chạy lại
+
+```sh
+golangci-lint run ./...
+go vet ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
+go test ./edge/internal/waf -run '^$' -bench 'BenchmarkWAF(ManagedClean|ManagedEarlyExit|WorstCase)$' -benchtime=10x -benchmem
+```
+
 ## Kiểm chứng gần nhất — 2026-11-22
 
 ### Đã xác minh

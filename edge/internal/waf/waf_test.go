@@ -2,14 +2,17 @@ package waf
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -170,18 +173,18 @@ func TestManagedCorpusTPRFPR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attacks := readCorpus(t, "attacks.tsv")
-	clean := readCorpus(t, "clean.tsv")
+	attacks := readCorpus(t, "heldout", "attacks.tsv")
+	clean := readCorpus(t, "heldout", "clean.tsv")
 	attackCounts := make(map[string]int)
 	for _, sample := range attacks {
 		attackCounts[sample.group]++
 	}
 	for group, count := range attackCounts {
-		if count < 20 || count > 30 {
-			t.Fatalf("attack group %s has %d samples; want 20..30", group, count)
+		if count < 40 {
+			t.Fatalf("attack group %s has %d samples; want at least 40", group, count)
 		}
 	}
-	baselineBytes, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "corpus", "waf", "tpr-baseline.json"))
+	baselineBytes, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "corpus", "waf", "heldout", "tpr-baseline.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,8 +226,10 @@ func TestManagedCorpusTPRFPR(t *testing.T) {
 		cleanTotal := make(map[string]int)
 		for _, sample := range clean {
 			cleanTotal[sample.group]++
-			if anyCorpusTag(phase, sample, paranoia) {
+			decision := corpusDecision(phase, sample, paranoia)
+			if len(decision.Tags) > 0 {
 				cleanHits[sample.group]++
+				t.Logf("FALSE POSITIVE\t%s\t%d\t%s\t%s\t%v", sample.group, paranoia, sample.target, sample.value, decision.Tags)
 			}
 		}
 		cleanGroups := make([]string, 0, len(cleanTotal))
@@ -235,10 +240,283 @@ func TestManagedCorpusTPRFPR(t *testing.T) {
 		for _, group := range cleanGroups {
 			rate := float64(cleanHits[group]) / float64(cleanTotal[group])
 			t.Logf("FPR\t%s\t%d\t%d/%d\t%.3f\t-\t%.3f", group, paranoia, cleanHits[group], cleanTotal[group], rate, fprMax)
-			if paranoia == 1 && rate > fprMax+1e-12 {
-				t.Errorf("FPR %s paranoia 1 = %.3f, exceeds configured maximum %.3f", group, rate, fprMax)
+			if rate > fprMax+1e-12 {
+				t.Errorf("FPR %s paranoia %d = %.3f, exceeds configured maximum %.3f", group, paranoia, rate, fprMax)
 			}
 		}
+	}
+	if len(clean) < 300 {
+		t.Fatalf("clean corpus has %d samples; want at least 300", len(clean))
+	}
+}
+
+func TestDevCorpusTPR(t *testing.T) {
+	rules := loadManagedRules(t)
+	phase, err := NewPhase(rules, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attacks := readCorpus(t, "dev", "attacks.tsv")
+	baselineBytes, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "corpus", "waf", "dev", "tpr-baseline.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var baseline map[string]float64
+	if err := json.Unmarshal(baselineBytes, &baseline); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("DEV metric\tgroup\tparanoia\tdetected/total\trate\tbaseline")
+	for paranoia := 1; paranoia <= 4; paranoia++ {
+		hits, totals := map[string]int{}, map[string]int{}
+		for _, sample := range attacks {
+			totals[sample.group]++
+			if hasCorpusTag(phase, sample, paranoia, sample.group) {
+				hits[sample.group]++
+			}
+		}
+		groups := make([]string, 0, len(totals))
+		for group := range totals {
+			groups = append(groups, group)
+		}
+		sort.Strings(groups)
+		for _, group := range groups {
+			rate := float64(hits[group]) / float64(totals[group])
+			minimum, ok := baseline[fmt.Sprintf("%s/%d", group, paranoia)]
+			if !ok {
+				t.Errorf("missing dev baseline for %s/%d", group, paranoia)
+			}
+			t.Logf("DEV TPR\t%s\t%d\t%d/%d\t%.3f\t%.3f", group, paranoia, hits[group], totals[group], rate, minimum)
+			if rate+1e-12 < minimum {
+				t.Errorf("dev TPR %s paranoia %d = %.3f below baseline %.3f", group, paranoia, rate, minimum)
+			}
+		}
+	}
+}
+
+func TestAttackMutations(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attacks := readCorpus(t, "dev", "attacks.tsv")
+	var total, caught int
+	var misses []string
+	for _, sample := range attacks {
+		if sample.group != "sqli" && sample.group != "xss" && sample.group != "rce" && sample.group != "ssrf" {
+			continue
+		}
+		encoded := strings.ReplaceAll(url.QueryEscape(sample.value), "+", "%20")
+		doubleEncoded := strings.ReplaceAll(url.QueryEscape(encoded), "+", "%20")
+		mutations := []string{encoded, doubleEncoded}
+		switch sample.group {
+		case "sqli":
+			mutations = append(mutations, strings.ToUpper(sample.value), "雪"+sample.value)
+			if strings.Contains(sample.value, " ") {
+				mutations = append(mutations, strings.ReplaceAll(sample.value, " ", "/**/"), strings.ReplaceAll(sample.value, " ", "\t"))
+			}
+			if strings.Contains(sample.value, "=") {
+				mutations = append(mutations, strings.ReplaceAll(sample.value, "=", " LIKE "))
+			}
+		case "xss":
+			variant := strings.NewReplacer("<script", "<ScRiPt", "</script", "</ScRiPt", "onerror", "OnErRoR", "onload", "OnLoAd", "onfocus", "OnFoCuS", "onbegin", "OnBeGiN", "ontoggle", "OnToGgLe").Replace(sample.value)
+			mutations = append(mutations, variant, strings.ReplaceAll(sample.value, " ", "\t"))
+		case "rce":
+			mutations = append(mutations, "雪"+sample.value, strings.ReplaceAll(sample.value, " ", "\t"))
+		case "ssrf":
+			mutations = append(mutations, strings.ToUpper(sample.value), "雪"+sample.value)
+		}
+		for _, mutation := range mutations {
+			total++
+			candidate := corpusSample{group: sample.group, target: "rawargs", value: mutation}
+			if hasCorpusTag(phase, candidate, 1, sample.group) {
+				caught++
+			} else {
+				misses = append(misses, sample.group+"\t"+mutation)
+			}
+		}
+	}
+	rate := float64(caught) / float64(total)
+	t.Logf("MUTATION caught=%d/%d rate=%.3f", caught, total, rate)
+	for _, miss := range misses {
+		t.Logf("MUTATION MISS\t%s", miss)
+	}
+}
+
+func TestNewManagedRulesPositiveNegative(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ id, group, target, positive, negative string }{
+		{"waf-sqli-heldout-001", "sqli", "args", "name=' OR 9=9", "name=order status for report"},
+		{"waf-xss-heldout-001", "xss", "args", "<svg><animate onbegin=alert(1)>", "SVG animation event documentation"},
+		{"waf-rce-heldout-001", "rce", "args", "cmd=%0a/usr/bin/id", "python code prints hello"},
+		{"waf-ssrf-heldout-001", "ssrf", "args", "url=http://[::1]:8080/admin", "url=http://203.0.113.10/public"},
+		{"waf-sensitive-files-heldout-001", "sensitive", "path", "/actuator/env", "/.well-known/security.txt"},
+		{"waf-scanner-ua-heldout-001", "scanner", "ua", "Mozilla/5.0 WPScan/3.8", "Mozilla/5.0 Chrome/130"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			positive := corpusDecision(phase, corpusSample{group: tc.group, target: tc.target, value: tc.positive}, 1)
+			if !containsString(positive.Tags, tc.group) {
+				t.Fatalf("positive sample missed: %+v", positive)
+			}
+			negative := corpusDecision(phase, corpusSample{group: tc.group, target: tc.target, value: tc.negative}, 1)
+			if containsString(negative.Tags, tc.group) {
+				t.Fatalf("negative sample matched: %+v", negative)
+			}
+		})
+	}
+}
+
+func TestWorstCaseShapesTakeConfiguredFailMode(t *testing.T) {
+	rules := loadManagedRules(t)
+	for _, shape := range []string{"200_params", "repeated_aho", "deep_json", "multipart_many_parts"} {
+		for _, mode := range []string{"open", "closed"} {
+			t.Run(shape+"_"+mode, func(t *testing.T) {
+				clock := time.Time{}
+				phase, err := NewPhase(rules, func() time.Time { clock = clock.Add(time.Millisecond); return clock })
+				if err != nil {
+					t.Fatal(err)
+				}
+				var request *http.Request
+				switch shape {
+				case "200_params":
+					var q strings.Builder
+					for i := 0; i < 200; i++ {
+						if i > 0 {
+							q.WriteByte('&')
+						}
+						fmt.Fprintf(&q, "p%d=select+union+membership+plain", i)
+					}
+					request = httptest.NewRequest(http.MethodGet, "http://edge.test/?"+q.String(), nil)
+				case "repeated_aho":
+					request = httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader(strings.Repeat("select union membership script alert ", 220)))
+					request.Header.Set("Content-Type", "text/plain")
+				case "deep_json":
+					request = httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader("{"+strings.Repeat(`"a":[{`, 1200)+`"x":"ok"`+strings.Repeat("}]", 1200)+"}"))
+					request.Header.Set("Content-Type", "application/json")
+				case "multipart_many_parts":
+					var b strings.Builder
+					for i := 0; i < 120; i++ {
+						fmt.Fprintf(&b, "--b\r\nContent-Disposition: form-data; name=\"p%d\"\r\n\r\nplain\r\n", i)
+					}
+					b.WriteString("--b--\r\n")
+					request = httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader(b.String()))
+					request.Header.Set("Content-Type", "multipart/form-data; boundary=b")
+				}
+				ctx := reqctx.New(request, nil, "budget", nil)
+				ctx.Entitlements.MaxBodyBytes = 64 * 1024
+				ctx.Site = &wafcore.Site{ID: "s", FailMode: mode, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 4, BodyLimitKB: 64, BudgetMS: 2}}
+				decision := phase.Handle(ctx)
+				want := reqctx.ActionAllow
+				if mode == "closed" {
+					want = reqctx.ActionBlock
+				}
+				if decision.RuleID != "waf_budget" || decision.Action != want || !containsString(decision.Tags, "waf.budget_exceeded") {
+					t.Fatalf("shape=%s mode=%s decision=%+v", shape, mode, decision)
+				}
+				reqctx.Release(ctx)
+			})
+		}
+	}
+}
+
+type delayedBody struct {
+	data    []byte
+	delayed bool
+}
+
+func (r *delayedBody) Read(p []byte) (int, error) {
+	if !r.delayed {
+		r.delayed = true
+		time.Sleep(3 * time.Millisecond)
+	}
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+func (r *delayedBody) Close() error { return nil }
+
+func TestWorstCaseBodyLimitsAndBudgetFailMode(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kb := range []int{8, 64, 256} {
+		for _, failMode := range []string{"open", "closed"} {
+			t.Run(fmt.Sprintf("body_%dKB_fail_%s", kb, failMode), func(t *testing.T) {
+				body := &delayedBody{data: []byte(strings.Repeat("a", kb*1024))}
+				r := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", nil)
+				r.Body = body
+				r.Header.Set("Content-Type", "text/plain")
+				ctx := reqctx.New(r, nil, "worst-case", nil)
+				ctx.Entitlements.MaxBodyBytes = kb * 1024
+				ctx.Site = &wafcore.Site{ID: "s", FailMode: failMode, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 1, BodyLimitKB: kb, BudgetMS: 2}}
+				started := time.Now()
+				decision := phase.Handle(ctx)
+				elapsed := time.Since(started)
+				if !ctx.BodyLoaded() || elapsed < 2*time.Millisecond {
+					t.Fatalf("body was not read within enforced budget path: loaded=%v elapsed=%s", ctx.BodyLoaded(), elapsed)
+				}
+				if got := len(ctx.BodyText()); got != kb*1024 || ctx.BodyTruncated() {
+					t.Fatalf("body boundary: got %d bytes truncated=%v, want exact %d-byte body", got, ctx.BodyTruncated(), kb*1024)
+				}
+				want := reqctx.ActionAllow
+				if failMode == "closed" {
+					want = reqctx.ActionBlock
+				}
+				if decision.Action != want || decision.RuleID != "waf_budget" {
+					t.Fatalf("budget decision=%+v want action=%v", decision, want)
+				}
+				if !strings.Contains(decision.Reason, "budget exceeded") {
+					t.Fatalf("budget reason missing: %+v", decision)
+				}
+				if !containsString(decision.Tags, "waf.budget_exceeded") {
+					t.Fatalf("budget tag missing: %+v", decision)
+				}
+				reqctx.Release(ctx)
+			})
+		}
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWAFRequestContextsDoNotAccumulate(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(n int) {
+		for i := 0; i < n; i++ {
+			r := httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader(strings.Repeat("plain", 1024)))
+			r.Header.Set("Content-Type", "text/plain")
+			c := reqctx.New(r, nil, "leak", nil)
+			c.Site = &wafcore.Site{ID: "s", WAF: wafcore.WAFConfig{Mode: "monitor", BodyLimitKB: 8, BudgetMS: 2000}}
+			_ = phase.Handle(c)
+			reqctx.Release(c)
+		}
+	}
+	run(100)
+	runtime.GC()
+	var before, runtimeAfter runtime.MemStats
+	runtime.ReadMemStats(&before)
+	run(3000)
+	runtime.GC()
+	runtime.ReadMemStats(&runtimeAfter)
+	if runtimeAfter.HeapAlloc > before.HeapAlloc+4*1024*1024 {
+		t.Fatalf("heap grew beyond bounded request working set: before=%d after=%d", before.HeapAlloc, runtimeAfter.HeapAlloc)
 	}
 }
 
@@ -255,9 +533,9 @@ func loadManagedRules(t testing.TB) []Rule {
 	return rules
 }
 
-func readCorpus(t *testing.T, name string) []corpusSample {
+func readCorpus(t *testing.T, set, name string) []corpusSample {
 	t.Helper()
-	file, err := os.Open(filepath.Join("..", "..", "..", "test", "corpus", "waf", name))
+	file, err := os.Open(filepath.Join("..", "..", "..", "test", "corpus", "waf", set, name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +555,8 @@ func readCorpus(t *testing.T, name string) []corpusSample {
 		if len(parts) != 3 {
 			t.Fatalf("%s malformed corpus line %q", name, line)
 		}
-		samples = append(samples, corpusSample{group: parts[0], target: parts[1], value: parts[2]})
+		value := strings.NewReplacer(`\n`, "\n", `\r`, "\r", `\t`, "\t").Replace(parts[2])
+		samples = append(samples, corpusSample{group: parts[0], target: parts[1], value: value})
 	}
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
@@ -307,27 +586,50 @@ func hasCorpusTag(phase *Phase, sample corpusSample, paranoia int, expected stri
 	return false
 }
 
-func anyCorpusTag(phase *Phase, sample corpusSample, paranoia int) bool {
-	return len(corpusDecision(phase, sample, paranoia).Tags) > 0
-}
-
 func corpusDecision(phase *Phase, sample corpusSample, paranoia int) reqctx.Decision {
 	var request *http.Request
+	var body io.Reader
 	switch sample.target {
 	case "args":
 		request = httptest.NewRequest(http.MethodGet, "http://edge.test/?q="+url.QueryEscape(sample.value), nil)
+	case "rawargs":
+		request = httptest.NewRequest(http.MethodGet, "http://edge.test/", nil)
+		request.URL.RawQuery = "q=" + strings.NewReplacer(" ", "%20", "#", "%23", ";", "%3B", "&", "%26").Replace(sample.value)
 	case "path":
-		request = httptest.NewRequest(http.MethodGet, (&url.URL{Scheme: "http", Host: "edge.test", Path: sample.value}).String(), nil)
-	case "body":
-		request = httptest.NewRequest(http.MethodPost, "http://edge.test/submit", strings.NewReader(sample.value))
-		if strings.HasPrefix(strings.TrimSpace(sample.value), "{") {
-			request.Header.Set("Content-Type", "application/json")
-		} else {
-			request.Header.Set("Content-Type", "text/plain")
+		pathValue, query, _ := strings.Cut(sample.value, "?")
+		u := (&url.URL{Scheme: "http", Host: "edge.test", Path: pathValue, RawQuery: query}).String()
+		request = httptest.NewRequest(http.MethodGet, u, nil)
+	case "body", "json", "xml", "multipart", "form":
+		contentType := "text/plain"
+		switch sample.target {
+		case "json":
+			contentType = "application/json"
+			encoded, _ := json.Marshal(map[string]string{"input": sample.value})
+			body = bytes.NewReader(encoded)
+		case "xml":
+			contentType = "application/xml"
+			body = strings.NewReader("<root><input>" + sample.value + "</input></root>")
+		case "form":
+			contentType = "application/x-www-form-urlencoded"
+			body = strings.NewReader("input=" + url.QueryEscape(sample.value))
+		case "multipart":
+			var data bytes.Buffer
+			writer := multipart.NewWriter(&data)
+			_ = writer.WriteField("input", sample.value)
+			_ = writer.Close()
+			contentType = writer.FormDataContentType()
+			body = bytes.NewReader(data.Bytes())
+		default:
+			body = strings.NewReader(sample.value)
 		}
+		request = httptest.NewRequest(http.MethodPost, "http://edge.test/submit", body)
+		request.Header.Set("Content-Type", contentType)
 	case "ua", "header":
 		request = httptest.NewRequest(http.MethodGet, "http://edge.test/", nil)
 		request.Header.Set("User-Agent", sample.value)
+	case "cookie":
+		request = httptest.NewRequest(http.MethodGet, "http://edge.test/", nil)
+		request.Header.Set("Cookie", "input="+strings.ReplaceAll(sample.value, " ", "%20"))
 	case "protocol":
 		request = httptest.NewRequest(http.MethodGet, "http://edge.test/", nil)
 		switch {
@@ -437,4 +739,68 @@ func BenchmarkWAFManagedEarlyExit(b *testing.B) {
 		_ = phase.Handle(ctx)
 		reqctx.Release(ctx)
 	}
+}
+
+func BenchmarkWAFWorstCase(b *testing.B) {
+	rules := loadManagedRules(b)
+	phase, err := NewPhase(rules, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, kb := range []int{8, 64, 256} {
+		for _, shape := range []string{"repeated_aho", "deep_json", "multipart"} {
+			b.Run(fmt.Sprintf("%s_%dKB", shape, kb), func(b *testing.B) {
+				limit := kb * 1024
+				var payload string
+				contentType := "text/plain"
+				switch shape {
+				case "repeated_aho":
+					payload = repeatToLimit("select union membership script alert plain ", limit)
+				case "deep_json":
+					contentType = "application/json"
+					payload = "{" + strings.Repeat(`"a":[{`, limit/6) + `"x":"ok"` + strings.Repeat("}]", limit/6) + "}"
+				case "multipart":
+					contentType = "multipart/form-data; boundary=bench-boundary"
+					payload = repeatToLimit("--bench-boundary\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nplain-field\r\n", limit)
+				}
+				b.ReportAllocs()
+				b.SetBytes(int64(limit))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					r := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", strings.NewReader(payload))
+					r.Header.Set("Content-Type", contentType)
+					c := reqctx.New(r, nil, "bench", nil)
+					c.Entitlements.MaxBodyBytes = limit
+					c.Site = &wafcore.Site{ID: "bench", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 4, BodyLimitKB: kb, BudgetMS: 2}}
+					_ = phase.Handle(c)
+					reqctx.Release(c)
+				}
+			})
+		}
+	}
+	b.Run("200_params", func(b *testing.B) {
+		var query strings.Builder
+		for i := 0; i < 200; i++ {
+			if i > 0 {
+				query.WriteByte('&')
+			}
+			fmt.Fprintf(&query, "p%d=%s", i, url.QueryEscape("select union membership and alert settings"))
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			r := httptest.NewRequest(http.MethodGet, "http://edge.test/search?"+query.String(), nil)
+			c := reqctx.New(r, nil, "bench", nil)
+			c.Site = &wafcore.Site{ID: "bench", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 4, BudgetMS: 2}}
+			_ = phase.Handle(c)
+			reqctx.Release(c)
+		}
+	})
+}
+
+func repeatToLimit(value string, limit int) string {
+	if limit <= 0 || value == "" {
+		return ""
+	}
+	return strings.Repeat(value, (limit+len(value)-1)/len(value))[:limit]
 }
