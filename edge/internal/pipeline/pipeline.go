@@ -1,10 +1,6 @@
 package pipeline
 
 import (
-	"fmt"
-	"log"
-	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
@@ -79,9 +75,7 @@ func (p *Pipeline) Run(c *reqctx.RequestCtx) reqctx.Decision {
 
 type Histogram struct {
 	mu          sync.Mutex
-	counts      map[string][]uint64
-	sums        map[string]float64
-	bounds      []float64
+	phaseCounts map[string]uint64
 	blocked     map[string]uint64
 	logDropped  uint64
 	audit       *AsyncAuditSink
@@ -94,7 +88,7 @@ func NewHistogram() *Histogram {
 }
 
 func NewHistogramWithAudit(writer AuditWriter, capacity int) *Histogram {
-	h := &Histogram{counts: map[string][]uint64{}, sums: map[string]float64{}, bounds: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}, blocked: map[string]uint64{}}
+	h := &Histogram{phaseCounts: map[string]uint64{}, blocked: map[string]uint64{}}
 	if memory, ok := writer.(*MemoryAuditWriter); ok {
 		h.auditMemory = memory
 	}
@@ -113,60 +107,23 @@ func (h *Histogram) Close() { h.audit.Close() }
 
 func (h *Histogram) Blocked(action string) { h.mu.Lock(); h.blocked[action]++; h.mu.Unlock() }
 func (h *Histogram) LogDropped(n uint64)   { h.mu.Lock(); h.logDropped += n; h.mu.Unlock() }
-func (h *Histogram) ObservePhase(name string, d time.Duration) {
+func (h *Histogram) ObservePhase(name string, _ time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.counts[name] == nil {
-		h.counts[name] = make([]uint64, len(h.bounds)+1)
-	}
-	seconds := d.Seconds()
-	h.sums[name] += seconds
-	for i, b := range h.bounds {
-		if seconds <= b {
-			h.counts[name][i]++
-		}
-	}
-	h.counts[name][len(h.bounds)]++
+	h.phaseCounts[name]++
 }
-func (h *Histogram) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+
+// Snapshot returns counters for unit tests and in-memory diagnostics. Production
+// Prometheus exposition is provided by edge/internal/telemetry.
+func (h *Histogram) Snapshot() (phases, blocked map[string]uint64, logDropped uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	out := firstErrorWriter{writer: w}
-	for phase, counts := range h.counts {
-		for i, b := range h.bounds {
-			out.Printf("edge_phase_duration_seconds_bucket{phase=%q,le=%q} %d\n", phase, strconv.FormatFloat(b, 'f', -1, 64), counts[i])
+	copyMap := func(src map[string]uint64) map[string]uint64 {
+		out := make(map[string]uint64, len(src))
+		for key, value := range src {
+			out[key] = value
 		}
-		out.Printf("edge_phase_duration_seconds_bucket{phase=%q,le=\"+Inf\"} %d\n", phase, counts[len(h.bounds)])
-		out.Printf("edge_phase_duration_seconds_sum{phase=%q} %f\n", phase, h.sums[phase])
-		out.Printf("edge_phase_duration_seconds_count{phase=%q} %d\n", phase, counts[len(h.bounds)])
+		return out
 	}
-	for action, count := range h.blocked {
-		out.Printf("edge_blocked_total{action=%q} %d\n", action, count)
-	}
-	out.Printf("edge_log_dropped_total %d\n", h.logDropped)
-	auditCounts := h.AuditCounts()
-	out.Printf("edge_waf_budget_exceeded_total %d\n", auditCounts[AuditWAFBudgetExceeded])
-	out.Printf("edge_waf_body_truncated_total %d\n", auditCounts[AuditWAFBodyTruncated])
-	out.Printf("edge_waf_body_read_timeout_total %d\n", auditCounts[AuditWAFBodyReadTimeout])
-	out.Printf("edge_waf_work_exhausted_total %d\n", auditCounts[AuditWAFWorkExhausted])
-	out.Printf("edge_waf_degraded_paranoia_total %d\n", auditCounts[AuditWAFDegradedParanoia])
-	out.Printf("edge_waf_degraded_scope_total %d\n", auditCounts[AuditWAFDegradedScope])
-	out.Printf("edge_waf_degraded_fail_mode_total %d\n", auditCounts[AuditWAFDegradedFailMode])
-	out.Printf("edge_waf_audit_dropped_total %d\n", h.audit.Dropped())
-	if out.err != nil {
-		log.Printf("metrics exporter: lỗi ghi phản hồi: %v", out.err)
-	}
-}
-
-type firstErrorWriter struct {
-	writer http.ResponseWriter
-	err    error
-}
-
-func (w *firstErrorWriter) Printf(format string, args ...any) {
-	if w.err != nil {
-		return
-	}
-	_, w.err = fmt.Fprintf(w.writer, format, args...)
+	return copyMap(h.phaseCounts), copyMap(h.blocked), h.logDropped
 }

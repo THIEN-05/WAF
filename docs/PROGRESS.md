@@ -1,5 +1,31 @@
 # Tiến độ
 
+## P12 — logging và telemetry
+
+### Đã xác minh
+
+- Thay exporter Prometheus viết tay ở `pipeline` và `/configsync/metrics` bằng adapter `prometheus/client_golang` sau interface `pipeline.Metrics`; chỉ labels hữu hạn, không gắn `site_id`. `/metrics` có histogram từng phase; counter block theo phase/nhóm, rate-limit, log/audit dropped, cache hit, origin error; gauges snapshot version/age/stale, cert expiry, goroutine và heap.
+- Log request theo `wafcore.LogEvent`; stats `wafcore.SiteStats1m` tổng hợp trong worker. Security events không lấy mẫu; event thường mặc định Free 1%, Pro 10%, Business 50%, Enterprise 100%. Queue bounded 4096, enqueue không chờ; batch theo 1 giây/1000 record/512 KiB, zstd; gửi NATS hoặc `EDGE_INGEST_URL` HTTPS. IP mặc định mask /24 và /56; không đưa body, Authorization, Cookie hoặc query vào schema/log.
+- OpenTelemetry sampler ratio 0.001; OTLP/HTTP exporter được bật bằng `OTEL_EXPORTER_OTLP_ENDPOINT`; W3C trace context được inject tới origin.
+- PASS: `go test -count=1 ./edge/internal/telemetry`; `go test -count=1 ./edge/internal/pipeline`; `go test -count=1 ./edge/internal/configsync`; `go test -count=1 ./edge/cmd/edge`; `go test -count=1 -run TestRequestTelemetryUsesWafcoreSchemaAndOmitsSecrets ./edge/internal/edgecore`; `go test -tags=integration -run '^$' ./edge/internal/telemetry` (compile integration test, không gọi NATS).
+- **Kiểm tra cuối trên Windows Go 1.26.11:** `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → exit 0; `go build ./...` → exit 0 (cảnh báo quyền ghi stat-cache Windows, không ảnh hưởng exit code); `go mod tidy` và `git diff --check` → exit 0. `govulncheck -show verbose ./...` → `No vulnerabilities found.` Trước khi nâng bản vá, scan từng báo 5 vấn đề (2 nhóm module) gồm lỗ hổng bị gọi trong OTel và `x/net`; đã nâng OTel lên v1.47.0, `x/net` lên v0.62.0, `x/crypto` lên bản được DB đánh dấu fixed rồi quét lại sạch.
+- **Chưa xác minh trong môi trường này:** `go test -tags=integration -count=1 -v ./edge/internal/telemetry` chạy unit tests xanh nhưng integration FAIL khi kết nối `127.0.0.1:4222`: `connectex: ... socket ... forbidden by its access permissions`; NATS/Docker daemon không chạy và sandbox cấm loopback. Integration build tag biên dịch được và CI đã cấu hình service NATS + Redis, chạy cả hai package với `-race`.
+- Toàn repo `go test -count=1 ./...` FAIL ở test loopback bot/edgecore/listener/proxy vì sandbox chặn loopback; không quy lỗi đó cho telemetry. `go test -race` không chạy được tại máy này do `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1` (Windows có CGO_ENABLED=0). Vì vậy phase chưa được xác minh hoàn chỉnh cho tới khi CI Ubuntu/WSL xanh.
+
+### Chưa xác minh — lệnh chạy lại
+
+- WSL/Linux: `go test -race -count=1 ./...`
+- Khởi động NATS và Redis local: `docker compose -f deploy/docker-compose.yml up -d nats redis`, rồi `NATS_ADDR=127.0.0.1:4222 REDIS_ADDR=127.0.0.1:6379 make test-integration` (chạy cả Redis và NATS integration với `-race`).
+- WSL/Linux/CI Ubuntu cần xác nhận toàn repo và integration thật. Ở môi trường Windows này race dừng trước test vì thiếu cgo; NATS integration không kết nối được do loopback bị chặn. Lint/vet/build/govulncheck và các unit tests liệt kê ở trên đã xác minh.
+
+### Nợ kỹ thuật
+
+- **TODO-P12-1:** pipeline chưa có response cache; metric/cache status hook có sẵn nhưng hit count chưa được nối từ cache implementation.
+- **TODO-P12-2:** log shipper best-effort, không có durable local spool/ACK retry; queue/delivery failure được đếm nhưng event bị mất.
+- **TODO-P12-3:** NATS integration test mô phỏng mất kết nối bằng TCP proxy với server thật, chưa dừng/restart tiến trình NATS.
+- **TODO-P12-4:** trace chỉ được gửi khi OTLP endpoint được cấu hình; không có collector mặc định.
+- **TODO-P12-5:** request bytes-in chỉ lấy từ Content-Length; với body chunked giá trị ghi là 0. Stats có thể thiếu khi queue đầy, tương ứng với `log_dropped`.
+
 ## P6a — tích hợp edge/control plane (MVP interface) — 2026-11-24
 
 ### Đã xác minh

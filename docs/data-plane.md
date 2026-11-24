@@ -483,11 +483,13 @@ Loader YAML hỗ trợ `path`, `args`, `body`, `cookies`, `headers` và `protoco
 
 1. Mỗi request đẩy sự kiện vào **channel/ring buffer không chặn**; đầy thì bỏ sự kiện và tăng bộ đếm log\_dropped (không bao giờ làm chậm request).  
 2. Worker gom lô theo 1 giây hoặc 1.000 sự kiện, nén (gzip/zstd) rồi gửi qua NATS hoặc HTTP tới dịch vụ ingest, ghi vào ClickHouse.  
-3. **Lấy mẫu**: 100% sự kiện bảo mật (bị chặn, challenge, rate limit); request bình thường lấy mẫu theo gói. Đồng thời tính **bộ đếm tổng hợp theo site theo phút** ngay trên edge để biểu đồ vẫn chính xác dù có lấy mẫu.
+3. **Lấy mẫu**: 100% sự kiện bảo mật (bị chặn, challenge, rate limit); request bình thường lấy mẫu theo gói. Đồng thời tính **bộ đếm tổng hợp theo site theo phút** ngay trên edge để biểu đồ không bị ảnh hưởng bởi lấy mẫu event; khi queue đầy, delta bị drop và `log_dropped` phản ánh sai số có thể có.
 
 **Metric Prometheus**: tổng request, histogram độ trễ **theo từng pha**, số lần chặn theo nhóm luật, số lần rate limit, tỷ lệ cache hit, lỗi origin, version snapshot, tuổi snapshot, goroutine/bộ nhớ. **Lưu ý cardinality**: không dùng site\_id làm label cho metric toàn cục nếu có hàng nghìn site; chi tiết theo site để ở log/ClickHouse.
 
 **Trace**: OpenTelemetry với tỷ lệ lấy mẫu thấp (khoảng 0,1%) để điều tra độ trễ.
+
+**Triển khai edge hiện tại**: dùng `prometheus/client_golang`; NATS batch mặc định ở `nats://127.0.0.1:4222`, subject `edge.logs.v1`, hoặc đặt `EDGE_INGEST_URL` để gửi HTTPS. Event batch JSON được nén zstd, tối đa 1 giây/1.000 bản ghi/512 KiB; queue mặc định 4.096 record, không có spool bền vững khi process dừng hoặc ingest lỗi. Request thường lấy mẫu Free 1%, Pro 10%, Business 50%, Enterprise 100%; sự kiện bảo mật luôn được chọn. Client IP mặc định mask IPv4 `/24`, IPv6 `/56`, điều chỉnh qua `EDGE_LOG_IP_MASK_V4_BITS` và `EDGE_LOG_IP_MASK_V6_BITS`. OpenTelemetry OTLP/HTTP chỉ export khi đặt `OTEL_EXPORTER_OTLP_ENDPOINT`. Cache response chưa được nối vào request pipeline nên cache-hit metric hiện chưa tăng.
 
 ## ***5.14 Đồng bộ cấu hình – ConfigSync***
 

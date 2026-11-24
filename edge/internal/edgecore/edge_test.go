@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -20,7 +21,9 @@ import (
 	"github.com/example/wafplatform/edge/internal/pipeline"
 	"github.com/example/wafplatform/edge/internal/proxy"
 	"github.com/example/wafplatform/edge/internal/reqctx"
+	"github.com/example/wafplatform/edge/internal/telemetry"
 	"github.com/example/wafplatform/pkg/wafcore"
+	"github.com/klauspost/compress/zstd"
 	"gopkg.in/yaml.v3"
 )
 
@@ -643,7 +646,7 @@ func TestPanicAfterHeadersClosesConnectionAndCountsMetric(t *testing.T) {
 	}
 	metrics := httptest.NewRecorder()
 	e.Metrics().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if !strings.Contains(metrics.Body.String(), "edge_blocked_total{action=\"panic\"} 1") {
+	if !strings.Contains(metrics.Body.String(), "edge_blocked_total{group=\"panic\"} 1") {
 		t.Fatalf("panic metric missing: %s", metrics.Body.String())
 	}
 }
@@ -655,4 +658,65 @@ func closeOnCleanup(t *testing.T, closer interface{ Close() error }) {
 			t.Errorf("close test connection: %v", err)
 		}
 	})
+}
+
+type edgeTelemetrySink struct{ batches chan []byte }
+
+func (s *edgeTelemetrySink) Publish(_ context.Context, batch []byte) error {
+	s.batches <- append([]byte(nil), batch...)
+	return nil
+}
+
+func TestRequestTelemetryUsesWafcoreSchemaAndOmitsSecrets(t *testing.T) {
+	sink := &edgeTelemetrySink{batches: make(chan []byte, 4)}
+	shipper, err := telemetry.NewShipper(sink, telemetry.ShipperConfig{QueueSize: 4, BatchSize: 1, FlushInterval: time.Hour, PlanSampleRate: map[string]float64{"free": 0}, IPMaskV4Bits: 24, IPMaskV6Bits: 56})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := New(siteSnapshot("active", "closed", "http://203.0.113.1", 1), "edge")
+	e.SetLogShipper(shipper)
+	e.SetTelemetryIdentity("edge-a", "region-b")
+	r := httptest.NewRequest(http.MethodPost, "http://site.test/login?password=query-secret", nil)
+	r.Header.Set("Authorization", "Bearer header-secret")
+	r.Header.Set("Cookie", "session=cookie-secret")
+	c := reqctx.New(r, e.runtime.Load().snapshot, "request-id", net.ParseIP("203.0.113.19"))
+	c.Site = &e.runtime.Load().snapshot.Sites[0]
+	c.SetDecision(reqctx.Decision{Action: reqctx.ActionBlock, Phase: "waf", RuleID: "sqli", Score: 5, Tags: []string{"security"}})
+	tw := &trackingWriter{ResponseWriter: httptest.NewRecorder()}
+	tw.WriteHeader(http.StatusForbidden)
+	_, _ = tw.Write([]byte("blocked"))
+	e.recordRequest(c, tw, time.Now().Add(-time.Millisecond))
+	reqctx.Release(c)
+	shipper.Close()
+	e.Close()
+	compressed := <-sink.batches
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := decoder.DecodeAll(compressed, nil)
+	decoder.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var batch telemetry.CompressedBatch
+	if err = json.Unmarshal(raw, &batch); err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Events) != 1 {
+		t.Fatalf("events=%d", len(batch.Events))
+	}
+	event := batch.Events[0]
+	if err = event.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if event.EdgeID != "edge-a" || event.Region != "region-b" || event.Action != "block" || event.RuleID != "sqli" || event.ClientIP != "203.0.113.0" || event.BytesOut != 7 {
+		t.Fatalf("event=%+v", event)
+	}
+	encoded := string(raw)
+	for _, secret := range []string{"header-secret", "cookie-secret", "query-secret"} {
+		if strings.Contains(encoded, secret) {
+			t.Fatalf("sensitive request data was logged: %s", secret)
+		}
+	}
 }

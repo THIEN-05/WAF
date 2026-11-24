@@ -13,7 +13,7 @@ test:
 	go test -race ./...
 
 test-integration:
-	go test -tags=integration -count=1 -v ./edge/internal/ratelimit
+	go test -tags=integration -race -count=1 -v ./edge/internal/ratelimit ./edge/internal/telemetry
 
 lint:
 	golangci-lint run ./...

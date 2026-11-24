@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/example/wafplatform/edge/internal/listener"
 	"github.com/example/wafplatform/edge/internal/ratelimit"
 	"github.com/example/wafplatform/edge/internal/response"
+	"github.com/example/wafplatform/edge/internal/telemetry"
 	"github.com/example/wafplatform/pkg/server"
 	"github.com/example/wafplatform/pkg/wafcore"
 	"gopkg.in/yaml.v3"
@@ -39,6 +41,17 @@ func main() {
 func run() error {
 	syncCtx, cancelSync := context.WithCancel(context.Background())
 	defer cancelSync()
+	traceShutdown, traceErr := telemetry.InitTracing(syncCtx, os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	if traceErr != nil {
+		return fmt.Errorf("khởi tạo OpenTelemetry: %w", traceErr)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := traceShutdown(shutdownCtx); err != nil {
+			log.Printf("tắt OpenTelemetry: %q", err.Error())
+		}
+	}()
 	cpURL := strings.TrimSpace(os.Getenv("EDGE_CONTROL_PLANE_URL"))
 	snapshot, err := loadSnapshot()
 	if err != nil && cpURL == "" {
@@ -63,6 +76,27 @@ func run() error {
 	}
 	core := edgecore.New(&snapshot, "waf-edge")
 	defer core.Close()
+	var logSink telemetry.BatchSink
+	if ingestURL := strings.TrimSpace(os.Getenv("EDGE_INGEST_URL")); ingestURL != "" {
+		logSink = telemetry.HTTPBatchSink{URL: ingestURL}
+	} else {
+		natsURL := server.Env("EDGE_NATS_URL", "nats://127.0.0.1:4222")
+		sink, sinkErr := telemetry.NewNATSBatchSink(natsURL, server.Env("EDGE_NATS_LOG_SUBJECT", "edge.logs.v1"))
+		if sinkErr != nil {
+			return sinkErr
+		}
+		logSink = sink
+	}
+	shipper, shipErr := telemetry.NewShipper(logSink, telemetry.ShipperConfig{QueueSize: envInt("EDGE_LOG_QUEUE_SIZE", 4096), BatchSize: 1000, FlushInterval: time.Second, IPMaskV4Bits: envInt("EDGE_LOG_IP_MASK_V4_BITS", 24), IPMaskV6Bits: envInt("EDGE_LOG_IP_MASK_V6_BITS", 56), OnDropped: core.RecordLogDropped})
+	if shipErr != nil {
+		return fmt.Errorf("khởi tạo log shipper: %w", shipErr)
+	}
+	core.SetLogShipper(shipper)
+	core.SetTelemetryIdentity(server.Env("EDGE_ID", ""), server.Env("REGION", ""))
+	if closer, ok := logSink.(interface{ Close() }); ok {
+		defer closer.Close()
+	}
+	defer shipper.Close()
 	var siteCertCache *listener.CertCache
 	if tlsAddr := strings.TrimSpace(os.Getenv("EDGE_TLS_ADDR")); tlsAddr != "" {
 		siteCertCache = listener.NewCertCache()
@@ -410,11 +444,28 @@ func loadSnapshot() (wafcore.Snapshot, error) {
 
 func metricsServer(core *edgecore.Edge, agent *configsync.Agent, addr string) *http.Server {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", core.Metrics())
-	if agent != nil {
-		mux.Handle("/configsync/metrics", agent.Metrics())
-	}
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if agent != nil {
+			status := agent.Status()
+			core.RefreshMetrics(status.Version, status.Age, true, agent.SnapshotStale(), agent.CertificateExpiry())
+		} else {
+			core.RefreshMetrics(0, 0, false, false, time.Time{})
+		}
+		core.Metrics().ServeHTTP(w, r)
+	})
 	return &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+}
+
+func envInt(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
 }
 
 type edgeSnapshotInstaller struct {

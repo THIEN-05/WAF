@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -375,6 +374,7 @@ func (a *Agent) Status() SnapshotStatus {
 	}
 	return SnapshotStatus{}
 }
+func (a *Agent) CertificateExpiry() time.Time { a.mu.Lock(); defer a.mu.Unlock(); return a.certExpiry }
 func (a *Agent) SetCurrentSnapshot(version uint64, appliedAt time.Time) {
 	a.mu.Lock()
 	a.version = version
@@ -385,23 +385,6 @@ func (a *Agent) SetCurrentSnapshot(version uint64, appliedAt time.Time) {
 func (a *Agent) SnapshotStale() bool {
 	s := a.Status()
 	return !s.LastApplied.IsZero() && s.Age > a.cfg.SnapshotStaleAfter
-}
-func (a *Agent) Metrics() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		status := a.Status()
-		stale := 0
-		if a.SnapshotStale() {
-			stale = 1
-		}
-		a.mu.Lock()
-		expiry := a.certExpiry
-		a.mu.Unlock()
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		_, _ = fmt.Fprintf(w, "edge_snapshot_version %d\nedge_snapshot_age_seconds %f\nedge_snapshot_stale %d\n", status.Version, status.Age.Seconds(), stale)
-		if !expiry.IsZero() {
-			_, _ = fmt.Fprintf(w, "edge_mtls_certificate_expiry_timestamp_seconds %d\n", expiry.Unix())
-		}
-	})
 }
 func (a *Agent) publishStatus() {
 	a.mu.Lock()

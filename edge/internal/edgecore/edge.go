@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -26,36 +27,45 @@ import (
 	"github.com/example/wafplatform/edge/internal/response"
 	"github.com/example/wafplatform/edge/internal/router"
 	"github.com/example/wafplatform/edge/internal/rules"
+	"github.com/example/wafplatform/edge/internal/telemetry"
 	"github.com/example/wafplatform/edge/internal/waf"
 	"github.com/example/wafplatform/edge/rulesets"
 	"github.com/example/wafplatform/pkg/wafcore"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Edge struct {
-	runtime      atomic.Pointer[runtimeConfig]
-	metrics      pipeline.Metrics
-	histogram    *pipeline.Histogram
-	pipeline     atomic.Pointer[pipeline.Pipeline]
-	trafficMu    sync.Mutex
-	banTable     *access.BanTable
-	geoResolver  access.GeoResolver
-	globalBlocks *access.PrefixTree
-	underAttack  access.UnderAttack
-	rateLimiter  *ratelimit.Limiter
-	ready        atomic.Bool
-	via          string
-	security     response.SecurityHeaders
-	poolFactory  func([]wafcore.Origin, string) *proxy.OriginPool
-	botManager   atomic.Pointer[bot.ChallengeManager]
-	botVerified  bot.VerifiedBotChecker
-	botIPTrust   bot.IPReputation
-	botFPTrust   bot.FingerprintReputation
-	botPhase     atomic.Pointer[bot.Phase]
-	managedWAF   []waf.Rule
-	poolMu       sync.Mutex
-	pools        map[string]*proxy.OriginPool
-	healthCtx    context.Context
-	healthCancel context.CancelFunc
+	runtime         atomic.Pointer[runtimeConfig]
+	metrics         pipeline.Metrics
+	promMetrics     *telemetry.PrometheusMetrics
+	auditMetrics    *pipeline.Histogram
+	logShipper      *telemetry.Shipper
+	pipeline        atomic.Pointer[pipeline.Pipeline]
+	trafficMu       sync.Mutex
+	telemetryEdgeID string
+	telemetryRegion string
+	banTable        *access.BanTable
+	geoResolver     access.GeoResolver
+	globalBlocks    *access.PrefixTree
+	underAttack     access.UnderAttack
+	rateLimiter     *ratelimit.Limiter
+	ready           atomic.Bool
+	via             string
+	security        response.SecurityHeaders
+	poolFactory     func([]wafcore.Origin, string) *proxy.OriginPool
+	botManager      atomic.Pointer[bot.ChallengeManager]
+	botVerified     bot.VerifiedBotChecker
+	botIPTrust      bot.IPReputation
+	botFPTrust      bot.FingerprintReputation
+	botPhase        atomic.Pointer[bot.Phase]
+	managedWAF      []waf.Rule
+	poolMu          sync.Mutex
+	pools           map[string]*proxy.OriginPool
+	healthCtx       context.Context
+	healthCancel    context.CancelFunc
 }
 
 type runtimeConfig struct {
@@ -67,9 +77,10 @@ type runtimeConfig struct {
 var fallbackRequestIDCounter atomic.Uint64
 
 func New(s *wafcore.Snapshot, via string) *Edge {
-	h := pipeline.NewHistogram()
+	audit := pipeline.NewHistogram()
+	prom := telemetry.NewPrometheusMetrics()
 	healthCtx, healthCancel := context.WithCancel(context.Background())
-	e := &Edge{via: via, metrics: h, histogram: h, poolFactory: proxy.NewOriginPool, pools: map[string]*proxy.OriginPool{}, healthCtx: healthCtx, healthCancel: healthCancel}
+	e := &Edge{via: via, metrics: composedMetrics{primary: prom, audit: audit}, promMetrics: prom, auditMetrics: audit, poolFactory: proxy.NewOriginPool, pools: map[string]*proxy.OriginPool{}, healthCtx: healthCtx, healthCancel: healthCancel}
 	e.botManager.Store(bot.NewChallengeManager(bot.StaticKeyRing{}))
 	e.banTable = access.NewBanTable(100_000, time.Now)
 	e.rateLimiter = ratelimit.NewLimiter(ratelimit.Config{})
@@ -234,11 +245,60 @@ func (e *Edge) Close() {
 		e.healthCancel()
 	}
 	e.poolMu.Unlock()
-	if e.histogram != nil {
-		e.histogram.Close()
+	if e.logShipper != nil {
+		e.logShipper.Close()
+	}
+	if e.auditMetrics != nil {
+		e.auditMetrics.Close()
 	}
 }
-func (e *Edge) Metrics() http.Handler { return e.histogram }
+func (e *Edge) Metrics() http.Handler                    { return e.promMetrics.Handler() }
+func (e *Edge) SetLogShipper(shipper *telemetry.Shipper) { e.logShipper = shipper }
+func (e *Edge) SetTelemetryIdentity(edgeID, region string) {
+	e.telemetryEdgeID = edgeID
+	e.telemetryRegion = region
+}
+func (e *Edge) RecordLogDropped(n uint64) { e.promMetrics.LogDropped(n) }
+func (e *Edge) RecordCacheHit()           { e.promMetrics.CacheHit() }
+func (e *Edge) RefreshMetrics(agentVersion uint64, agentAge time.Duration, hasAgent, snapshotStale bool, clientCertExpiry time.Time) {
+	e.promMetrics.RefreshRuntime()
+	state := e.runtime.Load()
+	if hasAgent {
+		e.promMetrics.SetSnapshot(agentVersion, agentAge.Seconds(), snapshotStale)
+		e.promMetrics.SetClientCertificateExpiry(clientCertExpiry)
+		return
+	}
+	if state != nil && state.snapshot != nil {
+		age := time.Duration(0)
+		if !state.snapshot.GeneratedAt.IsZero() {
+			age = time.Since(state.snapshot.GeneratedAt)
+			if age < 0 {
+				age = 0
+			}
+		}
+		e.promMetrics.SetSnapshot(state.snapshot.Version, age.Seconds(), false)
+	}
+}
+
+type composedMetrics struct {
+	primary *telemetry.PrometheusMetrics
+	audit   *pipeline.Histogram
+}
+
+func (m composedMetrics) ObservePhase(name string, d time.Duration) {
+	m.primary.ObservePhase(name, d)
+	m.audit.ObservePhase(name, d)
+}
+func (m composedMetrics) Blocked(action string) { m.primary.Blocked(action); m.audit.Blocked(action) }
+func (m composedMetrics) LogDropped(n uint64)   { m.primary.LogDropped(n); m.audit.LogDropped(n) }
+func (m composedMetrics) EnqueueAudit(event pipeline.AuditEvent) bool {
+	m.primary.AuditEvent(event.Kind)
+	ok := m.audit.EnqueueAudit(event)
+	if !ok {
+		m.primary.AuditDropped(1)
+	}
+	return ok
+}
 func (e *Edge) Snapshot() *wafcore.Snapshot {
 	state := e.runtime.Load()
 	if state == nil {
@@ -273,23 +333,40 @@ func (e *Edge) CanonicalHTTPHost(host string) (string, bool) {
 	return canonical, true
 }
 func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	ctx, span := otel.Tracer("waf/edge").Start(ctx, "edge.request", trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(attribute.String("http.request.method", r.Method)))
+	r = r.WithContext(ctx)
+	tw := &trackingWriter{ResponseWriter: w}
+	defer func() {
+		status := tw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		e.promMetrics.ObserveRequest(r.Method, status)
+		span.SetAttributes(attribute.Int("http.response.status_code", status))
+		if tw.originAttempted && status >= 500 {
+			e.promMetrics.OriginError(status)
+		}
+		span.End()
+	}()
 	if r.URL.Path == "/healthz" {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
+		tw.WriteHeader(http.StatusOK)
+		_, _ = tw.Write([]byte("ok\n"))
 		return
 	}
 	if r.URL.Path == "/readyz" {
 		if !e.ready.Load() {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			http.Error(tw, "not ready", http.StatusServiceUnavailable)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready\n"))
+		tw.WriteHeader(http.StatusOK)
+		_, _ = tw.Write([]byte("ready\n"))
 		return
 	}
 	state := e.runtime.Load()
 	if state == nil || state.snapshot == nil {
-		http.Error(w, "no snapshot", http.StatusServiceUnavailable)
+		http.Error(tw, "no snapshot", http.StatusServiceUnavailable)
 		return
 	}
 	snap := state.snapshot
@@ -297,7 +374,7 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := remoteIP(r.RemoteAddr)
 	c := reqctx.New(r, snap, id, clientIP)
 	defer reqctx.Release(c)
-	tw := &trackingWriter{ResponseWriter: w}
+	defer e.recordRequest(c, tw, started)
 	response.ApplyHeaders(tw.Header(), e.security)
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -348,8 +425,9 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		decision = requestPipeline.Run(c)
 	}()
 	if decision.Terminal() {
-		e.metrics.Blocked(actionName(decision.Action))
+		e.promMetrics.BlockedGroup(decision.Phase)
 		if decision.Phase == "ratelimit" {
+			e.promMetrics.RateLimited()
 			log.Printf("giới hạn tốc độ request_id=%q rule_id=%q", c.RequestID, decision.RuleID)
 		}
 		if decision.RetryAfter > 0 {
@@ -464,29 +542,113 @@ func (e *Edge) proxySite(w http.ResponseWriter, c *reqctx.RequestCtx) {
 	}
 	e.poolMu.Unlock()
 	if err := pool.ValidateOrigins(); err != nil {
+		if tracked, ok := w.(*trackingWriter); ok {
+			tracked.originAttempted = true
+		}
 		response.Block(w, c, http.StatusBadGateway, err.Error())
 		return
+	}
+	if tracked, ok := w.(*trackingWriter); ok {
+		tracked.originAttempted = true
+		upstreamStart := time.Now()
+		defer func() { tracked.upstream = time.Since(upstreamStart) }()
 	}
 	pool.Serve(w, c)
 }
 
-func actionName(a reqctx.Action) string {
-	switch a {
-	case reqctx.ActionBlock:
-		return "block"
-	case reqctx.ActionChallenge:
-		return "challenge"
-	case reqctx.ActionRateLimited:
-		return "rate_limited"
-	default:
-		return "other"
+func (e *Edge) recordRequest(c *reqctx.RequestCtx, tw *trackingWriter, started time.Time) {
+	if c == nil || c.Site == nil || c.Request == nil {
+		return
 	}
+	status := tw.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	decision := c.Decision()
+	action := "allow"
+	switch decision.Action {
+	case reqctx.ActionBlock:
+		action = "block"
+	case reqctx.ActionChallenge:
+		action = "challenge"
+	case reqctx.ActionRateLimited:
+		action = "rate_limited"
+	case reqctx.ActionLogOnly:
+		action = "log"
+	}
+	input := uint64(0)
+	if c.Request.ContentLength > 0 {
+		input = uint64(c.Request.ContentLength)
+	}
+	output := uint64(0)
+	if tw.bytesWritten > 0 {
+		output = uint64(tw.bytesWritten)
+	}
+	latency := time.Since(started)
+	event := wafcore.LogEvent{SchemaVersion: wafcore.LogSchemaVersion, TS: started.UTC(), RequestID: c.RequestID, SiteID: c.Site.ID, TenantID: c.Site.TenantID, EdgeID: e.telemetryEdgeID, Region: e.telemetryRegion, ClientIP: clientIPString(c.ClientIP), Country: c.GeoCountry, ASN: c.GeoASN, JA3: c.JA3, Method: c.Method, Host: c.Host, Path: c.Path, Status: statusCode16(status), BytesIn: input, BytesOut: output, LatencyMS: durationMilliseconds(latency), UpstreamMS: durationMilliseconds(tw.upstream), Action: action, RuleID: decision.RuleID, WAFScore: score16(decision.Score), BotScore: score8(c.BotScore), CacheStatus: "", Tags: decision.Tags}
+	for _, tag := range event.Tags {
+		if tag == "cache_hit" {
+			event.CacheStatus = "hit"
+			e.promMetrics.CacheHit()
+			break
+		}
+	}
+	security := decision.Terminal() || decision.RuleID != "" || decision.Phase == "waf" || decision.Phase == "access" || decision.Phase == "ratelimit"
+	if e.logShipper != nil {
+		_ = e.logShipper.Record(event, security, c.Site.Plan)
+	}
+}
+func clientIPString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+func durationMilliseconds(d time.Duration) uint32 {
+	if d <= 0 {
+		return 0
+	}
+	ms := uint64(d / time.Millisecond)
+	if ms > uint64(1<<32-1) {
+		ms = uint64(1<<32 - 1)
+	}
+	return uint32(ms)
+}
+func statusCode16(status int) uint16 {
+	if status < 0 {
+		return 0
+	}
+	if status > 65535 {
+		return 65535
+	}
+	return uint16(status)
+}
+func score16(score int) uint16 {
+	if score <= 0 {
+		return 0
+	}
+	if score >= 65535 {
+		return 65535
+	}
+	return uint16(score)
+}
+func score8(score int) uint8 {
+	if score <= 0 {
+		return 0
+	}
+	if score >= 255 {
+		return 255
+	}
+	return uint8(score)
 }
 
 type trackingWriter struct {
 	http.ResponseWriter
-	wrote  bool
-	status int
+	wrote           bool
+	status          int
+	bytesWritten    int64
+	upstream        time.Duration
+	originAttempted bool
 }
 
 func (w *trackingWriter) WriteHeader(code int) {
@@ -500,7 +662,17 @@ func (w *trackingWriter) Write(b []byte) (int, error) {
 	if !w.wrote {
 		w.WriteHeader(http.StatusOK)
 	}
-	return w.ResponseWriter.Write(b)
+	n, err := w.ResponseWriter.Write(b)
+	w.bytesWritten += int64(n)
+	return n, err
+}
+func (w *trackingWriter) ReadFrom(r io.Reader) (int64, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := io.Copy(w.ResponseWriter, r)
+	w.bytesWritten += n
+	return n, err
 }
 func (w *trackingWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
@@ -514,6 +686,9 @@ func (w *trackingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	h, ok := w.ResponseWriter.(http.Hijacker)
 	if !ok {
 		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	if !w.wrote {
+		w.status = http.StatusSwitchingProtocols
 	}
 	w.wrote = true
 	return h.Hijack()
