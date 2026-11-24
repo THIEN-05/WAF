@@ -23,7 +23,7 @@ import (
 type OriginPool struct {
 	origins            []wafcore.Origin
 	healthy            []atomic.Bool
-	next               atomic.Uint64
+	next               atomic.Int64
 	mu                 sync.Mutex
 	failures           []int
 	openUntil          []time.Time
@@ -135,7 +135,10 @@ func (p *OriginPool) Select() (wafcore.Origin, int, error) {
 	if total == 0 {
 		total = len(p.origins)
 	}
-	slot := int((p.next.Add(1) - 1) % uint64(total)) //nolint:gosec // total is positive and bounded by max int, so conversion to uint64 is safe.
+	slot := (p.next.Add(1) - 1) % int64(total)
+	if slot < 0 {
+		slot += int64(total)
+	}
 	for i, o := range p.origins {
 		weight := o.Weight
 		if weight <= 0 && total == len(p.origins) {
@@ -144,7 +147,7 @@ func (p *OriginPool) Select() (wafcore.Origin, int, error) {
 		if weight <= 0 || !p.eligible(i) {
 			continue
 		}
-		slot -= weight
+		slot -= int64(weight)
 		if slot < 0 {
 			return o, i, nil
 		}

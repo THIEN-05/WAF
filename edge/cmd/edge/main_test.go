@@ -2,9 +2,14 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/example/wafplatform/pkg/wafcore"
 )
 
 func TestLoadSampleYAMLSnapshotNeedsExplicitDevelopmentFlag(t *testing.T) {
@@ -22,6 +27,37 @@ func TestLoadSampleYAMLSnapshotNeedsExplicitDevelopmentFlag(t *testing.T) {
 	}
 	if snapshot.Version != 1842 || len(snapshot.Sites) != 1 || snapshot.Sites[0].ID != "site_001" {
 		t.Fatalf("unexpected sample snapshot: %#v", snapshot)
+	}
+}
+
+func TestLoadChallengesReadsConfiguredOperatorFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "challenges.json")
+	if err := os.WriteFile(path, []byte(`{"token":"proof"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadChallenges(path)
+	if err != nil || got["token"] != "proof" {
+		t.Fatalf("loadChallenges=%v err=%v", got, err)
+	}
+}
+
+func TestLoadSnapshotUnsignedJSONDevelopmentFallbackReadsConfiguredFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	snapshot := wafcore.Snapshot{SchemaVersion: 1, Version: 91, GeneratedAt: time.Now().UTC(), Global: wafcore.GlobalConfig{ManagedRuleset: "test"}}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EDGE_ENV", "development")
+	t.Setenv("EDGE_DEV_UNSIGNED", "1")
+	t.Setenv("EDGE_SNAPSHOT_FILE", path)
+	t.Setenv("EDGE_LAST_KNOWN_GOOD", "")
+	got, err := loadSnapshot()
+	if err != nil || got.Version != 91 {
+		t.Fatalf("loadSnapshot version=%d err=%v", got.Version, err)
 	}
 }
 

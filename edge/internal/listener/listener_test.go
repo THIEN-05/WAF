@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/wafplatform/edge/internal/reqctx"
 	"github.com/example/wafplatform/edge/internal/router"
+	"github.com/example/wafplatform/pkg/wafcore"
 )
 
 func TestHTTPChallengeAndRedirect(t *testing.T) {
@@ -87,6 +89,52 @@ func canonicalTestHTTPHost(host string) (string, bool) {
 	canonical := router.NormalizeHost(host)
 	return canonical, canonical == "known.test"
 }
+
+func TestHostAuthorityConsistentAcrossRedirectRoutingAndSNI(t *testing.T) {
+	routes := router.New(&wafcore.Snapshot{Sites: []wafcore.Site{{ID: "known", Status: "active", Domains: []string{"known.test"}}}})
+	redirect := NewHTTPHandler(nil, "443", func(host string) (string, bool) {
+		canonical := router.NormalizeHost(host)
+		return canonical, routes.Route(host) != nil
+	})
+	for _, tc := range []struct {
+		host      string
+		accepted  bool
+		canonical string
+	}{
+		{host: "KNOWN.TEST.:80", accepted: true, canonical: "known.test"},
+		{host: "known.test:0"}, {host: "known.test:65536"}, {host: "known.test:bad"},
+		{host: "known.test:80:80"}, {host: "user@known.test"}, {host: "known.test/path"},
+		{host: "known.test?x"}, {host: "known.test.."}, {host: "known.test\x7f"},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "http://known.test/a?q=1", nil)
+			request.Host = tc.host
+			response := httptest.NewRecorder()
+			redirect.ServeHTTP(response, request)
+			if tc.accepted {
+				if response.Code != http.StatusPermanentRedirect || response.Header().Get("Location") != "https://known.test/a?q=1" {
+					t.Fatalf("redirect status=%d location=%q", response.Code, response.Header().Get("Location"))
+				}
+				if router.NormalizeHost(tc.host) != tc.canonical || routes.Route(tc.host) == nil {
+					t.Fatalf("router disagrees on accepted authority %q", tc.host)
+				}
+				ctx := &reqctx.RequestCtx{Host: tc.host, SNI: tc.canonical}
+				if _, status := routes.Resolve(ctx); status != 0 {
+					t.Fatalf("matching SNI rejected: status=%d", status)
+				}
+				ctx.SNI = "other.test"
+				if _, status := routes.Resolve(ctx); status != http.StatusMisdirectedRequest {
+					t.Fatalf("SNI/Host mismatch status=%d", status)
+				}
+				return
+			}
+			if response.Code != http.StatusMisdirectedRequest || response.Header().Get("Location") != "" || routes.Route(tc.host) != nil {
+				t.Fatalf("rejected authority redirected or routed: status=%d location=%q route=%v", response.Code, response.Header().Get("Location"), routes.Route(tc.host))
+			}
+		})
+	}
+}
+
 func TestMissingCertificateFallsBack(t *testing.T) {
 	cache := NewCertCache()
 	cert, err := NewSelfSignedDefault()

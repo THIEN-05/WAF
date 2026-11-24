@@ -94,6 +94,87 @@ func punycodeLabel(label string) (string, error) {
 	return "xn--" + out.String(), nil
 }
 
+func decodePunycodeLabel(label string) (string, error) {
+	if !strings.HasPrefix(label, "xn--") {
+		return "", fmt.Errorf("not a punycode label")
+	}
+	input := strings.TrimPrefix(label, "xn--")
+	output := make([]rune, 0, len(input))
+	if delimiter := strings.LastIndexByte(input, '-'); delimiter >= 0 {
+		for _, r := range input[:delimiter] {
+			if !validBasicRune(r) {
+				return "", fmt.Errorf("invalid basic punycode rune")
+			}
+			output = append(output, r)
+		}
+		input = input[delimiter+1:]
+	}
+	if input == "" {
+		return "", fmt.Errorf("empty punycode payload")
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	n, index, bias := int64(punyInitialN), int64(0), int64(punyInitialBias)
+	for offset := 0; offset < len(input); {
+		oldIndex, weight := index, int64(1)
+		for k := int64(punyBase); ; k += punyBase {
+			if offset >= len(input) {
+				return "", fmt.Errorf("truncated punycode payload")
+			}
+			digit, ok := decodeDigit(input[offset])
+			if !ok || int64(digit) > (maxInt64-index)/weight {
+				return "", fmt.Errorf("invalid or overflowing punycode digit")
+			}
+			offset++
+			index += int64(digit) * weight
+			threshold := threshold(k, bias)
+			if int64(digit) < threshold {
+				break
+			}
+			factor := int64(punyBase) - threshold
+			if weight > maxInt64/factor {
+				return "", fmt.Errorf("punycode weight overflow")
+			}
+			weight *= factor
+		}
+		points := int64(len(output) + 1)
+		bias = adapt(index-oldIndex, points, oldIndex == 0)
+		increment := index / points
+		if increment > 0x10ffff || n > 0x10ffff-increment {
+			return "", fmt.Errorf("punycode code point overflow")
+		}
+		n += increment
+		index %= points
+		if n >= 0xd800 && n <= 0xdfff {
+			return "", fmt.Errorf("punycode surrogate code point")
+		}
+		if n < 0 || n > 0x10ffff {
+			return "", fmt.Errorf("punycode code point out of range")
+		}
+		output = append(output, 0)
+		copy(output[index+1:], output[index:])
+		output[index] = rune(n)
+		index++
+	}
+	decoded := string(output)
+	for _, r := range decoded {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return "", fmt.Errorf("disallowed punycode code point")
+		}
+	}
+	return decoded, nil
+}
+
+func decodeDigit(b byte) (int, bool) {
+	switch {
+	case b >= 'a' && b <= 'z':
+		return int(b - 'a'), true
+	case b >= '0' && b <= '9':
+		return int(b-'0') + 26, true
+	default:
+		return 0, false
+	}
+}
+
 func validBasicRune(r rune) bool {
 	return r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-'
 }

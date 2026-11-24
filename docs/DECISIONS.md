@@ -112,6 +112,25 @@ Ngày: 2026-11-20
 
 - Decoder YAML v3 và `encoding/json` giữ hành vi bỏ qua field chưa biết; trường tùy chọn bị thiếu trong snapshot cũ giữ zero value, mặc định tắt tính năng. Điều này giữ tương thích mở rộng ở schema version 1; contract test khóa hành vi này.
 - Gate G chỉ harden PROXY protocol v1 hiện có: header tối đa 108 byte, CRLF và địa chỉ/port đúng định dạng; lỗi header đóng kết nối. Nguồn không thuộc CIDR tin cậy không được parse header. Chưa triển khai PROXY protocol v2 vì repo chưa có nhu cầu NLB cụ thể và không thêm parser/protocol mới vào đợt đóng nợ này; ghi **TODO-G-1**.
+
+## Gate G-2 — audit suppression và hostname — 2026-11-24
+
+Các `//nolint` còn lại được giữ vì có ranh giới tin cậy rõ ràng và test cụ thể; không dùng suppression mới để né lỗi. Audit từng vị trí:
+
+| Vị trí | Linter | Lý do giữ | Test chứng minh |
+|---|---|---|---|
+| `edge/cmd/edge/main.go:207` | G304 | File ACME HTTP-01 chỉ được chọn bởi operator qua cấu hình khởi động; request không cung cấp path. | `TestLoadChallengesReadsConfiguredOperatorFile` |
+| `edge/cmd/edge/main.go:237` | G304 | Snapshot YAML đọc từ `EDGE_SNAPSHOT_FILE`, chỉ trong nhánh development có opt-in unsigned. | `TestLoadSampleYAMLSnapshotNeedsExplicitDevelopmentFlag` |
+| `edge/cmd/edge/main.go:264` | G304 | Fallback unsigned JSON cũng chỉ dùng path `EDGE_SNAPSHOT_FILE` trong development và cần `EDGE_DEV_UNSIGNED=1`. | `TestLoadSnapshotUnsignedJSONDevelopmentFallbackReadsConfiguredFile` |
+| `edge/internal/configsync/holder.go:42` | G304 | `LoadLocal` nhận snapshot path cấu hình operator, không nhận dữ liệu request. | `TestLoadLocalUsesOperatorPathAndLastKnownGood` |
+| `edge/internal/configsync/holder.go:44` | G304 | Last-known-good path do operator truyền vào Holder khi khởi tạo; fallback chỉ đọc file đó. | `TestLoadLocalUsesOperatorPathAndLastKnownGood` |
+| `edge/internal/configsync/holder.go:79` | G304 | File keyring chỉ được trỏ qua `EDGE_PUBLIC_KEYS_FILE`; keyring được parse/kiểm tra trước dùng. | `TestLoadPublicKeysFromEnvAndFile` |
+| `edge/internal/configsync/holder.go:114` | G304 | Snapshot ký được đọc từ file operator cấu hình rồi xác minh Ed25519 trước khi trả. | `TestLoadSignedFileReadsConfiguredOperatorPath` |
+| `edge/internal/listener/fingerprint.go:4` | G401 | JA3 quy định MD5 làm fingerprint tương thích; digest không dùng cho xác thực hay bảo vệ tính toàn vẹn. | `TestFingerprintIndependentFoxIOChromeCapture`, `TestFingerprintIndependentFoxIOTLS12ALPNCapture` |
+| `edge/internal/listener/fingerprint.go:277` | G401 | Cùng lý do JA3; chỉ băm chuỗi fingerprint theo định dạng giao thức. | `TestFingerprintIndependentFoxIOChromeCapture`, `TestFingerprintIndependentFoxIOTLS12ALPNCapture` |
+| `edge/internal/proxy/proxy.go:257` | G706 | ID correlation được kiểm tra hex trước log, format `%q`; lỗi transport chỉ log kiểu lỗi, không nội dung attacker-controlled. | `TestProxyErrorDoesNotLogOrReflectUnsafeRequestID` |
+
+Vị trí cũ `edge/internal/proxy/proxy.go` G115 đã được gỡ: counter chuyển sang signed modular arithmetic có chuẩn hóa số âm; `TestWeightedOriginSelectionCounterNearInt64Maximum` kiểm tra wraparound. Host authority chỉ nhận port 1–65535, hostname/label theo trần DNS và IP IPv6 được biểu diễn dạng bracket để chuẩn hóa lặp lại ổn định. `FuzzNormalizeHost` kiểm tra các seed authority lỗi, quan hệ với `url.Parse`/`net.SplitHostPort` và tính idempotent; `TestHostAuthorityConsistentAcrossRedirectRoutingAndSNI` khóa kết quả listener redirect, router và SNI.
 - Khi WAF/rules đọc body, `gzip` được giải nén chỉ trong scan cap của gói và giới hạn expansion tối đa 20× số byte nén (với sàn 1 KiB để đọc header nhỏ); phần vượt giới hạn đánh dấu truncated, không coi là sạch. Encoding không hỗ trợ cũng đánh dấu truncated. Origin vẫn nhận byte nén gốc và framing HTTP gốc.
 
 ## Quyết định P3 — access và rate limiting

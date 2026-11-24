@@ -76,3 +76,51 @@ func TestApplySignedSnapshot(t *testing.T) {
 		t.Fatal("snapshot not applied")
 	}
 }
+
+func TestLoadLocalUsesOperatorPathAndLastKnownGood(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[string]ed25519.PublicKey{"k": pub}
+	raw, err := wafcore.SignSnapshot(testSnapshot(), "k", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "configured.snapshot")
+	lastGood := filepath.Join(dir, "last-good.snapshot")
+	if err = os.WriteFile(source, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := New(keys, lastGood)
+	if err = h.LoadLocal(source); err != nil || h.Load() == nil {
+		t.Fatalf("LoadLocal configured path: snapshot=%v err=%v", h.Load(), err)
+	}
+	if err = os.Remove(source); err != nil {
+		t.Fatal(err)
+	}
+	recovered := New(keys, lastGood)
+	if err = recovered.LoadLocal(source); err != nil || recovered.Load() == nil {
+		t.Fatalf("LoadLocal last-known-good fallback: snapshot=%v err=%v", recovered.Load(), err)
+	}
+}
+
+func TestLoadSignedFileReadsConfiguredOperatorPath(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := wafcore.SignSnapshot(testSnapshot(), "k", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "signed.snapshot")
+	if err = os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSignedFile(path, map[string]ed25519.PublicKey{"k": pub})
+	if err != nil || got.Version != 1 {
+		t.Fatalf("LoadSignedFile version=%d err=%v", got.Version, err)
+	}
+}

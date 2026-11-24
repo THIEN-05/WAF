@@ -74,19 +74,19 @@ func TestWeightedOriginSelection(t *testing.T) {
 	}
 }
 
-func TestWeightedOriginSelectionCounterNearUint64Maximum(t *testing.T) {
+func TestWeightedOriginSelectionCounterNearInt64Maximum(t *testing.T) {
 	p := NewOriginPool([]wafcore.Origin{
 		{URL: "http://203.0.113.1", Weight: 1},
 		{URL: "http://203.0.113.2", Weight: 1},
 	}, "edge")
-	p.next.Store(^uint64(0))
+	p.next.Store(int64(^uint64(0) >> 1))
 
 	origin, _, err := p.Select()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if origin.URL != "http://203.0.113.2" {
-		t.Fatalf("selected origin %q, want second origin after uint64 wraparound", origin.URL)
+		t.Fatalf("selected origin %q, want second origin after int64 wraparound", origin.URL)
 	}
 }
 func TestCircuitBreakerFiveFailuresAndHalfOpen(t *testing.T) {
