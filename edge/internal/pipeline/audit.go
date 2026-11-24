@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	AuditWAFBudgetExceeded = "waf_budget_exceeded"
-	AuditWAFBodyTruncated  = "waf_body_truncated"
+	AuditWAFBudgetExceeded  = "waf_budget_exceeded"
+	AuditWAFBodyTruncated   = "waf_body_truncated"
+	AuditWAFBodyReadTimeout = "waf_body_read_timeout"
 )
 
 type AuditEvent struct {

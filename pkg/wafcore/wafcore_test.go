@@ -246,6 +246,32 @@ func TestWAFConfigValidation(t *testing.T) {
 		t.Fatalf("expected WAF sensitivity and entitlement validation, got %v", err)
 	}
 }
+
+func TestEffectiveBodyLimitByPlan(t *testing.T) {
+	for _, tc := range []struct {
+		plan              string
+		entitlement, want int
+	}{{"free", 256 * 1024, 8 * 1024}, {"pro", 256 * 1024, 64 * 1024}, {"business", 128 * 1024, 128 * 1024}, {"business", 256 * 1024, 256 * 1024}, {"enterprise", 256 * 1024, 256 * 1024}} {
+		t.Run(tc.plan+"/"+strconv.Itoa(tc.entitlement), func(t *testing.T) {
+			site := Site{Plan: tc.plan, Entitlements: Entitlements{MaxBodyBytes: tc.entitlement}}
+			if got := site.EffectiveBodyLimitBytes(); got != tc.want {
+				t.Fatalf("body limit=%d want=%d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWAFScanLimitAllowsFullBoundedRequestScope(t *testing.T) {
+	snapshot := validSnapshot()
+	snapshot.Sites[0].WAF.ScanLimitBytes = 1024 * 1024
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("1 MiB bounded scan limit rejected: %v", err)
+	}
+	snapshot.Sites[0].WAF.BodyLimitKB = 257
+	if err := snapshot.Validate(); err == nil || !strings.Contains(err.Error(), "body_limit_kb") {
+		t.Fatalf("body limit above package max accepted: %v", err)
+	}
+}
 func TestLogAndStatsValidate(t *testing.T) {
 	e := LogEvent{SchemaVersion: 1, TS: time.Now(), RequestID: "r", SiteID: "s", TenantID: "t", ClientIP: "192.0.2.1"}
 	if err := e.Validate(); err != nil {

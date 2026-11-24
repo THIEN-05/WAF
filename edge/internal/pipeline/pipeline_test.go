@@ -52,7 +52,7 @@ func TestWAFEventsAreAuditedAsynchronously(t *testing.T) {
 	metrics := NewHistogram()
 	defer metrics.Close()
 	p := New(metrics,
-		testPhase{"waf", reqctx.Decision{Action: reqctx.ActionAllow, RuleID: "waf_budget", Tags: []string{AuditWAFBudgetExceeded, AuditWAFBodyTruncated}}},
+		testPhase{"waf", reqctx.Decision{Action: reqctx.ActionAllow, RuleID: "waf_budget", Tags: []string{AuditWAFBudgetExceeded, AuditWAFBodyTruncated, AuditWAFBodyReadTimeout}}},
 	)
 	ctx := reqctx.New(httptest.NewRequest("POST", "http://x/", strings.NewReader("body")), nil, "audit", nil)
 	_ = p.Run(ctx)
@@ -60,7 +60,7 @@ func TestWAFEventsAreAuditedAsynchronously(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		counts := metrics.AuditCounts()
-		if counts[AuditWAFBudgetExceeded] == 1 && counts[AuditWAFBodyTruncated] == 1 {
+		if counts[AuditWAFBudgetExceeded] == 1 && counts[AuditWAFBodyTruncated] == 1 && counts[AuditWAFBodyReadTimeout] == 1 {
 			return
 		}
 		time.Sleep(time.Millisecond)

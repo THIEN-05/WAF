@@ -53,6 +53,42 @@ type Site struct {
 	Secrets      SecretReferences `json:"secrets" yaml:"secrets"`
 }
 
+// EffectiveBodyLimitBytes returns the configured scan/read cap bounded by the
+// site's plan and explicit MaxBodyBytes entitlement.
+func (s Site) EffectiveBodyLimitBytes() int {
+	planLimit := 8 * 1024
+	switch strings.ToLower(s.Plan) {
+	case "free":
+		planLimit = 8 * 1024
+	case "pro":
+		planLimit = 64 * 1024
+	case "business":
+		planLimit = 128 * 1024
+		if s.Entitlements.MaxBodyBytes > planLimit {
+			planLimit = 256 * 1024
+		}
+	case "enterprise":
+		planLimit = 256 * 1024
+	default:
+		if s.Entitlements.MaxBodyBytes > 0 {
+			planLimit = minInt(s.Entitlements.MaxBodyBytes, 256*1024)
+		}
+	}
+	if s.Entitlements.MaxBodyBytes > 0 && s.Entitlements.MaxBodyBytes < planLimit {
+		planLimit = s.Entitlements.MaxBodyBytes
+	}
+	if s.WAF.BodyLimitKB > 0 && s.WAF.BodyLimitKB*1024 < planLimit {
+		planLimit = s.WAF.BodyLimitKB * 1024
+	}
+	return planLimit
+}
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 type Origin struct {
 	URL        string `json:"url" yaml:"url"`
 	Weight     int    `json:"weight" yaml:"weight"`
@@ -67,6 +103,7 @@ type WAFConfig struct {
 	Paranoia           int            `json:"paranoia,omitempty" yaml:"paranoia,omitempty"`
 	BudgetMS           int            `json:"budget_ms,omitempty" yaml:"budget_ms,omitempty"`
 	ScanLimitBytes     int            `json:"scan_limit_bytes,omitempty" yaml:"scan_limit_bytes,omitempty"`
+	BodyReadTimeoutMS  int            `json:"body_read_timeout_ms,omitempty" yaml:"body_read_timeout_ms,omitempty"`
 	TruncatedBodyScore int            `json:"truncated_body_score,omitempty" yaml:"truncated_body_score,omitempty"`
 	Exclusions         []WAFExclusion `json:"exclusions" yaml:"exclusions"`
 }
@@ -203,8 +240,8 @@ func (s Snapshot) Validate() error {
 		if len(site.Secrets.ChallengeHMACKeyID) > 64 || strings.ContainsAny(site.Secrets.ChallengeHMACKeyID, " /\\\t\r\n") {
 			errs = append(errs, p+".secrets.challenge_hmac_key_id: invalid key identifier")
 		}
-		if site.WAF.BodyLimitKB < 0 {
-			errs = append(errs, p+".waf.body_limit_kb: must not be negative")
+		if site.WAF.BodyLimitKB < 0 || site.WAF.BodyLimitKB > 256 {
+			errs = append(errs, p+".waf.body_limit_kb: must be between 0 and 256 KiB")
 		}
 		if site.WAF.Sensitivity != "" && site.WAF.Sensitivity != "low" && site.WAF.Sensitivity != "medium" && site.WAF.Sensitivity != "high" {
 			errs = append(errs, p+".waf.sensitivity: must be low, medium, or high")
@@ -218,8 +255,14 @@ func (s Snapshot) Validate() error {
 		if site.WAF.BudgetMS < 0 {
 			errs = append(errs, p+".waf.budget_ms: must not be negative")
 		}
-		if site.WAF.ScanLimitBytes < 0 || site.WAF.ScanLimitBytes > 4*1024 {
-			errs = append(errs, p+".waf.scan_limit_bytes: must be between 0 and 4096")
+		if site.WAF.BodyReadTimeoutMS < 0 || site.WAF.BodyReadTimeoutMS > 30000 {
+			errs = append(errs, p+".waf.body_read_timeout_ms: must be between 0 and 30000")
+		}
+		if site.WAF.ScanLimitBytes < 0 || site.WAF.ScanLimitBytes > 1024*1024 {
+			errs = append(errs, p+".waf.scan_limit_bytes: must be between 0 and 1048576")
+		}
+		if site.Entitlements.MaxBodyBytes < 0 || site.Entitlements.MaxBodyBytes > 256*1024 {
+			errs = append(errs, p+".entitlements.max_body_bytes: must be between 0 and 262144")
 		}
 		if site.WAF.TruncatedBodyScore < 0 || site.WAF.TruncatedBodyScore > 5 {
 			errs = append(errs, p+".waf.truncated_body_score: must be between 0 and 5")

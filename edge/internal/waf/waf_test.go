@@ -3,6 +3,7 @@ package waf
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -574,15 +576,22 @@ func TestWorstCaseBodyLimitsAndBudgetFailMode(t *testing.T) {
 				r.Header.Set("Content-Type", "text/plain")
 				ctx := reqctx.New(r, nil, "worst-case", nil)
 				ctx.Entitlements.MaxBodyBytes = kb * 1024
-				ctx.Site = &wafcore.Site{ID: "s", FailMode: failMode, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 1, BodyLimitKB: kb, BudgetMS: 2}}
+				plan := "free"
+				if kb == 64 {
+					plan = "pro"
+				}
+				if kb == 256 {
+					plan = "enterprise"
+				}
+				ctx.Site = &wafcore.Site{ID: "s", Plan: plan, Entitlements: wafcore.Entitlements{MaxBodyBytes: kb * 1024}, FailMode: failMode, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 1, BodyLimitKB: kb, BudgetMS: 2}}
 				started := time.Now()
 				decision := phase.Handle(ctx)
 				elapsed := time.Since(started)
 				if !ctx.BodyLoaded() || elapsed < 2*time.Millisecond {
 					t.Fatalf("body was not read within enforced budget path: loaded=%v elapsed=%s", ctx.BodyLoaded(), elapsed)
 				}
-				if got := len(ctx.BodyText()); got != maxBodyScanBytes || !ctx.BodyTruncated() {
-					t.Fatalf("WAF body prefix: got %d bytes truncated=%v, want %d-byte bounded prefix", got, ctx.BodyTruncated(), maxBodyScanBytes)
+				if got := len(ctx.BodyText()); got != kb*1024 || ctx.BodyTruncated() {
+					t.Fatalf("WAF body buffer: got %d bytes truncated=%v, want complete %d-byte package scope", got, ctx.BodyTruncated(), kb*1024)
 				}
 				want := reqctx.ActionAllow
 				if failMode == "closed" {
@@ -594,7 +603,7 @@ func TestWorstCaseBodyLimitsAndBudgetFailMode(t *testing.T) {
 				if !strings.Contains(decision.Reason, "budget exceeded") {
 					t.Fatalf("budget reason missing: %+v", decision)
 				}
-				if !containsString(decision.Tags, "waf_budget_exceeded") || !containsString(decision.Tags, "waf_body_truncated") {
+				if !containsString(decision.Tags, "waf_budget_exceeded") {
 					t.Fatalf("budget tag missing: %+v", decision)
 				}
 				replayed, err := io.ReadAll(r.Body)
@@ -622,7 +631,7 @@ func TestLargeBodyAttackAtPrefixCannotBeSkipped(t *testing.T) {
 	if decision.Action != reqctx.ActionBlock || !containsString(decision.Tags, "sqli") {
 		t.Fatalf("large body prefix escaped WAF: %+v", decision)
 	}
-	if !ctx.BodyTruncated() || len(ctx.BodyText()) != maxBodyScanBytes {
+	if !ctx.BodyTruncated() || len(ctx.BodyText()) != 8*1024 {
 		t.Fatalf("large body was not bounded: truncated=%v prefix=%d", ctx.BodyTruncated(), len(ctx.BodyText()))
 	}
 	replayed, err := io.ReadAll(request.Body)
@@ -642,17 +651,27 @@ func TestBodyTruncationScoresAndPlanFailModeDefaults(t *testing.T) {
 		want string
 	}{{plan: "free", want: "open"}, {plan: "pro", want: "closed"}} {
 		t.Run(tc.plan, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", strings.NewReader(strings.Repeat("x", 16*1024)))
+			request := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", strings.NewReader(strings.Repeat("x", 20*1024)))
 			request.Header.Set("Content-Type", "text/plain")
 			ctx := reqctx.New(request, nil, "truncate", nil)
 			ctx.Entitlements.MaxBodyBytes = 16 * 1024
-			ctx.Site = &wafcore.Site{ID: "s", Plan: tc.plan, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "high", BodyLimitKB: 16, TruncatedBodyScore: 3, BudgetMS: 2000}}
+			capKB := 8
+			maxBytes := 8 * 1024
+			if tc.plan == "pro" {
+				capKB = 16
+				maxBytes = 16 * 1024
+			}
+			ctx.Site = &wafcore.Site{ID: "s", Plan: tc.plan, Entitlements: wafcore.Entitlements{MaxBodyBytes: maxBytes}, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "high", BodyLimitKB: capKB, TruncatedBodyScore: 3, BudgetMS: 2000}}
 			decision := phase.Handle(ctx)
 			if decision.RuleID != "waf_body_truncated" || decision.Score != 3 || !containsString(decision.Tags, "waf_body_truncated") {
 				t.Fatalf("truncation must be an anomaly with the configured score: %+v", decision)
 			}
-			if decision.Action != reqctx.ActionLogOnly {
-				t.Fatalf("monitor mode truncation action=%v, want log only", decision.Action)
+			wantAction := reqctx.ActionBlock
+			if tc.want == "open" {
+				wantAction = reqctx.ActionAllow
+			}
+			if decision.Action != wantAction {
+				t.Fatalf("truncation fail mode action=%v want %v", decision.Action, wantAction)
 			}
 			budgetDecision := phase.budgetFailure(ctx, 0, "test budget")
 			want := reqctx.ActionAllow
@@ -715,6 +734,222 @@ func TestBodyReadErrorIsMarkedAsTruncated(t *testing.T) {
 		t.Fatalf("explicit fail-open on read error: got %v", decision.Action)
 	}
 	reqctx.Release(ctx)
+}
+
+func TestBodyReadTimeoutEmitsTimeoutTag(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "http://edge.test/", nil)
+	r.Header.Set("Content-Type", "text/plain")
+	ctx := reqctx.New(r, nil, "body-timeout", nil)
+	ctx.Site = &wafcore.Site{ID: "s", Plan: "free", WAF: wafcore.WAFConfig{Mode: "block", BudgetMS: 2000}}
+	ctx.MarkBodyReadError(context.DeadlineExceeded)
+	decision := phase.Handle(ctx)
+	if decision.RuleID != "waf_budget" || decision.Action != reqctx.ActionAllow || !containsString(decision.Tags, "waf_budget_exceeded") || !containsString(decision.Tags, "waf_body_truncated") || !containsString(decision.Tags, "waf_body_read_timeout") {
+		t.Fatalf("body timeout decision/tags=%+v", decision)
+	}
+	reqctx.Release(ctx)
+}
+
+func TestScanWindowBypassMatrixAcrossTargets(t *testing.T) {
+	rule := Rule{ID: "test-window-sqli", Phase: "request", Targets: []string{"path", "args", "headers", "cookies", "body"}, Pattern: `union\s+select`, Severity: "critical", Paranoia: 1, Prefilter: []string{"union", "select"}, Tags: []string{"test-sqli"}}
+	phase, err := NewPhase([]Rule{rule}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := []string{"path", "query", "header", "cookie", "form", "json", "xml", "multipart"}
+	for _, target := range targets {
+		for _, offset := range []int{1, 2, 8, 60} {
+			for _, placement := range []string{"middle", "end"} {
+				t.Run(fmt.Sprintf("%s/%dKB/%s", target, offset, placement), func(t *testing.T) {
+					pad := strings.Repeat("x", offset*1024)
+					if offset == 2 {
+						pad = strings.Repeat("%41", offset*1024/3) + strings.Repeat("x", offset*1024%3)
+					}
+					if offset == 8 {
+						pad = strings.Repeat("/**/", offset*1024/4)
+					}
+					suffix := ""
+					if placement == "middle" {
+						suffix = strings.Repeat("z", offset*1024)
+					}
+					request := httptest.NewRequest(http.MethodGet, "http://edge.test/", nil)
+					includeBody := false
+					setBody := func(contentType, raw string) {
+						request.Method = http.MethodPost
+						request.Body = io.NopCloser(strings.NewReader(raw))
+						request.ContentLength = int64(len(raw))
+						request.Header.Set("Content-Type", contentType)
+						includeBody = true
+					}
+					switch target {
+					case "path":
+						request.URL.Path = "/" + pad + "UNION/**/SELECT" + suffix
+					case "query":
+						request.URL.RawQuery = "p=" + pad + "UNION%2F**%2FSELECT" + suffix
+					case "header":
+						request.Header.Set("Referer", pad+"UNION/**/SELECT"+suffix)
+					case "cookie":
+						request.Header.Set("Cookie", "p="+pad+"UNION/**/SELECT"+suffix)
+					case "form":
+						setBody("application/x-www-form-urlencoded", "p="+pad+"UNION%2F**%2FSELECT"+suffix)
+					case "json":
+						setBody("application/json", `{"pad":"`+pad+suffix+`","q":"UNION/**/SELECT"}`)
+					case "xml":
+						setBody("application/xml", `<r><pad>`+pad+suffix+`</pad><q>UNION/**/SELECT</q></r>`)
+					case "multipart":
+						var b strings.Builder
+						b.WriteString("--b\r\nContent-Disposition: form-data; name=\"pad\"\r\n\r\n" + pad + suffix + "\r\n--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nUNION/**/SELECT\r\n--b--\r\n")
+						setBody("multipart/form-data; boundary=b", b.String())
+					}
+					ctx := reqctx.New(request, nil, "window-bypass", nil)
+					ctx.Path = request.URL.Path
+					ctx.Query = request.URL.RawQuery
+					ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", Entitlements: wafcore.Entitlements{MaxBodyBytes: 256 * 1024}, WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 1, BodyLimitKB: 256, BudgetMS: 2000}}
+					decision := phase.Handle(ctx)
+					if decision.Action != reqctx.ActionBlock || !containsString(decision.Tags, "test-sqli") {
+						t.Fatalf("payload outside a regex window: body=%v decision=%+v", includeBody, decision)
+					}
+					reqctx.Release(ctx)
+				})
+			}
+		}
+	}
+}
+
+func TestPackageBodyCapTruncationUsesFailMode(t *testing.T) {
+	phase, err := NewPhase([]Rule{{ID: "body-probe", Phase: "request", Targets: []string{"body"}, Pattern: `never-match`, Severity: "warning", Paranoia: 1, Prefilter: []string{"never"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		plan, fail string
+		want       reqctx.Action
+	}{{"free", "", reqctx.ActionAllow}, {"pro", "", reqctx.ActionBlock}} {
+		t.Run(tc.plan, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader(strings.Repeat("x", 70*1024)+"UNION SELECT"))
+			request.Header.Set("Content-Type", "text/plain")
+			ctx := reqctx.New(request, nil, "cap", nil)
+			ctx.Site = &wafcore.Site{ID: "s", Plan: tc.plan, FailMode: tc.fail, WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "low", Paranoia: 1, BudgetMS: 2000}}
+			got := phase.Handle(ctx)
+			if got.Action != tc.want || !containsString(got.Tags, "waf_body_truncated") || got.RuleID != "waf_body_truncated" {
+				t.Fatalf("truncated body decision=%+v want action=%v", got, tc.want)
+			}
+			reqctx.Release(ctx)
+		})
+	}
+}
+
+func TestRegexWindowLimitKeepsBodyHeadAndTail(t *testing.T) {
+	phase, err := NewPhase([]Rule{{ID: "test-window-limit", Phase: "request", Targets: []string{"body"}, Pattern: `union\s+select`, Severity: "critical", Paranoia: 1, Prefilter: []string{"union", "select"}, Tags: []string{"test-sqli"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Repeat("UNION harmless documentation phrase ", 6000) + "UNION SELECT"
+	r := httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader(body))
+	r.Header.Set("Content-Type", "text/plain")
+	ctx := reqctx.New(r, nil, "window-limit", nil)
+	ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", Entitlements: wafcore.Entitlements{MaxBodyBytes: 256 * 1024}, FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "high", Paranoia: 1, BodyLimitKB: 256, BudgetMS: 2000}}
+	got := phase.Handle(ctx)
+	if got.Action != reqctx.ActionBlock || !containsString(got.Tags, "test-sqli") || !containsString(got.Tags, "waf_scan_truncated") {
+		t.Fatalf("head/tail window selection missed final payload or failed closed: %+v", got)
+	}
+	reqctx.Release(ctx)
+}
+
+func TestLargeCleanBodiesFPR(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	falsePositives, total := 0, 0
+	for paranoia := 1; paranoia <= 4; paranoia++ {
+		levelFalsePositives := 0
+		for i := 0; i < 30; i++ {
+			contentType := "application/json"
+			body := fmt.Sprintf(`{"note":"select union drop script alert are examples in documentation","id":%d,"text":"ordinary clean technical content %s"}`, i, strings.Repeat("readme ", 650))
+			switch i % 4 {
+			case 1:
+				contentType = "application/x-www-form-urlencoded"
+				body = "message=" + url.QueryEscape("O'Neil searched for select, union, drop, script and alert in a manual "+strings.Repeat("ordinary ", 400))
+			case 2:
+				contentType = "text/plain"
+				body = "C:\\Users\\O'Neil\\Documents\\select-union-drop-script-alert.txt " + strings.Repeat("normal-upload ", 500)
+			case 3:
+				var data bytes.Buffer
+				writer := multipart.NewWriter(&data)
+				_ = writer.WriteField("readme", "select union drop script alert are ordinary words "+strings.Repeat("uploaded documentation ", 250))
+				_ = writer.Close()
+				contentType = writer.FormDataContentType()
+				body = data.String()
+			}
+			r := httptest.NewRequest(http.MethodPost, "http://edge.test/api", strings.NewReader(body))
+			r.Header.Set("Content-Type", contentType)
+			ctx := reqctx.New(r, nil, "large-clean", nil)
+			ctx.Site = &wafcore.Site{ID: "s", Plan: "free", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "high", Paranoia: paranoia, BudgetMS: 2000}}
+			decision := phase.Handle(ctx)
+			if decision.Score > 0 {
+				falsePositives++
+				levelFalsePositives++
+				t.Logf("large-clean false-positive p%d sample=%d content-type=%s decision=%+v body-bytes=%d truncated=%v", paranoia, i, contentType, decision, len(body), ctx.BodyTruncated())
+			}
+			total++
+			reqctx.Release(ctx)
+		}
+		t.Logf("large-clean paranoia=%d false_positive=%d/30 FPR=%.2f%%", paranoia, levelFalsePositives, float64(levelFalsePositives)*100/30)
+	}
+	if falsePositives > 0 {
+		t.Fatalf("large clean body FPR exceeded configured 0%%: %d/%d", falsePositives, total)
+	}
+}
+
+func TestWAFParallel50ReportsP99AndBudgetAction(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const workers, perWorker = 50, 5
+	latencies := make(chan int64, workers*perWorker)
+	budgetFailures := make(chan reqctx.Decision, workers*perWorker)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				body := `{"message":"ordinary search for select union drop script alert","worker":` + strconv.Itoa(worker) + `,"text":"` + strings.Repeat("safe documentation ", 350) + `"}`
+				r := httptest.NewRequest(http.MethodPost, "http://edge.test/api", strings.NewReader(body))
+				r.Header.Set("Content-Type", "application/json")
+				ctx := reqctx.New(r, nil, "parallel", nil)
+				ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", Entitlements: wafcore.Entitlements{MaxBodyBytes: 256 * 1024}, FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "high", Paranoia: 4, BodyLimitKB: 256, BudgetMS: 2}}
+				started := time.Now()
+				decision := phase.Handle(ctx)
+				latencies <- time.Since(started).Nanoseconds()
+				if containsString(decision.Tags, "waf_budget_exceeded") {
+					budgetFailures <- decision
+				}
+				reqctx.Release(ctx)
+			}
+		}(worker)
+	}
+	wg.Wait()
+	close(latencies)
+	close(budgetFailures)
+	samples := make([]int64, 0, workers*perWorker)
+	for sample := range latencies {
+		samples = append(samples, sample)
+	}
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	budgetCount := 0
+	for decision := range budgetFailures {
+		budgetCount++
+		if decision.Action != reqctx.ActionBlock || !containsString(decision.Tags, "waf_budget_exceeded") {
+			t.Fatalf("paid budget failure did not fail closed: %+v", decision)
+		}
+	}
+	t.Logf("parallel-50 body=8KB p50=%d ns p99=%d ns budget_exceeded=%d/%d; any over-budget scan follows fail_mode", samples[len(samples)*50/100], samples[(len(samples)*99+99)/100-1], budgetCount, len(samples))
 }
 
 func containsString(values []string, want string) bool {
@@ -1000,14 +1235,25 @@ func BenchmarkWAFWorstCase(b *testing.B) {
 				b.SetBytes(int64(limit))
 				b.ResetTimer()
 				latencies := make([]int64, 0, min(b.N, 256))
+				budgetExceeded := 0
 				for i := 0; i < b.N; i++ {
 					started := time.Now()
 					r := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", strings.NewReader(payload))
 					r.Header.Set("Content-Type", contentType)
 					c := reqctx.New(r, nil, "bench", nil)
 					c.Entitlements.MaxBodyBytes = limit
-					c.Site = &wafcore.Site{ID: "bench", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 4, BodyLimitKB: kb, BudgetMS: 2}}
-					_ = phase.Handle(c)
+					plan := "free"
+					if kb == 64 {
+						plan = "pro"
+					}
+					if kb == 256 {
+						plan = "enterprise"
+					}
+					c.Site = &wafcore.Site{ID: "bench", Plan: plan, Entitlements: wafcore.Entitlements{MaxBodyBytes: limit}, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 4, BodyLimitKB: kb, BudgetMS: 2}}
+					decision := phase.Handle(c)
+					if containsString(decision.Tags, "waf_budget_exceeded") {
+						budgetExceeded++
+					}
 					reqctx.Release(c)
 					if i < 256 {
 						if elapsed := time.Since(started).Nanoseconds(); elapsed > 0 {
@@ -1016,6 +1262,7 @@ func BenchmarkWAFWorstCase(b *testing.B) {
 					}
 				}
 				reportLatencyPercentiles(b, latencies)
+				b.ReportMetric(float64(budgetExceeded)*100/float64(b.N), "budget-exceeded-%")
 			})
 		}
 	}
@@ -1030,12 +1277,16 @@ func BenchmarkWAFWorstCase(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		latencies := make([]int64, 0, min(b.N, 256))
+		budgetExceeded := 0
 		for i := 0; i < b.N; i++ {
 			started := time.Now()
 			r := httptest.NewRequest(http.MethodGet, "http://edge.test/search?"+query.String(), nil)
 			c := reqctx.New(r, nil, "bench", nil)
 			c.Site = &wafcore.Site{ID: "bench", WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 4, BudgetMS: 2}}
-			_ = phase.Handle(c)
+			decision := phase.Handle(c)
+			if containsString(decision.Tags, "waf_budget_exceeded") {
+				budgetExceeded++
+			}
 			reqctx.Release(c)
 			if i < 256 {
 				if elapsed := time.Since(started).Nanoseconds(); elapsed > 0 {
@@ -1044,6 +1295,7 @@ func BenchmarkWAFWorstCase(b *testing.B) {
 			}
 		}
 		reportLatencyPercentiles(b, latencies)
+		b.ReportMetric(float64(budgetExceeded)*100/float64(b.N), "budget-exceeded-%")
 	})
 }
 

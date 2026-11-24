@@ -1,6 +1,37 @@
 # Benchmark
 
-## P4d — giới hạn scan và coverage dev — 2026-11-23
+## P4e — toàn phạm vi package, cửa sổ regex và deadline body — 2026-11-24
+
+Đo trên WSL Ubuntu/Linux amd64, Go 1.26.11, Intel Core i5-11400H @ 2.70 GHz; `-benchtime=100x -benchmem`. Mỗi body benchmark đặt đúng gói/cap 8/64/256 KiB; WAF budget 2 ms. `budget-exceeded-%` là tỷ lệ request mà WAF phát hiện vượt ngân sách và phát `waf_budget_exceeded`; Free áp dụng fail-open, Pro/Enterprise áp dụng fail-closed. Đây là trạng thái/hành vi khi p99 vượt 2 ms, không tuyên bố giới hạn wall-clock cứng.
+
+| Input | Kích thước | ns/op | p50 ns | p99 ns | B/op | allocs/op | vượt budget |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Aho keywords lặp | 8 KiB | 2,031,240 | 2,022,401 | 2,119,558 | 86,889 | 89 | 100% |
+| JSON lồng sâu | 8 KiB | 526,361 | 502,373 | 721,825 | 52,720 | 58 | 0% |
+| Multipart nhiều phần | 8 KiB | 2,026,020 | 2,020,799 | 2,077,908 | 105,586 | 111 | 100% |
+| Aho keywords lặp | 64 KiB | 2,051,275 | 2,025,607 | 2,193,289 | 340,253 | 138 | 100% |
+| JSON lồng sâu | 64 KiB | 2,040,638 | 2,030,383 | 2,173,155 | 290,733 | 96 | 100% |
+| Multipart nhiều phần | 64 KiB | 2,024,580 | 2,013,386 | 2,087,377 | 382,097 | 167 | 100% |
+| Aho keywords lặp | 256 KiB | 2,027,176 | 2,016,330 | 2,094,294 | 1,037,041 | 142 | 100% |
+| JSON lồng sâu | 256 KiB | 2,041,659 | 2,026,347 | 2,163,780 | 987,102 | 99 | 100% |
+| Multipart nhiều phần | 256 KiB | 2,035,146 | 2,018,850 | 2,122,944 | 1,057,522 | 157 | 100% |
+| 200 tham số query | — | 2,056,106 | 2,025,775 | 2,379,751 | 213,693 | 2,157 | 100% |
+
+Lệnh đo: `go test -run '^$' -bench '^BenchmarkWAFWorstCase$' -benchtime=100x -benchmem ./edge/internal/waf`.
+
+Đo tải nhẹ song song: test `TestWAFParallel50ReportsP99AndBudgetAction` chạy 50 goroutine × 5 request JSON 8 KiB. WSL/Linux ghi p50 **2,090,501 ns**, p99 **22,048,227 ns**, budget vượt **250/250**. Các request dùng plan Enterprise/fail-closed và test xác nhận cả 250 đều trả decision block có `waf_budget_exceeded`; scheduler/CPU contention làm latency request tổng cao hơn 2 ms, nên đây không phải hard real-time guarantee.
+
+FPR body lớn: test 30 mẫu sạch cho mỗi paranoia (JSON, form, text, multipart) ghi **0/30 (0.00%)** ở P1, P2, P3 và P4. Ngưỡng test cố định 0%; nếu body vượt cap, đó là trường hợp thiếu quan sát được báo riêng bằng `waf_body_truncated`, không tính là mẫu sạch đầy đủ.
+
+Thay đổi thuật toán: Aho-Corasick quét cả phạm vi body theo block 4 KiB, overlap 512 byte; các vùng keyword chồng lấn được gộp rồi tách thành cửa sổ regex ≤512 byte. Tối đa 128 cửa sổ/request, giữ 64 đầu + 64 cuối; khi bị cắt, gắn scan/body truncated và áp fail mode. Khử trùng keyword Aho và yêu cầu biên từ cho tiền lọc chữ-số dài tối đa 3 ký tự để từ phổ biến như `or` trong `ordinary` không tạo cửa sổ giả. Test bypass bao phủ 64 trường hợp path/query/header/cookie/form/JSON/XML/multipart, padding 1/2/8/60 KiB, vị trí giữa/cuối; test riêng chứng minh phần cuối vẫn được quét sau khi K cửa sổ đã đầy.
+
+Test loopback thật cho body chậm/treo/đứt giữa chừng PASS trong WSL Ubuntu; deadline đọc mặc định 1 giây làm handler kết thúc, paid fail-closed trả 403. `TestPerIPConnectionLimit` tiếp tục nằm trong suite listener và được xác minh cùng race suite. Test loopback chỉ chạy ngoài sandbox Windows.
+
+Các p99 singleton vượt 2 ms nhẹ trong phần lớn workload và body 8 KiB dạng lặp/multipart; phần vượt ngân sách phát tag budget và xử lý theo plan (Free open, paid close). Độ trễ 50 goroutine cao rõ rệt nhưng toàn bộ request vẫn fail-closed. Allocations tăng theo kích thước body, nhưng body buffer có cap theo plan; test heap sau warm-up 3.000 request vẫn giới hạn heap tăng dưới 4 MiB. Kết quả là phép đo một máy, không đảm bảo hiệu năng sản xuất.
+
+Corpus ngoài do người dùng cung cấp được đo bằng `sh scripts/measure-waf-corpus.sh /path/to/corpus-v3`; script chỉ đọc `attacks.tsv` và `clean.tsv` ở thư mục đó, không nạp hay sửa luật. Corpus v2 trong repo vẫn là **dev**, không phải held-out; chưa có kết quả Coraza/CRS.
+
+## P4d — giới hạn scan và coverage dev — 2026-11-23 (lịch sử; trần đã bị P4e supersede)
 
 ### Xác minh trên corpus v2 (dev)
 

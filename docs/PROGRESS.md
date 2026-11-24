@@ -1,5 +1,42 @@
 # Tiến độ
 
+## P4e — WAF buffer bypass và deadline đọc body — 2026-11-24
+
+### Đã xác minh
+
+- Luồng WAF thay trần 4 KiB/request, 2 KiB/target và 1 KiB body prefix bằng body cap theo gói (Free 8 KiB, Pro 64 KiB, Business 128 KiB/256 KiB theo entitlement, Enterprise 256 KiB), tối đa 256 KiB/target và 1 MiB/request. Aho-Corasick quét toàn phạm vi; body normalize theo block 4 KiB chồng 512 byte; RE2 chỉ chạy trên cửa sổ 512 byte quanh keyword, tối đa 128 cửa sổ/request và giữ head/tail khi vượt K.
+- Validation snapshot cho phép `scan_limit_bytes` đến 1 MiB, giới hạn `body_limit_kb`/`max_body_bytes` ở 256 KiB; test xác nhận entitlement lớn không nới cap Free 8 KiB.
+- Cắt phần quét gắn cờ `waf_body_truncated` (body, mặc định +3 điểm) hoặc `waf_scan_truncated` (target/window) và áp fail mode; test kiểm chứng payload sau 1/2/8/60 KiB đệm ở path/query/header/cookie/form/JSON/XML/multipart, giữa/cuối. Payload trong cap bị bắt; payload sau package cap đi vào fail mode, không thành kết quả sạch.
+- Đọc body đặt `http.ResponseController.SetReadDeadline` trước khi pipeline đọc; mặc định 1 giây, override qua `body_read_timeout_ms`. Timeout gắn `waf_budget_exceeded`, `waf_body_truncated`, `waf_body_read_timeout`; deadline hết hạn được giữ lại để proxy không treo trên phần request chưa đọc. Có test loopback slow/hung/truncated body; các test này chỉ chạy ngoài sandbox Windows (WSL/Linux).
+- FPR test thêm 30 mẫu body lớn sạch cho mỗi paranoia (JSON, form, multipart, text); benchmark/test in FPR từng P1–P4. Có test tải 50 goroutine, đo p50/p99 và kiểm tra request vượt budget áp fail mode; test heap 3.000 request giữ nguyên để phát hiện tăng bộ nhớ.
+- Script `scripts/measure-waf-corpus.sh <dir>` đọc corpus ngoài chỉ từ thư mục người dùng chỉ định, in TPR theo nhóm và không thay đổi luật.
+- **Đã xác minh trong WSL Ubuntu/Linux, Go 1.26.11:** `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...` → `0 issues.`; `go vet ./...` → exit 0; `go test -count=1 ./...` → PASS tất cả package; `go test -race -count=1 ./...` → PASS tất cả package. `sh -n scripts/measure-waf-corpus.sh` và `git diff --check` → PASS.
+- WSL verbose test xác nhận FPR body sạch lớn 0/30 (0%) riêng cho P1, P2, P3, P4; 50 goroutine × 5 request ghi p50 2,090,501 ns / p99 22,048,227 ns, budget exceeded 250/250 và tất cả decision fail-closed có tag `waf_budget_exceeded`.
+- Test loopback WSL: `TestLoopbackBodyReadDeadlineSlowAndHungClients` PASS (slow/hung kết thúc lần lượt ~110/100 ms với timeout cấu hình 80 ms); `TestLoopbackTruncatedBodyReleasesListener` PASS. Full race suite cũng xác minh test listener `TestPerIPConnectionLimit`.
+- Benchmark WSL/Linux `-benchtime=100x -benchmem`: p99 body/query nằm khoảng 676,028–2,379,751 ns; body keyword lặp/multipart và các body 64/256 KiB vượt 2 ms ở 100% lần đo, gắn budget tag và đi theo fail mode. JSON lồng sâu 8 KiB không vượt budget. Đủ số p50/p99, B/op, allocs/op đã ghi trong `docs/BENCHMARKS.md`; test heap 3.000 request PASS (heap tăng không quá 4 MiB).
+- 64 ca matrix bypass ở path/query/header/cookie/form/JSON/XML/multipart với padding 1/2/8/60 KiB, middle/end PASS; test payload cuối body sau >128 cửa sổ tiền lọc PASS; package cap Free/Pro áp dụng fail mode như kỳ vọng.
+
+### Chưa xác minh — lệnh tự chạy lại
+
+- Không còn test/lint/vet nội bộ chưa chạy trong môi trường hiện tại. Loopback không chạy được trong sandbox Windows; đã xác minh lại bằng WSL/Linux như trên. Sau thay đổi tiếp theo, lệnh đầy đủ: `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./... && go vet ./... && go test -count=1 ./... && go test -race -count=1 ./...`.
+- Chưa chạy lại GitHub Actions sau commit/push; local WSL không thay thế xác nhận CI.
+- Chưa có corpus v3 độc lập do người dùng cung cấp. Khi có, chạy `sh scripts/measure-waf-corpus.sh /path/to/corpus-v3`; corpus v2 vẫn là dev, không held-out.
+
+### Nợ kỹ thuật
+
+- **TODO-2:** audit writer đang in-memory; event enqueue bounded/nonblocking và có count timeout/truncation/budget, nhưng chưa bền vững qua restart. Thay adapter tại P6a.
+- **TODO-3: đã xử lý và xác minh trong WSL P4e:** đặt read deadline trên kết nối HTTP thực và kiểm tra slow/hung/truncated body bằng loopback; không còn dựa vào deadline WAF 2 ms để ngắt socket.
+- **TODO P4e-1:** body lớn hơn cap không thể quét đuôi thật mà vẫn chỉ buffer prefix và stream phần dư nguyên trạng; phần vượt cap được đánh dấu thiếu quan sát và áp fail_mode. Nếu yêu cầu quét đuôi thật ngoài phạm vi cap, cần thiết kế bounded spool/replay riêng trước khi triển khai.
+
+### Lệnh tự chạy lại
+
+```sh
+golangci-lint run ./...
+go vet ./...
+go test -race -count=1 ./...
+go test -run '^$' -bench '^BenchmarkWAFWorstCase$' -benchtime=100x -benchmem ./edge/internal/waf
+```
+
 ## P8 — fingerprint TLS và bot challenge — 2026-11-23
 
 ### Đã xác minh
@@ -34,7 +71,7 @@ go test -count=1 ./...
 go test -race -count=1 ./...
 ```
 
-## P4d — giới hạn scan và coverage dev — 2026-11-23
+## P4d — giới hạn scan và coverage dev — 2026-11-23 (lịch sử; P4e supersedes các trần scan)
 
 ### Đã xác minh
 

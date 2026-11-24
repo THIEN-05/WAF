@@ -3,6 +3,7 @@ package reqctx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -221,10 +222,10 @@ func (c *RequestCtx) BodyPrefix(maxBytes int) string {
 		return ""
 	}
 	limit := int64(8 * 1024)
-	if c.Site != nil && c.Site.WAF.BodyLimitKB > 0 {
-		limit = int64(c.Site.WAF.BodyLimitKB) * 1024
+	if c.Site != nil {
+		limit = int64(c.Site.EffectiveBodyLimitBytes())
 	}
-	if c.Entitlements.MaxBodyBytes > 0 && int64(c.Entitlements.MaxBodyBytes) < limit {
+	if c.Site == nil && c.Entitlements.MaxBodyBytes > 0 {
 		limit = int64(c.Entitlements.MaxBodyBytes)
 	}
 	if limit < 1 {
@@ -249,6 +250,18 @@ func (c *RequestCtx) BodyPrefix(maxBytes int) string {
 func (c *RequestCtx) BodyTruncated() bool  { return c.bodyTruncated }
 func (c *RequestCtx) BodyReadError() error { return c.bodyReadErr }
 func (c *RequestCtx) BodyLoaded() bool     { return c.bodyLoaded }
+func (c *RequestCtx) MarkBodyReadError(err error) {
+	if err == nil {
+		return
+	}
+	c.bodyLoaded = true
+	c.bodyReadErr = err
+	c.bodyTruncated = true
+}
+func (c *RequestCtx) BodyReadTimedOut() bool {
+	var timeout net.Error
+	return errors.As(c.bodyReadErr, &timeout) && timeout.Timeout()
+}
 
 type replayBody struct {
 	io.Reader

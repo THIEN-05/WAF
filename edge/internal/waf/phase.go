@@ -20,13 +20,21 @@ type scanTarget struct {
 	path  bool
 }
 
+type regexCandidate struct{ text string }
+type queuedRegexCandidate struct {
+	target scanTarget
+	text   string
+}
+
 const (
-	defaultRequestScanBytes = 4 * 1024
-	maxRequestScanBytes     = 4 * 1024
-	maxTargetScanBytes      = 2 * 1024
-	maxBodyScanBytes        = 1 * 1024
-	maxQueryParseBytes      = 8 * 1024
-	maxQueryParams          = 64
+	defaultRequestScanBytes = 1024 * 1024
+	maxRequestScanBytes     = 1024 * 1024
+	maxTargetScanBytes      = 256 * 1024
+	maxBodyScanBytes        = 256 * 1024
+	maxQueryParseBytes      = 256 * 1024
+	maxQueryParams          = 200
+	scanChunkBytes          = 4096
+	scanChunkOverlap        = maxRegexWindowBytes
 )
 
 type Phase struct {
@@ -92,6 +100,30 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 	tags := make([]string, 0, 8)
 	seenTags := make(map[string]struct{})
 	bodyTruncated := false
+	bodyTruncationScored := false
+	markScanTruncated := func() {
+		inputTruncated = true
+		ctx.AddTag("waf_scan_truncated")
+		if !hasString(tags, "waf_scan_truncated") && len(tags) < 32 {
+			tags = append(tags, "waf_scan_truncated")
+		}
+	}
+	markBodyTruncated := func() {
+		bodyTruncated = true
+		ctx.AddTag("waf_body_truncated")
+		if !hasString(tags, "waf_body_truncated") && len(tags) < 32 {
+			tags = append(tags, "waf_body_truncated")
+		}
+		if !bodyTruncationScored {
+			truncatedScore := ctx.Site.WAF.TruncatedBodyScore
+			if truncatedScore == 0 {
+				truncatedScore = 3
+			}
+			score += truncatedScore
+			ctx.WAFScore = score
+			bodyTruncationScored = true
+		}
+	}
 	addTags := func(rule compiledRule) {
 		for _, tag := range rule.rule.Tags {
 			if _, exists := seenTags[tag]; !exists && len(tags) < 32 {
@@ -101,6 +133,47 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 			}
 		}
 	}
+	evaluate := func(target scanTarget, candidate string) (reqctx.Decision, bool) {
+		if p.overBudget(started, budget) {
+			return p.budgetFailure(ctx, score, "WAF request budget exceeded between regex windows"), true
+		}
+		found := make(map[string]struct{})
+		p.prefilter.scan(candidate, found)
+		for ruleIndex, rule := range p.rules {
+			if ruleIndex%4 == 0 && p.overBudget(started, budget) {
+				return p.budgetFailure(ctx, score, "WAF request budget exceeded between rule groups"), true
+			}
+			if rule.rule.Paranoia > paranoia || !containsTarget(rule.rule.Targets, target.kind) || excluded(ctx.Site.WAF.Exclusions, rule.rule.ID, ctx.Path, target.param) {
+				continue
+			}
+			prefilterMatched := len(rule.prefilter) == 0
+			for word := range found {
+				if _, ok := rule.prefilter[word]; ok {
+					prefilterMatched = true
+					break
+				}
+			}
+			if !prefilterMatched || !rule.pattern.MatchString(candidate) {
+				continue
+			}
+			if _, already := matched[rule.rule.ID]; already {
+				continue
+			}
+			matched[rule.rule.ID] = struct{}{}
+			if firstMatchedRule == "" {
+				firstMatchedRule = rule.rule.ID
+			}
+			score += rule.points
+			addTags(rule)
+			ctx.WAFScore = score
+			if mode != "monitor" && score >= threshold {
+				return thresholdDecision(ctx, mode, score, threshold, rule.rule.ID, ctx.Tags()), true
+			}
+		}
+		return reqctx.Decision{}, false
+	}
+	requestWindowCount := 0
+	var deferredTail []queuedRegexCandidate
 	for _, target := range targets {
 		if p.overBudget(started, budget) {
 			return p.budgetFailure(ctx, score, "WAF request budget exceeded")
@@ -108,16 +181,16 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 		if target.kind == "body" {
 			if ctx.Request == nil || !supportedBodyType(ctx.Request.Header.Get("Content-Type")) {
 				if ctx.Request != nil && ctx.Request.Body != nil && ctx.Request.Body != http.NoBody {
-					bodyTruncated = true
+					markBodyTruncated()
 				}
 				continue
 			}
 			if remaining <= 0 {
-				inputTruncated = true
-				bodyTruncated = true
+				markScanTruncated()
+				markBodyTruncated()
 				break
 			}
-			limit := maxBodyScanBytes
+			limit := min(maxBodyScanBytes, ctx.Site.EffectiveBodyLimitBytes())
 			if limit > remaining {
 				limit = remaining
 			}
@@ -125,104 +198,139 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 			if err := ctx.BodyReadError(); err != nil {
 				return p.budgetFailure(ctx, score, "request body read failed: "+err.Error())
 			}
-			bodyTruncated = ctx.BodyTruncated()
+			if ctx.BodyTruncated() {
+				markBodyTruncated()
+			}
 			if p.overBudget(started, budget) {
 				return p.budgetFailure(ctx, score, "WAF request budget exceeded while buffering body prefix")
 			}
 		}
 		if len(target.raw) > maxTargetScanBytes {
-			target.raw = target.raw[:maxTargetScanBytes]
-			inputTruncated = true
+			target.raw = sampleHeadTail(target.raw, maxTargetScanBytes)
+			markScanTruncated()
+			if target.kind == "body" {
+				markBodyTruncated()
+			}
 		}
 		if len(target.raw) > remaining {
-			target.raw = target.raw[:remaining]
-			inputTruncated = true
+			target.raw = sampleHeadTail(target.raw, remaining)
+			markScanTruncated()
+			if target.kind == "body" {
+				markBodyTruncated()
+			}
 		}
 		remaining -= len(target.raw)
 		if target.raw == "" {
 			continue
 		}
-		normalized, ok := normalizeBounded(target.raw, target.path, func() bool { return p.overBudget(started, budget) })
-		if !ok {
-			return p.budgetFailure(ctx, score, "WAF request budget exceeded during normalization")
-		}
-		values := []string{target.raw}
-		if normalized.Decoded != target.raw {
-			values = append(values, normalized.Decoded)
-		}
-		if normalized.Value != normalized.Decoded {
-			values = append(values, normalized.Value)
-		}
-		if normalized.DoubleEncoded {
-			values = append(values, "double-encoded "+normalized.Decoded)
-		}
-		if normalized.Traversal {
-			values = append(values, "../")
-		}
-		for _, value := range values {
-			if p.overBudget(started, budget) {
-				return p.budgetFailure(ctx, score, "WAF request budget exceeded between normalization and rule evaluation")
+		var headCandidates, tailCandidates []regexCandidate
+		targetWindowCount := 0
+		for _, rawChunk := range scanChunks(target.raw, target.kind == "body") {
+			normalized, ok := normalizeBounded(rawChunk, target.path, func() bool { return p.overBudget(started, budget) })
+			if !ok {
+				return p.budgetFailure(ctx, score, "WAF request budget exceeded during normalization")
 			}
-			found := make(map[string]struct{})
-			p.prefilter.scan(strings.ToLower(value), found)
-			for ruleIndex, rule := range p.rules {
-				if ruleIndex%4 == 0 && p.overBudget(started, budget) {
-					return p.budgetFailure(ctx, score, "WAF request budget exceeded between rule groups")
+			values := []string{rawChunk}
+			if normalized.Decoded != rawChunk {
+				values = append(values, normalized.Decoded)
+			}
+			if normalized.Value != normalized.Decoded {
+				values = append(values, normalized.Value)
+			}
+			if normalized.DoubleEncoded {
+				values = append(values, "double-encoded "+normalized.Decoded)
+			}
+			if normalized.Traversal {
+				values = append(values, "../")
+			}
+			for _, value := range values {
+				if p.overBudget(started, budget) {
+					return p.budgetFailure(ctx, score, "WAF request budget exceeded between normalization and rule evaluation")
 				}
-				if rule.rule.Paranoia > paranoia {
-					continue
+				lowerValue := strings.ToLower(value)
+				var windows []scanWindow
+				var complete bool
+				if hasUnfilteredRule(p.rules, target.kind, ctx.Site.WAF.Exclusions, ctx.Path) {
+					windows, complete = boundedWindows(len(lowerValue))
+				} else {
+					windows, complete = p.prefilter.windows(lowerValue, func() bool { return p.overBudget(started, budget) })
 				}
-				if !containsTarget(rule.rule.Targets, target.kind) || excluded(ctx.Site.WAF.Exclusions, rule.rule.ID, ctx.Path, target.param) {
-					continue
-				}
-				prefilterMatched := len(rule.prefilter) == 0
-				for word := range found {
-					if _, ok := rule.prefilter[word]; ok {
-						prefilterMatched = true
-						break
+				if !complete {
+					markScanTruncated()
+					if target.kind == "body" {
+						markBodyTruncated()
 					}
 				}
-				if !prefilterMatched || !rule.pattern.MatchString(value) {
-					continue
-				}
-				if _, already := matched[rule.rule.ID]; already {
-					continue
-				}
-				matched[rule.rule.ID] = struct{}{}
-				if firstMatchedRule == "" {
-					firstMatchedRule = rule.rule.ID
-				}
-				score += rule.points
-				addTags(rule)
-				ctx.WAFScore = score
-				if mode != "monitor" && score >= threshold {
-					return thresholdDecision(ctx, mode, score, threshold, rule.rule.ID, ctx.Tags())
+				for _, window := range windows {
+					targetWindowCount++
+					if targetWindowCount > maxRegexWindowsPerRequest {
+						markScanTruncated()
+						if target.kind == "body" {
+							markBodyTruncated()
+						}
+					}
+					if p.overBudget(started, budget) {
+						return p.budgetFailure(ctx, score, "WAF request budget exceeded during keyword scan")
+					}
+					start, end := min(window.start, len(lowerValue)), min(window.end, len(lowerValue))
+					if start > end {
+						continue
+					}
+					candidate := lowerValue[start:end]
+					if len(headCandidates) < maxRegexWindowsPerRequest/2 {
+						headCandidates = append(headCandidates, regexCandidate{text: candidate})
+					} else {
+						tailCandidates = append(tailCandidates, regexCandidate{text: candidate})
+						if len(tailCandidates) > maxRegexWindowsPerRequest/2 {
+							tailCandidates = tailCandidates[1:]
+						}
+					}
 				}
 			}
+		}
+		if bodyTruncated && !bodyTruncationScored {
+			markBodyTruncated()
+		}
+		candidates := make([]regexCandidate, 0, len(headCandidates)+len(tailCandidates))
+		candidates = append(candidates, headCandidates...)
+		candidates = append(candidates, tailCandidates...)
+		for _, scan := range candidates {
+			requestWindowCount++
+			queued := queuedRegexCandidate{target: target, text: scan.text}
+			if requestWindowCount <= maxRegexWindowsPerRequest/2 {
+				if decision, terminal := evaluate(queued.target, queued.text); terminal {
+					return decision
+				}
+			} else {
+				deferredTail = append(deferredTail, queued)
+				if len(deferredTail) > maxRegexWindowsPerRequest/2 {
+					deferredTail = deferredTail[1:]
+				}
+			}
+			if requestWindowCount > maxRegexWindowsPerRequest {
+				markScanTruncated()
+				if target.kind == "body" {
+					markBodyTruncated()
+				}
+			}
+		}
+	}
+	for _, queued := range deferredTail {
+		if decision, terminal := evaluate(queued.target, queued.text); terminal {
+			return decision
 		}
 	}
 	if bodyTruncated {
-		ctx.AddTag("waf_body_truncated")
-		if !hasString(tags, "waf_body_truncated") {
-			tags = append(tags, "waf_body_truncated")
+		markBodyTruncated()
+		if effectiveFailMode(ctx) == "closed" {
+			return wafDecision(reqctx.ActionBlock, "waf_body_truncated", score, "body is incomplete for this plan (fail closed)", ctx.Tags())
 		}
-		truncatedScore := ctx.Site.WAF.TruncatedBodyScore
-		if truncatedScore == 0 {
-			truncatedScore = 3
-		}
-		score += truncatedScore
-		ctx.WAFScore = score
-		if mode != "monitor" && score >= threshold {
-			return thresholdDecision(ctx, mode, score, threshold, "waf_body_truncated", ctx.Tags())
-		}
-		if firstMatchedRule == "" {
-			firstMatchedRule = "waf_body_truncated"
-		}
+		return wafDecision(reqctx.ActionAllow, "waf_body_truncated", score, "body is incomplete for this plan (fail open)", ctx.Tags())
 	}
 	if inputTruncated {
-		ctx.AddTag("waf_scan_truncated")
-		if !hasString(tags, "waf_scan_truncated") {
-			tags = append(tags, "waf_scan_truncated")
+		markScanTruncated()
+		if effectiveFailMode(ctx) == "closed" {
+			return wafDecision(reqctx.ActionBlock, "waf_scan_truncated", score, "WAF target exceeded bounded scan range (fail closed)", ctx.Tags())
 		}
 	}
 	if score == 0 && !inputTruncated {
@@ -235,6 +343,69 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 		return p.budgetFailure(ctx, score, "WAF scan byte limit exceeded")
 	}
 	return wafDecision(reqctx.ActionAllow, firstMatchedRuleOrAllow(firstMatchedRule), score, fmt.Sprintf("WAF score %d below threshold %d", score, threshold), ctx.Tags())
+}
+
+func scanChunks(raw string, body bool) []string {
+	if !body || len(raw) <= scanChunkBytes {
+		return []string{raw}
+	}
+	step := scanChunkBytes - scanChunkOverlap
+	chunks := make([]string, 0, (len(raw)+step-1)/step)
+	for start := 0; start < len(raw); start += step {
+		end := min(start+scanChunkBytes, len(raw))
+		chunks = append(chunks, raw[start:end])
+		if end == len(raw) {
+			break
+		}
+	}
+	return chunks
+}
+
+func sampleHeadTail(raw string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(raw) <= limit {
+		return raw
+	}
+	if limit == 1 {
+		return raw[:1]
+	}
+	head := (limit - 1) / 2
+	tail := limit - 1 - head
+	return raw[:head] + "\x01" + raw[len(raw)-tail:]
+}
+
+func hasUnfilteredRule(rules []compiledRule, target string, exclusions []wafcore.WAFExclusion, path string) bool {
+	for _, rule := range rules {
+		if len(rule.prefilter) == 0 && containsTarget(rule.rule.Targets, target) && !excluded(exclusions, rule.rule.ID, path, "") {
+			return true
+		}
+	}
+	return false
+}
+
+func boundedWindows(length int) ([]scanWindow, bool) {
+	if length <= 0 {
+		return nil, true
+	}
+	if length <= maxRegexWindowBytes {
+		return []scanWindow{{0, length}}, true
+	}
+	out := make([]scanWindow, 0, maxRegexWindowsPerRequest)
+	for start := 0; start < length; start += maxRegexWindowBytes / 2 {
+		end := min(start+maxRegexWindowBytes, length)
+		out = append(out, scanWindow{start, end})
+		if len(out) > maxRegexWindowsPerRequest {
+			half := maxRegexWindowsPerRequest / 2
+			selected := append(append(make([]scanWindow, 0, maxRegexWindowsPerRequest), out[:half]...), out[len(out)-half:]...)
+			return selected, false
+		}
+		if end == length {
+			break
+		}
+	}
+	return out, true
 }
 
 func (p *Phase) overBudget(start time.Time, budget time.Duration) bool {
@@ -253,6 +424,9 @@ func (p *Phase) budgetFailure(ctx *reqctx.RequestCtx, score int, reason string) 
 	}
 	ctx.WAFScore = score
 	ctx.AddTag("waf_budget_exceeded")
+	if ctx.BodyReadTimedOut() {
+		ctx.AddTag("waf_body_read_timeout")
+	}
 	if effectiveFailMode(ctx) == "closed" {
 		return wafDecision(reqctx.ActionBlock, "waf_budget", score, reason+" (fail closed)", ctx.Tags())
 	}
@@ -274,7 +448,7 @@ func collectTargets(ctx *reqctx.RequestCtx, includeBody bool) ([]scanTarget, boo
 	truncated := false
 	query := ctx.Query
 	if len(query) > maxQueryParseBytes {
-		query = query[:maxQueryParseBytes]
+		query = sampleHeadTail(query, maxQueryParseBytes)
 		truncated = true
 	}
 	queryValues, _ := url.ParseQuery(query)
@@ -306,16 +480,16 @@ func collectTargets(ctx *reqctx.RequestCtx, includeBody bool) ([]scanTarget, boo
 				truncated = true
 			}
 			for _, value := range values {
-				if len(value) > 1024 {
-					value = value[:1024]
+				if len(value) > maxTargetScanBytes {
+					value = sampleHeadTail(value, maxTargetScanBytes)
 					truncated = true
 				}
 				targets = append(targets, scanTarget{kind: "headers", param: name, raw: value})
 			}
 		}
 		cookieHeader := ctx.Request.Header.Get("Cookie")
-		if len(cookieHeader) > 4096 {
-			cookieHeader = cookieHeader[:4096]
+		if len(cookieHeader) > maxTargetScanBytes {
+			cookieHeader = sampleHeadTail(cookieHeader, maxTargetScanBytes)
 			truncated = true
 		}
 		cookieParts := strings.Split(cookieHeader, ";")

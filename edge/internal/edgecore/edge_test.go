@@ -226,6 +226,87 @@ func TestLoopbackSampleSnapshotServesThroughFakeOrigin(t *testing.T) {
 	}
 }
 
+func TestLoopbackBodyReadDeadlineSlowAndHungClients(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sent string
+		wait time.Duration
+	}{
+		{name: "slow_body", sent: "x", wait: 250 * time.Millisecond},
+		{name: "hung_body", sent: "", wait: 250 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := siteSnapshot("active", "closed", "http://127.0.0.1:8080", 1)
+			snap.Sites[0].WAF = wafcore.WAFConfig{Mode: "block", Sensitivity: "high", BodyLimitKB: 8, BodyReadTimeoutMS: 80, BudgetMS: 2000}
+			e := New(snap, "edge-test")
+			defer e.Close()
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := &http.Server{Handler: e}
+			go func() { _ = srv.Serve(listener) }()
+			defer func() { _ = srv.Close() }()
+			conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			_, err = fmt.Fprintf(conn, "POST /submit HTTP/1.1\r\nHost: site.test\r\nContent-Type: text/plain\r\nContent-Length: 32\r\nConnection: close\r\n\r\n%s", tc.sent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := time.Now()
+			line, err := bufio.NewReader(conn).ReadString('\n')
+			if err != nil {
+				t.Fatalf("deadline failed to release body read (elapsed %s): %v", time.Since(started), err)
+			}
+			if !strings.Contains(line, "403") {
+				t.Fatalf("fail-closed body read timeout status=%q", line)
+			}
+			if time.Since(started) > time.Second {
+				t.Fatalf("listener held by body read for %s", time.Since(started))
+			}
+		})
+	}
+}
+
+func TestLoopbackTruncatedBodyReleasesListener(t *testing.T) {
+	snap := siteSnapshot("active", "closed", "http://127.0.0.1:8080", 1)
+	snap.Sites[0].WAF = wafcore.WAFConfig{Mode: "block", Sensitivity: "high", BodyLimitKB: 8, BodyReadTimeoutMS: 500, BudgetMS: 2000}
+	e := New(snap, "edge-test")
+	defer e.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: e}
+	go func() { _ = srv.Serve(listener) }()
+	defer func() { _ = srv.Close() }()
+	conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcp := conn.(*net.TCPConn)
+	defer func() { _ = tcp.Close() }()
+	_ = tcp.SetDeadline(time.Now().Add(2 * time.Second))
+	_, err = fmt.Fprint(tcp, "POST /submit HTTP/1.1\r\nHost: site.test\r\nContent-Type: text/plain\r\nContent-Length: 32\r\nConnection: close\r\n\r\nabc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = tcp.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(tcp).ReadString('\n')
+	if err != nil {
+		t.Fatalf("truncated body did not release handler: %v", err)
+	}
+	if !strings.Contains(line, "403") {
+		t.Fatalf("truncated body did not use paid fail-closed policy: %q", line)
+	}
+}
+
 func TestHostAndSiteStatusResponses(t *testing.T) {
 	snap := siteSnapshot("suspended", "closed", "http://203.0.113.1", 1)
 	snap.Sites = append(snap.Sites, wafcore.Site{ID: "pending", TenantID: "t", Status: "pending", Plan: "p", Domains: []string{"pending.test"}, FailMode: "closed"})

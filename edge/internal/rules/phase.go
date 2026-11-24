@@ -72,6 +72,9 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 		}
 		if rule.usesBody {
 			_ = ctx.BodyText()
+			if ctx.BodyReadError() != nil {
+				return reqctx.Decision{Action: reqctx.ActionAllow, RuleID: "waf_body_read", Phase: p.Name(), Reason: "request body could not be inspected"}
+			}
 		}
 		if !rule.match(ctx) {
 			continue

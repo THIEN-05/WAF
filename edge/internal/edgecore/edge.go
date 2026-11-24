@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -272,7 +273,32 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if override := e.pipeline.Load(); override != nil {
 		requestPipeline = override
 	}
-	decision := requestPipeline.Run(c)
+	var decision reqctx.Decision
+	bodyDeadlineSet := false
+	if c.Request.Body != nil && c.Request.Body != http.NoBody && needsBodyInspection(c.Site) {
+		timeout := time.Second
+		if c.Site.WAF.BodyReadTimeoutMS > 0 {
+			timeout = time.Duration(c.Site.WAF.BodyReadTimeoutMS) * time.Millisecond
+		}
+		controller := http.NewResponseController(tw)
+		if err := controller.SetReadDeadline(time.Now().Add(timeout)); err == nil {
+			bodyDeadlineSet = true
+		} else if !errors.Is(err, http.ErrNotSupported) {
+			c.MarkBodyReadError(fmt.Errorf("set body read deadline: %w", err))
+		}
+	}
+	func() {
+		if bodyDeadlineSet {
+			defer func() {
+				// Keep an expired socket deadline after a timed-out read so fail-open
+				// cannot leave the origin proxy blocked on the unread remainder.
+				if !c.BodyReadTimedOut() {
+					_ = http.NewResponseController(tw).SetReadDeadline(time.Time{})
+				}
+			}()
+		}
+		decision = requestPipeline.Run(c)
+	}()
 	if decision.Terminal() {
 		e.metrics.Blocked(actionName(decision.Action))
 		if decision.Phase == "ratelimit" {
@@ -307,6 +333,18 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if phase := e.botPhase.Load(); phase != nil && tw.status == http.StatusNotFound {
 		phase.RecordResponse(c.Site.ID, c.ClientIP, c.Path, tw.status)
 	}
+}
+
+func needsBodyInspection(site *wafcore.Site) bool {
+	if site == nil {
+		return false
+	}
+	for _, rule := range site.Rules {
+		if wafcore.ExpressionUsesField(rule.Expression, "http.body") {
+			return true
+		}
+	}
+	return site.WAF.Mode != "off"
 }
 
 func (e *Edge) recoverPanic(tw *trackingWriter, c *reqctx.RequestCtx, recovered any) {
