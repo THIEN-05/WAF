@@ -18,6 +18,8 @@ import (
 	"github.com/example/wafplatform/pkg/wafcore"
 )
 
+const perfP99Gate = 69 * time.Millisecond // 3 × the user-measured 23 ms worst cell.
+
 // This wall-clock load test runs in the required perf CI job without -race.
 // Deterministic WAF policy tests remain in the default race suite.
 func TestWAFParallel50GOMAXPROCSMatrix(t *testing.T) {
@@ -47,7 +49,6 @@ func TestWAFParallel50GOMAXPROCSMatrix(t *testing.T) {
 					wg.Add(1)
 					go func(worker int) {
 						defer wg.Done()
-						workerStarted := time.Now()
 						for i := 0; i < each; i++ {
 							attack := i == 0
 							body := `{"q":"ordinary documentation ` + strings.Repeat("safe ", 200) + `"}`
@@ -59,7 +60,9 @@ func TestWAFParallel50GOMAXPROCSMatrix(t *testing.T) {
 							r.Header.Set("Content-Type", "application/json")
 							c := reqctx.New(r, nil, "perf-load", nil)
 							c.Site = &wafcore.Site{ID: "perf", Plan: "enterprise", FailMode: "closed", WAF: wafcore.WAFConfig{Mode: mode, Sensitivity: "high", Paranoia: 4, BodyLimitKB: 8}}
+							requestStarted := time.Now() // request arrival at the WAF handler; excludes time queued before the goroutine runs.
 							d := phase.Handle(c)
+							latencies <- time.Since(requestStarted).Nanoseconds()
 							if containsString(d.Tags, "waf_budget_exceeded") {
 								fuseTrips.Add(1)
 							}
@@ -75,7 +78,6 @@ func TestWAFParallel50GOMAXPROCSMatrix(t *testing.T) {
 							}
 							reqctx.Release(c)
 						}
-						latencies <- time.Since(workerStarted).Nanoseconds() / each
 					}(w)
 				}
 				wg.Wait()
@@ -96,7 +98,10 @@ func TestWAFParallel50GOMAXPROCSMatrix(t *testing.T) {
 				}
 				sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 				p50, p99 := samples[len(samples)/2], samples[(len(samples)*99+99)/100-1]
-				t.Logf("workers=%d GOMAXPROCS=%d CPUs=%d clean_rejected=%d/%d attacks_blocked=%d/%d fuse=%d/%d worker_mean_request_p50_ns=%d worker_mean_request_p99_ns=%d", workers, n, runtime.NumCPU(), cleanRejects.Load(), workers*each-workers, attacksCaught.Load(), workers, fuseTrips.Load(), workers*each, p50, p99)
+				if time.Duration(p99) > perfP99Gate {
+					t.Errorf("request-start p99=%s exceeds wide regression gate %s", time.Duration(p99), perfP99Gate)
+				}
+				t.Logf("OS=%s CPUs=%d GOMAXPROCS=%d goroutines=%d clean_rejected=%d/%d attacks_blocked=%d/%d fuse=%d/%d request_start_p50_ns=%d request_start_p99_ns=%d p99_gate_ns=%d", runtime.GOOS, runtime.NumCPU(), n, workers, cleanRejects.Load(), workers*each-workers, attacksCaught.Load(), workers, fuseTrips.Load(), workers*each, p50, p99, perfP99Gate.Nanoseconds())
 			})
 		}
 	}
@@ -133,12 +138,11 @@ func TestWAFCleanFailClosedAtOnePWithCPUBackground(t *testing.T) {
 	var wg sync.WaitGroup
 	var cleanRejected, attacksCaught, fuseTrips atomic.Int64
 	failures := make(chan string, workers*each)
-	latencies := make(chan int64, workers)
+	latencies := make(chan int64, workers*each)
 	for worker := 0; worker < workers; worker++ {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
-			started := time.Now()
 			for i := 0; i < each; i++ {
 				attack := i == 0
 				body := `{"q":"ordinary documentation ` + strings.Repeat("safe ", 200) + `"}`
@@ -149,7 +153,9 @@ func TestWAFCleanFailClosedAtOnePWithCPUBackground(t *testing.T) {
 				r.Header.Set("Content-Type", "application/json")
 				ctx := reqctx.New(r, nil, "cpu-background", nil)
 				ctx.Site = &wafcore.Site{ID: "perf", Plan: "enterprise", FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 4, BodyLimitKB: 8}}
+				requestStarted := time.Now()
 				d := phase.Handle(ctx)
+				latencies <- time.Since(requestStarted).Nanoseconds()
 				if containsString(d.Tags, "waf_budget_exceeded") {
 					fuseTrips.Add(1)
 				}
@@ -165,7 +171,6 @@ func TestWAFCleanFailClosedAtOnePWithCPUBackground(t *testing.T) {
 				}
 				reqctx.Release(ctx)
 			}
-			latencies <- time.Since(started).Nanoseconds() / each
 		}(worker)
 	}
 	wg.Wait()
@@ -190,5 +195,9 @@ func TestWAFCleanFailClosedAtOnePWithCPUBackground(t *testing.T) {
 		samples = append(samples, sample)
 	}
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	t.Logf("workers=%d GOMAXPROCS=1 background_cpu_workers=1 background_iterations=%d clean_rejected=%d/%d attacks_blocked=%d/%d fuse=%d/%d worker_mean_request_p50_ns=%d worker_mean_request_p99_ns=%d", workers, backgroundProgress.Load(), cleanRejected.Load(), workers*(each-1), attacksCaught.Load(), workers, fuseTrips.Load(), workers*each, samples[len(samples)/2], samples[(len(samples)*99+99)/100-1])
+	p99 := samples[(len(samples)*99+99)/100-1]
+	if time.Duration(p99) > perfP99Gate {
+		t.Errorf("CPU-background request-start p99=%s exceeds wide regression gate %s", time.Duration(p99), perfP99Gate)
+	}
+	t.Logf("OS=%s CPUs=%d GOMAXPROCS=1 goroutines=%d background_cpu_workers=1 background_iterations=%d clean_rejected=%d/%d attacks_blocked=%d/%d fuse=%d/%d request_start_p50_ns=%d request_start_p99_ns=%d p99_gate_ns=%d", runtime.GOOS, runtime.NumCPU(), workers, backgroundProgress.Load(), cleanRejected.Load(), workers*(each-1), attacksCaught.Load(), workers, fuseTrips.Load(), workers*each, samples[len(samples)/2], p99, perfP99Gate.Nanoseconds())
 }

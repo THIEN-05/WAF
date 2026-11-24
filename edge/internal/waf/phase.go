@@ -173,9 +173,6 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 		fuse = min(max(fuse, minimumFuse), maxFuse)
 	}
 	started := p.now()
-	if p.overFuse(started, fuse) {
-		return p.budgetFailure(ctx, 0, "WAF request budget exceeded")
-	}
 	if err := ctx.BodyReadError(); err != nil {
 		return p.bodyReadFailure(ctx, 0, "request body read failed: "+err.Error())
 	}
@@ -212,6 +209,9 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 	seenTags := make(map[string]struct{})
 	bodyTruncated := false
 	bodyTruncationScored := false
+	fuseExpired := func(target scanTarget) bool {
+		return target.kind == "body" && !bodyTruncated && !workTruncated && !inputTruncated && p.overFuse(started, fuse)
+	}
 	markScanTruncated := func() {
 		inputTruncated = true
 		ctx.AddTag("waf_scan_truncated")
@@ -245,7 +245,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 		}
 	}
 	evaluate := func(target scanTarget, candidate string) (reqctx.Decision, bool) {
-		if p.overFuse(started, fuse) {
+		if fuseExpired(target) {
 			return p.budgetFailure(ctx, score, "WAF request fuse exceeded between regex windows"), true
 		}
 		found := make(map[string]struct{})
@@ -269,7 +269,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 				p.afterRegex()
 			}
 			if !patternMatched {
-				if p.overFuse(started, fuse) {
+				if fuseExpired(target) {
 					return p.budgetFailure(ctx, score, "WAF request fuse exceeded during regex evaluation"), true
 				}
 				continue
@@ -287,7 +287,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 			if mode != "monitor" && score >= threshold {
 				return thresholdDecision(ctx, mode, score, threshold, rule.rule.ID, ctx.Tags()), true
 			}
-			if p.overFuse(started, fuse) {
+			if fuseExpired(target) {
 				return p.budgetFailure(ctx, score, "WAF request fuse exceeded after regex evaluation"), true
 			}
 		}
@@ -296,7 +296,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 	requestWindowCount := 0
 	var deferredTail []queuedRegexCandidate
 	for _, target := range targets {
-		if p.overFuse(started, fuse) {
+		if target.kind == "body" && fuseExpired(target) {
 			return p.budgetFailure(ctx, score, "WAF request fuse exceeded")
 		}
 		if target.kind == "body" {
@@ -322,7 +322,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 			if ctx.BodyTruncated() {
 				markBodyTruncated()
 			}
-			if p.overFuse(started, fuse) {
+			if fuseExpired(target) {
 				return p.budgetFailure(ctx, score, "WAF request fuse exceeded while buffering body prefix")
 			}
 		}
@@ -334,6 +334,9 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 			}
 		}
 		if len(target.raw) > remaining {
+			if remaining <= work.limit.bytes-work.bytes {
+				workTruncated = true
+			}
 			target.raw = sampleHeadTail(target.raw, remaining)
 			markScanTruncated()
 			if target.kind == "body" {
@@ -358,16 +361,19 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 		chunks := scanChunks(target.raw, target.kind == "body")
 		chunks = prioritizeHeadTail(chunks)
 		for _, rawChunk := range chunks {
-			if work.normalizeSteps >= work.limit.normalizeSteps || p.overFuse(started, fuse) {
-				workTruncated = work.normalizeSteps >= work.limit.normalizeSteps
+			if work.normalizeSteps >= work.limit.normalizeSteps {
+				workTruncated = true
 				markScanTruncated()
 				if target.kind == "body" {
 					markBodyTruncated()
 				}
 				break
 			}
+			if fuseExpired(target) {
+				return p.budgetFailure(ctx, score, "WAF request fuse exceeded before normalization")
+			}
 			work.normalizeSteps++
-			normalized, ok := normalizeBounded(rawChunk, target.path, func() bool { return p.overFuse(started, fuse) })
+			normalized, ok := normalizeBounded(rawChunk, target.path, func() bool { return fuseExpired(target) })
 			if !ok {
 				return p.budgetFailure(ctx, score, "WAF request fuse exceeded during normalization")
 			}
@@ -385,7 +391,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 				values = append(values, "../")
 			}
 			for _, value := range values {
-				if p.overFuse(started, fuse) {
+				if fuseExpired(target) {
 					return p.budgetFailure(ctx, score, "WAF request fuse exceeded between normalization and rule evaluation")
 				}
 				lowerValue := strings.ToLower(value)
@@ -398,7 +404,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 				if hasUnfilteredRule(p.rules, target.kind, ctx.Site.WAF.Exclusions, ctx.Path) {
 					windows, complete = boundedWindowsLimit(len(lowerValue), remainingWindows)
 				} else {
-					windows, complete = p.prefilter.windowsLimit(lowerValue, remainingWindows, func() bool { return p.overFuse(started, fuse) })
+					windows, complete = p.prefilter.windowsLimit(lowerValue, remainingWindows, func() bool { return fuseExpired(target) })
 				}
 				if !complete {
 					workTruncated = true
@@ -422,7 +428,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 							markBodyTruncated()
 						}
 					}
-					if p.overFuse(started, fuse) {
+					if fuseExpired(target) {
 						return p.budgetFailure(ctx, score, "WAF request fuse exceeded during keyword scan")
 					}
 					start, end := min(window.start, len(lowerValue)), min(window.end, len(lowerValue))
@@ -472,6 +478,9 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 		if decision, terminal := evaluate(queued.target, queued.text); terminal {
 			return decision
 		}
+	}
+	if !workTruncated && !inputTruncated && !bodyTruncated && p.overFuse(started, fuse) {
+		return p.budgetFailure(ctx, score, "WAF request fuse exceeded after priority targets")
 	}
 	if workTruncated {
 		ctx.AddTag("waf_work_exhausted")
@@ -669,9 +678,7 @@ func (p *Phase) budgetFailure(ctx *reqctx.RequestCtx, score int, reason string) 
 		ctx.AddTag("waf_scan_truncated")
 	}
 	ctx.AddTag("waf_degraded_fuse")
-	if score == 0 {
-		score = 1 // Work was interrupted, but no attack evidence was found.
-	}
+	score++ // The scan stopped early; retain existing evidence and add one point for incompleteness.
 	ctx.WAFScore = score
 	if ctx.BodyReadTimedOut() {
 		ctx.AddTag("waf_body_read_timeout")
@@ -681,7 +688,7 @@ func (p *Phase) budgetFailure(ctx *reqctx.RequestCtx, score int, reason string) 
 		return wafDecision(reqctx.ActionLogOnly, "waf_budget", score, reason+" (partial scan; monitor)", ctx.Tags())
 	}
 	if score >= threshold {
-		return wafDecision(reqctx.ActionBlock, "waf_budget", score, reason+" (anomaly threshold exceeded)", ctx.Tags())
+		return thresholdDecision(ctx, ctx.Site.WAF.Mode, score, threshold, "waf_budget", ctx.Tags())
 	}
 	return wafDecision(reqctx.ActionAllow, "waf_budget", score, reason+" (partial scan; score below threshold, fail mode deferred)", ctx.Tags())
 }

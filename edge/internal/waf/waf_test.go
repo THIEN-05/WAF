@@ -661,6 +661,185 @@ func TestWAFFuseBlocksOnlyWhenAccumulatedScoreReachesThreshold(t *testing.T) {
 	reqctx.Release(attack)
 }
 
+func TestWAFFuseAfterPriorityTargetsKeepsPayloadAndMarksBodyIncomplete(t *testing.T) {
+	for _, failMode := range []string{"open", "closed"} {
+		for _, target := range []string{"path", "args", "headers", "cookies"} {
+			t.Run(failMode+"/"+target, func(t *testing.T) {
+				base := time.Now()
+				calls := 0
+				now := func() time.Time {
+					calls++
+					if calls >= 2 {
+						return base.Add(time.Second)
+					}
+					return base
+				}
+				rules := []Rule{
+					{ID: "priority-evidence", Phase: "request", Targets: []string{target}, Pattern: `needle`, Severity: "notice", Paranoia: 1, Prefilter: []string{"needle"}, Tags: []string{"priority-evidence"}},
+					{ID: "body-probe", Phase: "request", Targets: []string{"body"}, Pattern: `never-match`, Severity: "warning", Paranoia: 1},
+				}
+				phase, err := NewPhase(rules, now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				requestURL := "http://edge.test/safe"
+				switch target {
+				case "path":
+					requestURL = "http://edge.test/needle"
+				case "args":
+					requestURL += "?q=needle"
+				}
+				r := httptest.NewRequest(http.MethodPost, requestURL, strings.NewReader("unscanned body"))
+				r.Header.Set("Content-Type", "text/plain")
+				if target == "headers" {
+					r.Header.Set("User-Agent", "needle")
+				}
+				if target == "cookies" {
+					r.Header.Set("Cookie", "session=needle")
+				}
+				ctx := reqctx.New(r, nil, "priority-before-fuse", nil)
+				ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", FailMode: failMode, WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 1}}
+				d := phase.Handle(ctx)
+				if d.Action != reqctx.ActionBlock || d.RuleID != "waf_budget" || d.Score < sensitivityThreshold("high") {
+					t.Fatalf("priority payload must remain over threshold after fuse: action=%v rule=%s score=%d reason=%q tags=%v", d.Action, d.RuleID, d.Score, d.Reason, d.Tags)
+				}
+				for _, tag := range []string{"priority-evidence", "waf_budget_exceeded", "waf_scan_truncated", "waf_degraded_fuse"} {
+					if !containsString(d.Tags, tag) {
+						t.Errorf("missing %s after priority match and fuse: %+v", tag, d)
+					}
+				}
+				if ctx.BodyLoaded() {
+					t.Error("fuse should stop before reading the body after priority targets were scanned")
+				}
+				reqctx.Release(ctx)
+			})
+		}
+	}
+}
+
+func TestWAFCleanFuseDefersFailModeButWorkCapHonorsFailMode(t *testing.T) {
+	for _, failMode := range []string{"open", "closed"} {
+		t.Run("fuse/"+failMode, func(t *testing.T) {
+			base := time.Now()
+			calls := 0
+			phase, err := NewPhase([]Rule{{ID: "body-probe", Phase: "request", Targets: []string{"body"}, Pattern: `never-match`, Severity: "warning", Paranoia: 1}}, func() time.Time {
+				calls++
+				if calls >= 2 {
+					return base.Add(time.Second)
+				}
+				return base
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader("safe body"))
+			r.Header.Set("Content-Type", "text/plain")
+			ctx := reqctx.New(r, nil, "clean-fuse", nil)
+			ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", FailMode: failMode, WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high"}}
+			d := phase.Handle(ctx)
+			if d.Action != reqctx.ActionAllow || d.Score != 1 || !containsString(d.Tags, "waf_scan_truncated") || !containsString(d.Tags, "waf_budget_exceeded") {
+				t.Fatalf("clean wall fuse should allow with an incomplete-scan score independent of fail_mode: %+v", d)
+			}
+			reqctx.Release(ctx)
+		})
+
+		t.Run("work-cap/"+failMode, func(t *testing.T) {
+			var query strings.Builder
+			for i := 0; i < 200; i++ {
+				if i > 0 {
+					query.WriteByte('&')
+				}
+				fmt.Fprintf(&query, "p%03d=%s", i, strings.Repeat("ordinary+", 100))
+			}
+			query.WriteString("&zzz=UNION+SELECT+password+FROM+users")
+			phase, err := NewPhase(loadManagedRules(t), func() time.Time { return time.Unix(0, 0) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(http.MethodGet, "http://edge.test/search?"+query.String(), nil)
+			ctx := reqctx.New(r, nil, "deterministic-work-cap", nil)
+			ctx.Site = &wafcore.Site{ID: "s", Plan: "free", FailMode: failMode, WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 1}}
+			d := phase.Handle(ctx)
+			want := reqctx.ActionAllow
+			if failMode == "closed" {
+				want = reqctx.ActionBlock
+			}
+			if d.Action != want || !containsString(d.Tags, "waf_work_exhausted") || !containsString(d.Tags, "waf_scan_truncated") || containsString(d.Tags, "waf_budget_exceeded") {
+				t.Fatalf("deterministic work cap fail_mode=%s decision=%+v wantAction=%v", failMode, d, want)
+			}
+			reqctx.Release(ctx)
+		})
+	}
+}
+
+func TestWAFDeterministicWorkCapsBoundExpensiveAttackerInputs(t *testing.T) {
+	keywords := []string{"select", "union", "drop", "script", "alert"}
+	patternNeverMatches := `sentinel-never-matches-this-input`
+	tests := []struct {
+		name, target, plan string
+		build              func() *http.Request
+	}{
+		{
+			name:   "200_parameters",
+			target: "args",
+			plan:   "free",
+			build: func() *http.Request {
+				var query strings.Builder
+				for i := 0; i < 200; i++ {
+					if i > 0 {
+						query.WriteByte('&')
+					}
+					fmt.Fprintf(&query, "p%03d=%s", i, strings.Repeat("ordinary+", 100))
+				}
+				return httptest.NewRequest(http.MethodGet, "http://edge.test/search?"+query.String(), nil)
+			},
+		},
+		{
+			name:   "repeated_aho_keywords",
+			target: "body",
+			plan:   "enterprise",
+			build: func() *http.Request {
+				body := strings.Repeat("select union drop script alert ", 5000)
+				r := httptest.NewRequest(http.MethodPost, "http://edge.test/upload", strings.NewReader(body))
+				r.Header.Set("Content-Type", "text/plain")
+				return r
+			},
+		},
+		{
+			name:   "deep_json_with_repeated_keywords",
+			target: "body",
+			plan:   "enterprise",
+			build: func() *http.Request {
+				var body strings.Builder
+				for i := 0; i < 1400; i++ {
+					body.WriteString(`{"value":"select union drop script alert","child":`)
+				}
+				body.WriteString(`"leaf"`)
+				body.WriteString(strings.Repeat("}", 1400))
+				r := httptest.NewRequest(http.MethodPost, "http://edge.test/json", strings.NewReader(body.String()))
+				r.Header.Set("Content-Type", "application/json")
+				return r
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			phase, err := NewPhase([]Rule{{ID: "work-cap-probe", Phase: "request", Targets: []string{tc.target}, Pattern: patternNeverMatches, Severity: "critical", Paranoia: 1, Prefilter: keywords}}, func() time.Time { return time.Unix(0, 0) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := tc.build()
+			ctx := reqctx.New(r, nil, "work-cap-expensive", nil)
+			ctx.Site = &wafcore.Site{ID: "s", Plan: tc.plan, FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 1, BodyLimitKB: 256}}
+			d := phase.Handle(ctx)
+			if d.Action != reqctx.ActionBlock || !containsString(d.Tags, "waf_work_exhausted") || !containsString(d.Tags, "waf_scan_truncated") || containsString(d.Tags, "waf_budget_exceeded") {
+				t.Fatalf("expensive input must hit deterministic cap and fail closed without wall fuse: action=%v rule=%s score=%d reason=%q tags=%v", d.Action, d.RuleID, d.Score, d.Reason, d.Tags)
+			}
+			reqctx.Release(ctx)
+		})
+	}
+}
+
 func TestWAFFuseLogThrottleInterval(t *testing.T) {
 	if tierLogInterval < 2*time.Second {
 		t.Fatalf("overload tier log interval=%s, want several seconds", tierLogInterval)

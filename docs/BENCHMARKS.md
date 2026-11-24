@@ -58,11 +58,30 @@ Work-cap cases are marked incomplete and follow the configured fail mode; benchm
 
 ### P4f-fix — required perf job
 
-`TestWAFParallel50GOMAXPROCSMatrix` is tagged `perf`; CI runs it in a required, non-race job with `-count=30`. It exercises GOMAXPROCS 1/2/4/N and 50/200 goroutines, asserts zero clean fail-closed rejects and blocks every in-scope attack, and prints p50/p99 and fuse counts. Deterministic fuse/work-cap policy tests (fake clock, fake body reader, fake regex delay) remain in the normal race suite.
+`TestWAFParallel50GOMAXPROCSMatrix` and `TestWAFCleanFailClosedAtOnePWithCPUBackground` are tagged `perf`; CI runs both in a required, non-race job with `-count=30`. The matrix covers GOMAXPROCS 1/2/4/N and 50/200 goroutines; the background case uses GOMAXPROCS=1, 200 goroutines and a CPU-burning worker. Assertions require zero clean fail-closed rejects, 100% in-scope attack blocks, zero fuse trips, and request-start p99 below the wide regression gate. Deterministic fuse/work-cap policy tests (fake clock, fake body reader, fake regex delay, priority-target retention) remain in the normal race suite.
 
-No Linux/taskset 30-run measurement is available from this Windows sandbox. Do not treat Windows timings as a Linux baseline. TODO-P4f-1 remains open until WSL/CI captures 30-run output and establishes a latency tolerance from those measurements; no p99 limit is claimed before that evidence exists.
+## WSL/Linux results supplied by the user
 
-Windows 11 sandbox run, `GOMAXPROCS=2 go test -tags=perf -count=30 -v ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'`, host reports 12 CPUs and the test itself covers GOMAXPROCS 1/2/4/12 × 50/200 goroutines. All 30 runs passed: zero clean rejects, zero fuse trips, all 50/50 or 200/200 attack requests blocked. The 30-run p50/p99 ranges of per-worker mean request latency (ns) were:
+The user supplied this `taskset` run summary (30 repetitions; Linux, 2 CPUs pinned for the GOMAXPROCS matrix). Per cell: 0 clean rejects, 100% of in-scope attacks blocked, fuse 0. The provided summary contains aggregate p50/p99, not exact p99 per cell; the table therefore marks per-cell p99 as not separately reported.
+
+| OS | CPUs pinned | GOMAXPROCS | Goroutines | Runs | p50/request | p99/request per cell | Clean rejects | Attack blocked | Fuse |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| WSL/Linux | 2 | 1 | 50 | 30 | ~135 µs | included in aggregate 0.16–23 ms | 0 | 100% | 0 |
+| WSL/Linux | 2 | 1 | 200 | 30 | ~135 µs | included in aggregate 0.16–23 ms | 0 | 100% | 0 |
+| WSL/Linux | 2 | 2 | 50 | 30 | ~135 µs | included in aggregate 0.16–23 ms | 0 | 100% | 0 |
+| WSL/Linux | 2 | 2 | 200 | 30 | ~135 µs | included in aggregate 0.16–23 ms | 0 | 100% | 0 |
+| WSL/Linux | 2 | 4 | 50 | 30 | ~135 µs | included in aggregate 0.16–23 ms | 0 | 100% | 0 |
+| WSL/Linux | 2 | 4 | 200 | 30 | ~135 µs | included in aggregate 0.16–23 ms | 0 | 100% | 0 |
+
+The worst reported p99 was 23 ms (200 goroutines, GOMAXPROCS=4 on 2 pinned CPUs). CI uses a common per-cell gate of **69 ms = 3 × 23 ms**. The threshold is intentionally broad and catches a roughly 3× regression; a per-cell threshold can replace it when exact per-cell baselines are provided. The test logs OS, `runtime.NumCPU()`, GOMAXPROCS, goroutines, request-start p50/p99, and the gate.
+
+Latency starts immediately before `Phase.Handle` after the test goroutine is scheduled and the request/context are built. It includes WAF phase execution but excludes time waiting for that goroutine to become runnable. It is request-start latency, not end-to-end listener latency.
+
+For the one-core CPU-background test, the user's Linux summary reports 30 runs and `clean_rejected=0/800`; p99/attack/fuse counts for that specific Linux run were not supplied. The required perf test independently checks 200 goroutines + one CPU burner and reports all counters.
+
+The Windows measurements below were collected by the earlier worker-mean instrumentation. They remain historical diagnostics and are not the WSL/Linux baseline used for the 69 ms gate.
+
+Windows 11 sandbox run, `GOMAXPROCS=2 go test -tags=perf -count=30 -v ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'`, host reports 12 CPUs and the test itself covers GOMAXPROCS 1/2/4/12 × 50/200 goroutines. All 30 runs passed: zero clean rejects, zero fuse trips, all 50/50 or 200/200 attack requests blocked. The 30-run p50/p99 ranges of per-worker mean request latency (ns) from the older instrumentation were:
 
 | GOMAXPROCS | Goroutines | p50 range ns | p99 range ns |
 | ---: | ---: | ---: | ---: |
@@ -77,7 +96,20 @@ Windows 11 sandbox run, `GOMAXPROCS=2 go test -tags=perf -count=30 -v ./edge/int
 
 This Windows timer reported 0 for some worker mean p50 values; those p50 cells are below its measured resolution and are not a usable latency baseline. CPU affinity was not pinned; this is not the requested Linux `taskset` run.
 
-CPU-background extension, Windows sandbox, `GOMAXPROCS=2 go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'`: the dedicated GOMAXPROCS=1 / 200-worker case ran a CPU-burning goroutine concurrently. Across 30 repetitions: clean rejects **0/24,000**, in-scope attacks blocked **6,000/6,000**, fuse trips **0/30,000**. The background worker completed 26,361,856–121,405,440 iterations per run; worker-mean p99 was **754,940–2,050,280 ns**. This is Go scheduler CPU contention on Windows, not physical CPU pinning; Linux `taskset` validation remains open.
+Current request-start instrumentation, Windows sandbox (`OS=windows`, 12 reported CPUs), same two tests with `-count=30`: each matrix cell passed all 30 runs, 0 clean rejects, 100% attacks blocked, 0 fuse. The p99 ranges (ns) per cell were:
+
+| OS | CPUs | GOMAXPROCS | Goroutines | Runs | p50 range ns | p99 range ns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Windows | 12 | 1 | 50 | 30 | 0 | 1,099,400–7,715,800 |
+| Windows | 12 | 1 | 200 | 30 | 0 | 1,719,700–7,182,100 |
+| Windows | 12 | 2 | 50 | 30 | 0 | 1,280,200–16,079,500 |
+| Windows | 12 | 2 | 200 | 30 | 0 | 8,146,200–62,784,100 |
+| Windows | 12 | 4 | 50 | 30 | 0 | 1,822,700–9,585,100 |
+| Windows | 12 | 4 | 200 | 30 | 0 | 4,113,400–31,010,200 |
+| Windows | 12 | 12 | 50 | 30 | 0–557,900 | 2,031,000–10,134,900 |
+| Windows | 12 | 12 | 200 | 30 | 0–521,600 | 10,505,900–27,830,800 |
+
+The CPU-background case (GOMAXPROCS=1, 200 goroutines plus one burner) passed 30/30: clean rejects **0/24,000**, attacks **6,000/6,000**, fuse **0/30,000**, p99 **1,545,300–7,431,100 ns**. Background worker completed 29,622,272–134,742,016 iterations per run. P50 reported 0 in most cells due timer resolution. These are Windows measurements, not physical CPU pinning or a Linux baseline.
 
 Test loopback thật cho body chậm/treo/đứt giữa chừng PASS trong WSL Ubuntu; deadline đọc mặc định 1 giây làm handler kết thúc, paid fail-closed trả 403. `TestPerIPConnectionLimit` tiếp tục nằm trong suite listener và được xác minh cùng race suite. Test loopback chỉ chạy ngoài sandbox Windows.
 
