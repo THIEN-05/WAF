@@ -91,7 +91,7 @@
 - **TODO-G-1:** PROXY protocol v2 chưa triển khai. Repo hiện chỉ cấu hình v1; chưa có NLB/v2 contract cụ thể. Cần fixture/header v2 chuẩn và quyết định CRC32C/LOCAL trước khi thêm parser; hiện test v1 malformed/untrusted/length giới hạn đã có.
 - **TODO-G-2:** chưa có test chạy với GeoLite2 MMDB thật nếu không có file cấp phép; test giả và lỗi mở file đã có.
 - **TODO-G-3:** chưa xác nhận GitHub Actions xanh sau commit/push; local test không thay thế kết quả CI.
-- **TODO-P4f-1** còn mở: benchmark WAF concurrency 200 vẫn từng cho p99 >1 giây và work cap chạm 100%, dù full race Gate G hiện PASS. Cần hoàn tất đánh giá tải cao/clean fail-closed trước khi tuyên bố an toàn overload.
+- **TODO-P4f-1** còn mở: các benchmark lịch sử có p99 >1 giây/work cap tới 100%; P4f-fix đã đổi chính sách fuse, còn chờ xác minh Linux 30 lần và hiệu chỉnh latency tolerance.
 
 ### Rà soát `//nolint` không-test
 
@@ -117,16 +117,16 @@
 - Benchmark WSL/Linux (Intel Core i5-11400H, Go 1.26.11, `-benchtime=1000x -benchmem`): parser-only 5,829 ns/op, 818 B/op, 44 allocs/op; bounded peek + compute 9,854 ns/op, 4,068 B/op, 94 allocs/op. Đã ghi ở `docs/BENCHMARKS.md`.
 - Vector nguồn: FoxIO JA4 pcap commit `4ab8e3f18f4b27e0b896c4ec2c251e20506eb87e` (SHA-256 file được so đúng); expected đối chiếu community project commit `797a8b074e135f659da1ee3193b5a4cc111dfc26` và Salesforce JA3 commit `502cc6395811c54743b0561419d61900a6df3ff7` / dpkt v1.9.1. Mỗi test ghi URL + commit trong comment.
 - WSL Ubuntu, Go 1.26.11: `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...` → `0 issues.` (chạy lại sau thay đổi cuối); `go vet ./...` → exit 0; `go build ./...` → exit 0; `go test -count=1 ./...` → PASS tất cả package; `go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...` → `No vulnerabilities found.` (chạy lại sau thay đổi cuối).
-- Các package đã đổi (`bot`, `edgecore`, `listener`, `reqctx`) PASS `go test -race -count=1`. Full `go test -race -count=1 ./...` **FAIL trong cả hai lần thử** ở test tải có sẵn `edge/internal/waf/TestWAFParallel50GOMAXPROCSMatrix`: lần 1 `gomaxprocs_12`, lần 2 `gomaxprocs_2`; mỗi lần `clean fail-closed requests rejected=1/250`. Đây là lỗi P4f ngoài phạm vi P5a; không sửa/loại test. Vì race toàn repo còn đỏ, P5a chưa được đánh dấu hoàn tất.
+- Lịch sử P5a: full race từng FAIL ở `TestWAFParallel50GOMAXPROCSMatrix` tại GOMAXPROCS 12 và 2, mỗi lần 1 clean reject/250. Test này được chuyển sang perf job ở P4f-fix; test logic xác định vẫn thuộc race suite.
 - `git diff --check` → exit 0; chỉ cảnh báo Git rằng một số working-copy CRLF sẽ được chuẩn hóa LF.
 
 ### Chưa xác minh / cần chạy lại
 
-- Chưa xác nhận GitHub Actions sau commit/push. Loopback tests cần môi trường ngoài sandbox Windows; đã xác minh cục bộ trong WSL. Để tái hiện race failure P4f và kiểm tra run mới sau khi xử lý TODO-P4f-1:
+- Lệnh cũ trước P4f-fix (không còn chạy matrix wall-clock trong race suite):
 
 ```sh
 go test -race -count=1 ./...
-go test -race -count=5 ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'
+go test -tags=perf -count=30 ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'
 ```
 
 - Trên Windows sandbox, loopback bị chặn (WinSock “access to a socket … forbidden”); WSL chạy được qua `/usr/local/go/bin/go` (Go 1.26.11). `wsl.exe -l -q` bị AccessDenied trong sandbox, nhưng lệnh WSL được chạy ngoài sandbox đã PASS cho các test loopback kể trên.
@@ -138,11 +138,32 @@ go test -race -count=5 ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMat
 - **TODO-P5a-3:** cấp/rotate HMAC keyring qua mTLS thuộc P6b; hiện keyring operator/env hoặc interface, thiếu key khi entitlement bật là startup error.
 - **TODO-P5a-4:** net/http không giữ thứ tự header wire nên tín hiệu thứ tự header chưa được chấm.
 - **TODO-P5a-5:** hai raw ClientHello source độc lập đã có; bộ vector vẫn chỉ có hai mẫu, chưa bao phủ rộng nhiều client/phiên bản TLS.
-- **P4f status:** TODO-P4f-1 vẫn mở; tải 200 goroutine từng đo p99 1.603 s và work cap chạm 100%, chưa đủ bằng chứng để đóng khả năng overload fail-closed.
+- **P4f status lịch sử:** tải 200 goroutine từng đo p99 1.603 s/work cap 100%. Trạng thái hiện tại nằm ở mục P4f-fix ở trên; TODO-P4f-1 còn chờ Linux/CI.
 - **Gate G status:** phần code/test được tìm thấy: ACME HTTP-01 trước canonical redirect (`TestHTTPChallengeAndRedirect`), forged XFF bị xóa và IP transport được đặt lại (`TestLoopbackProxyRewritesForwardingHeaders`), `.gitattributes` đặt `eol=lf`. Chưa coi đây là test CI mới độc lập ngoài những test hiện hữu.
 - Inventory `//nolint` trong code không-test (11 vị trí; không thêm vị trí mới): `edge/cmd/edge/main.go:207,237,264`; `edge/internal/configsync/holder.go:42,44,79,114`; `edge/internal/listener/fingerprint.go:4,277`; `edge/internal/proxy/proxy.go:138,257`.
 
-## P4f — ngân sách WAF theo work và suy giảm quá tải — 2026-11-24
+## P4f-fix — fuse WAF không từ chối request sạch do scheduler — 2026-11-24
+
+### Đã xác minh
+
+- Gốc lỗi theo code + CI log: `budgetFailure` fail-closed theo wall fuse trước khi biết có anomaly; tier 3 còn áp fail-mode từ fuse ratio lịch sử. CI ghi `active=2`, runnable queue 0, EWMA 28.9 ms, fuse ratio 1.6%, cùng 1 clean reject/250. Đây là nhánh từ chối theo elapsed time, không phải bằng chứng request vượt work cap hay điểm luật.
+- Fuse nay là watchdog tối thiểu/mặc định 250 ms, thích ứng theo backlog + EWMA, tối đa 10 s. Khi nổ: giữ điểm đã có, cộng 1 nếu chưa có, gắn `waf_budget_exceeded`, `waf_scan_truncated`, `waf_degraded_fuse`; dưới ngưỡng chỉ allow/log-only, không fail-closed theo tier/fuse ratio. Điểm đã vượt ngưỡng vẫn block; deterministic work cap và body truncation tiếp tục dùng fail-mode.
+- Test logic dùng fake clock, fake slow body reader và fake regex delay; tách wall-clock matrix sang build tag `perf`. Log tier throttle toàn tiến trình ≥3 s, tổng thay đổi được đếm.
+- PASS cục bộ: `go test -count=1 ./edge/internal/waf` → `ok ... 2.592s`.
+- PASS perf-tag 30 lần trên Windows (không phải Linux/taskset; `GOMAXPROCS=2` ban đầu, host 12 CPUs): 240 cell GOMAXPROCS 1/2/4/12 × workers 50/200; **30/30 matrix passes**, 0 clean reject, 0 fuse trip, 100% payload bị chặn. Worker-mean p99 min–max theo cell **0.203–20.360 ms**; p50 timer có số 0 ở một số cell nên chưa phải baseline tin cậy. Bảng chi tiết và giới hạn ghi tại `docs/BENCHMARKS.md`.
+
+### Chưa xác minh — lệnh chạy lại
+
+- Tái hiện đúng Linux/WSL yêu cầu: `taskset -c 0,1 go test -tags=perf -count=30 -v ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'`; chạy test logic mặc định với `go test -race -count=1 ./...` (không chạy perf wall-clock dưới race). Thử WSL trực tiếp nhưng nhận `Wsl/E_ACCESSDENIED`; chưa có taskset affinity.
+- Sau thay đổi cuối: package WAF unit PASS; `golangci-lint run ./...` → `0 issues`; `go vet ./...` và `go build ./...` → exit 0; `govulncheck ./...` → `No vulnerabilities found.` Full `go test -count=1 ./...` vẫn đỏ do Windows sandbox chặn loopback ở bot/edgecore/listener/proxy. `go test -race` không chạy do CGO_ENABLED=0. CI/WSL vẫn phải xác minh race và full integration.
+- Job CI bắt buộc `perf` chạy `go test -tags=perf -count=30 ...`; chưa có kết quả GitHub Actions. Perf test in p50/p99 thật để hiệu chỉnh ngưỡng; chưa đặt giới hạn latency giả định.
+
+### Nợ kỹ thuật
+
+- **TODO-P4f-1:** chờ chạy 30 lần trên Linux/WSL và CI để xác nhận p50/p99, tỷ lệ fuse/false-positive dưới GOMAXPROCS 2/4/N và tải 50/200; sau đó mới đặt tolerance theo số đo. Chưa được đóng nợ.
+- **TODO-P4f-2:** fuse là cooperative checkpoint, không thể ngắt một regex RE2 hoặc `Reader.Read` đang bị treo giữa lời gọi; body socket có deadline riêng, regex chuẩn Go bị giới hạn kích thước đầu vào/RE2. Fake delay test chứng minh policy sau checkpoint, không chứng minh interrupt bất đồng bộ.
+
+## P4f — ngân sách WAF theo work và suy giảm quá tải — 2026-11-24 (kết quả trước P4f-fix)
 
 ### Đã xác minh
 
@@ -170,7 +191,7 @@ go test -tags=integration -race -count=5 ./edge/internal/ratelimit
 
 ### Nợ kỹ thuật
 
-- **TODO-P4f-1:** benchmark tải 50/200 goroutine cho thấy p99 worst-case vượt 1 giây; work cap chạm tối đa 100%, fuse còn chạm đến 9%. Với fail-closed, request hợp lệ bị cắt bởi cap/fuse vẫn có thể bị từ chối. Cần hiệu chỉnh work units/overload thresholds dựa trên profile Linux và xác nhận tỷ lệ reject sạch dưới tải trước khi tuyên bố an toàn tải cao. Hiện test fail-closed sạch đã chứng minh 50 goroutine với workload 8 KiB, không chứng minh upload 64–256 KiB ở 200 goroutine.
+- **TODO-P4f-1 (superseded by P4f-fix):** benchmark tải 50/200 goroutine trước đó cho p99 >1 giây, work cap chạm tối đa 100%, fuse tới 9%. Fuse-only false reject policy đã sửa; còn phải chạy perf job Linux/WSL 30 lần và hiệu chỉnh tolerance từ số đo.
 - **TODO-2:** audit writer còn in-memory, chưa bền qua restart.
 - **TODO-3:** body read deadlines đã xác minh WSL P4e; không thay đổi trong P4f.
 

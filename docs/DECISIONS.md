@@ -82,6 +82,14 @@ Ngày: 2026-11-20
 - Buffer body vẫn chỉ prefix theo cap và stream phần dư; không có tail scan thật. Candidate windows đầu/cuối nằm trong phần prefix đã đọc. Free fail-open có thể bị padding vượt cap để né phần payload ở đuôi; giảm thiểu bằng anomaly +3 (mặc định), cap Content-Length theo content type và rate-limit chặt hơn upload/body lớn. Gói trả phí nên chọn closed/challenge.
 - Tải cao suy giảm theo thứ tự “paranoia cao → phạm vi → fail-mode”; fail-mode cuối vẫn có thể chặn hợp lệ khi cầu chì liên tục, nhưng không chuyển chỉ vì concurrency tăng.
 
+## P4f-fix — cầu chì không từ chối request sạch theo scheduler — 2026-11-24
+
+- Bằng chứng kích hoạt sửa: CI log `level=1 active=2 estimated_runnable_queue=0 ewma_ns=28915914 fuse_ratio=0.016` đi cùng `clean fail-closed requests rejected=1/250`. `budgetFailure` trước đây áp `fail_mode=closed` ngay khi một request vượt fuse wall-clock; level 3 cũng từng đổi fail-mode chỉ từ lịch sử fuse. Do đó một request sạch bị scheduler trì hoãn vẫn có thể bị từ chối dù không vượt work cap.
+- Work budget xác định (byte, normalize steps, regex windows) tiếp tục quyết định `waf_work_exhausted` và fail-mode. Cầu chì chỉ là watchdog thô, tối thiểu 250 ms, mặc định 250 ms, cấu hình được tới 5 giây và tự tăng theo backlog runnable ước lượng + EWMA, tối đa 10 giây. Fuse chỉ gắn `waf_budget_exceeded`, `waf_scan_truncated`, `waf_degraded_fuse` và cộng 1 điểm nếu chưa có điểm; không áp fail-mode khi điểm dưới ngưỡng. Chỉ điểm bất thường tích lũy chạm ngưỡng mới block; monitor chỉ log. Body bị cắt/work cap vẫn theo fail-mode hiện hữu.
+- Fuse ratio quá khứ không còn tự kích hoạt fail-mode. Tier 1 bỏ paranoia cao, tier 2+ giảm phạm vi; cap công việc xác định vẫn là giới hạn cuối cùng. Đây ưu tiên không từ chối nhầm do lịch CPU, đổi lại request chưa quét hết dưới mức ngưỡng có thể qua theo fail-open/fail-closed nếu chưa vượt work cap. Dấu `waf_scan_truncated`/điểm fuse dùng cho telemetry/alert.
+- Wall-clock stress test được chuyển sang build tag `perf`, chạy riêng trong job bắt buộc không `-race`; logic fuse/work caps chạy dưới `-race` bằng fake clock và fake slow reader/regex. Lý do: race detector làm chậm xử lý nhiều lần và không đo độ trễ phục vụ. Job perf chạy 30 lần, GOMAXPROCS 1/2/4/N, 50/200 goroutine, yêu cầu 0 clean reject và mọi payload trong phạm vi bị block, đồng thời in p50/p99 thật. Chưa đặt ngưỡng latency p99 cố định cho đến khi có baseline Linux CI/WSL lặp lại; job hiện bắt buộc theo hành vi và lưu latency để thiết lập ngưỡng từ số đo, không bịa SLA.
+- Log đổi tier dùng throttle toàn tiến trình tối đa một dòng mỗi 3 giây; mỗi dòng gồm tổng thay đổi, còn counter/accessor giữ số liệu chi tiết.
+
 ## Quyết định P4d — WAF budget và fail mode — 2026-11-23 (đã superseded bởi P4e)
 
 - Lịch sử P4d dùng 4 KiB/request, 2 KiB/target, 1 KiB body prefix và query 8 KiB/64 tham số. P4e đã bỏ các trần này vì tạo điểm mù bypass; xem chính sách scope hiện hành ở mục P4e.

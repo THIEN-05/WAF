@@ -39,9 +39,14 @@ const (
 	maxQueryParams          = 200
 	scanChunkBytes          = 4096
 	scanChunkOverlap        = maxRegexWindowBytes
-	defaultFuse             = 100 * time.Millisecond
-	maxFuse                 = 5 * time.Second
+	defaultFuse             = 250 * time.Millisecond
+	minimumFuse             = 250 * time.Millisecond
+	maxFuse                 = 10 * time.Second
+	tierLogInterval         = 3 * time.Second
 )
+
+var globalTierLogAt atomic.Int64
+var globalTierChanges atomic.Uint64
 
 type workLimit struct {
 	bytes, normalizeSteps, regexWindows int
@@ -69,6 +74,7 @@ type Phase struct {
 	rules       []compiledRule
 	prefilter   *automaton
 	now         func() time.Time
+	afterRegex  func() // deterministic slow-regex seam for policy tests
 	active      atomic.Int64
 	requests    atomic.Uint64
 	fuses       atomic.Uint64
@@ -77,8 +83,8 @@ type Phase struct {
 	degrade2    atomic.Uint64
 	degrade3    atomic.Uint64
 	lastLevel   atomic.Int64
+	tierChanges atomic.Uint64
 	ewmaNanos   atomic.Int64
-	lastTierLog atomic.Int64
 	outcomeMu   sync.Mutex
 	outcomes    [64]bool
 	outcomeN    int
@@ -86,12 +92,12 @@ type Phase struct {
 }
 
 type OverloadMetrics struct {
-	Active, EWMAWAFNanos                                               int64
-	Requests, FuseTrips, WorkCaps, DropParanoia, ReduceScope, FailMode uint64
+	Active, EWMAWAFNanos                                                            int64
+	Requests, FuseTrips, WorkCaps, DropParanoia, ReduceScope, FailMode, TierChanges uint64
 }
 
 func (p *Phase) Metrics() OverloadMetrics {
-	return OverloadMetrics{Active: p.active.Load(), EWMAWAFNanos: p.ewmaNanos.Load(), Requests: p.requests.Load(), FuseTrips: p.fuses.Load(), WorkCaps: p.workCaps.Load(), DropParanoia: p.degrade1.Load(), ReduceScope: p.degrade2.Load(), FailMode: p.degrade3.Load()}
+	return OverloadMetrics{Active: p.active.Load(), EWMAWAFNanos: p.ewmaNanos.Load(), Requests: p.requests.Load(), FuseTrips: p.fuses.Load(), WorkCaps: p.workCaps.Load(), DropParanoia: p.degrade1.Load(), ReduceScope: p.degrade2.Load(), FailMode: p.degrade3.Load(), TierChanges: p.tierChanges.Load()}
 }
 
 func NewPhase(rules []Rule, now func() time.Time) (*Phase, error) {
@@ -149,19 +155,12 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 	requests, fuseTrips := p.recentFuseRatio()
 	level = overloadTier(active, procs, p.ewmaNanos.Load(), fuseTrips, requests, level)
 	if prev := p.lastLevel.Swap(level); prev != level {
+		p.tierChanges.Add(1)
+		changes := globalTierChanges.Add(1)
 		nowLog := time.Now().UnixNano()
-		last := p.lastTierLog.Load()
-		if nowLog-last > 100_000_000 && p.lastTierLog.CompareAndSwap(last, nowLog) {
-			log.Printf("waf overload tier changed: level=%d active=%d estimated_runnable_queue=%d ewma_ns=%d fuse_ratio=%.3f", level, active, max(int64(0), active-procs), p.ewmaNanos.Load(), fuseTrips)
+		if shouldLogTierChange(nowLog) {
+			log.Printf("waf overload tier changed: level=%d active=%d estimated_runnable_queue=%d ewma_ns=%d fuse_ratio=%.3f total_changes=%d", level, active, max(int64(0), active-procs), p.ewmaNanos.Load(), fuseTrips, changes)
 		}
-	}
-	if level >= 3 {
-		p.degrade3.Add(1)
-		ctx.AddTag("waf_degraded_fail_mode")
-		if effectiveFailMode(ctx) == "closed" {
-			return wafDecision(reqctx.ActionBlock, "waf_overload", 0, "persistent WAF fuse ratio; fail closed", ctx.Tags())
-		}
-		return wafDecision(reqctx.ActionAllow, "waf_overload", 0, "persistent WAF fuse ratio; fail open", ctx.Tags())
 	}
 	if level >= 1 && paranoia > 1 {
 		paranoia = 1
@@ -171,9 +170,7 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 	fuse := defaultFuse
 	if ctx.Site.WAF.BudgetMS > 0 {
 		fuse = time.Duration(ctx.Site.WAF.BudgetMS) * time.Millisecond
-		if fuse > maxFuse {
-			fuse = maxFuse
-		}
+		fuse = min(max(fuse, minimumFuse), maxFuse)
 	}
 	started := p.now()
 	if p.overFuse(started, fuse) {
@@ -264,7 +261,17 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 					break
 				}
 			}
-			if !prefilterMatched || !rule.pattern.MatchString(candidate) {
+			if !prefilterMatched {
+				continue
+			}
+			patternMatched := rule.pattern.MatchString(candidate)
+			if p.afterRegex != nil {
+				p.afterRegex()
+			}
+			if !patternMatched {
+				if p.overFuse(started, fuse) {
+					return p.budgetFailure(ctx, score, "WAF request fuse exceeded during regex evaluation"), true
+				}
 				continue
 			}
 			if _, already := matched[rule.rule.ID]; already {
@@ -279,6 +286,9 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 			ctx.WAFScore = score
 			if mode != "monitor" && score >= threshold {
 				return thresholdDecision(ctx, mode, score, threshold, rule.rule.ID, ctx.Tags()), true
+			}
+			if p.overFuse(started, fuse) {
+				return p.budgetFailure(ctx, score, "WAF request fuse exceeded after regex evaluation"), true
 			}
 		}
 		return reqctx.Decision{}, false
@@ -495,6 +505,11 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
 	return wafDecision(reqctx.ActionAllow, firstMatchedRuleOrAllow(firstMatchedRule), score, fmt.Sprintf("WAF score %d below threshold %d", score, threshold), ctx.Tags())
 }
 
+func shouldLogTierChange(nowNanos int64) bool {
+	last := globalTierLogAt.Load()
+	return nowNanos-last > int64(tierLogInterval) && globalTierLogAt.CompareAndSwap(last, nowNanos)
+}
+
 func scanChunks(raw string, body bool) []string {
 	if !body || len(raw) <= scanChunkBytes {
 		return []string{raw}
@@ -586,20 +601,21 @@ func boundedWindowsLimit(length, limit int) ([]scanWindow, bool) {
 func (p *Phase) overFuse(start time.Time, fuse time.Duration) bool {
 	active := p.active.Load()
 	procs := int64(max(1, runtime.GOMAXPROCS(0)))
-	return p.now().Sub(start) > effectiveFuse(fuse, active, procs)
+	return p.now().Sub(start) > effectiveFuse(fuse, active, procs, p.ewmaNanos.Load())
 }
 
-func effectiveFuse(fuse time.Duration, active, procs int64) time.Duration {
+func effectiveFuse(fuse time.Duration, active, procs, ewmaNanos int64) time.Duration {
 	procs = max(1, procs)
+	fuse = min(max(fuse, minimumFuse), maxFuse)
 	if active > procs {
-		ratio := float64(active) / float64(procs)
-		scale := 1 + ratio*ratio*ratio*ratio*ratio*ratio*ratio*ratio
+		backlogRatio := float64(active-procs) / float64(procs)
+		scale := 1 + min(backlogRatio, 16)
 		fuse = time.Duration(float64(fuse) * scale)
-		if fuse > maxFuse {
-			fuse = maxFuse
-		}
 	}
-	return fuse
+	if ewmaNanos > int64(fuse/2) {
+		fuse += time.Duration(ewmaNanos / 2)
+	}
+	return min(fuse, maxFuse)
 }
 
 func (p *Phase) recentFuseRatio() (int64, float64) {
@@ -649,13 +665,25 @@ func (p *Phase) budgetFailure(ctx *reqctx.RequestCtx, score int, reason string) 
 	}
 	ctx.WAFScore = score
 	ctx.AddTag("waf_budget_exceeded")
+	if !hasString(ctx.Tags(), "waf_scan_truncated") {
+		ctx.AddTag("waf_scan_truncated")
+	}
+	ctx.AddTag("waf_degraded_fuse")
+	if score == 0 {
+		score = 1 // Work was interrupted, but no attack evidence was found.
+	}
+	ctx.WAFScore = score
 	if ctx.BodyReadTimedOut() {
 		ctx.AddTag("waf_body_read_timeout")
 	}
-	if effectiveFailMode(ctx) == "closed" {
-		return wafDecision(reqctx.ActionBlock, "waf_budget", score, reason+" (fail closed)", ctx.Tags())
+	threshold := sensitivityThreshold(ctx.Site.WAF.Sensitivity)
+	if ctx.Site.WAF.Mode == "monitor" && score > 0 {
+		return wafDecision(reqctx.ActionLogOnly, "waf_budget", score, reason+" (partial scan; monitor)", ctx.Tags())
 	}
-	return wafDecision(reqctx.ActionAllow, "waf_budget", score, reason+" (fail open)", ctx.Tags())
+	if score >= threshold {
+		return wafDecision(reqctx.ActionBlock, "waf_budget", score, reason+" (anomaly threshold exceeded)", ctx.Tags())
+	}
+	return wafDecision(reqctx.ActionAllow, "waf_budget", score, reason+" (partial scan; score below threshold, fail mode deferred)", ctx.Tags())
 }
 
 func (p *Phase) bodyReadFailure(ctx *reqctx.RequestCtx, score int, reason string) reqctx.Decision {

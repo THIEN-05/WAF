@@ -39,7 +39,9 @@ Thay đổi thuật toán: Aho-Corasick quét phạm vi theo gói theo block 4 K
 
 ## P4f — deterministic WAF budget and overload
 
-Plan work caps: Free 128 KiB / 256 normalize block steps / 128 regex windows; Pro 256 KiB / 512 / 192; Business 384 KiB / 768 / 256; Enterprise 512 KiB / 1,024 / 384. `budget_ms` is a coarse wall fuse (default 100 ms, configurable 1–5,000); while active WAF work exceeds GOMAXPROCS, the threshold scales with the estimated runnable backlog and is capped at 5 s. Only effective fuse trips emit `waf_budget_exceeded`. Work-cap events emit `waf_work_exhausted` and truncation tags. Overload tiers use runnable-backlog proxy, WAF phase EWMA, and a rolling 64-request fuse ratio; `Phase.Metrics()` and audit counters expose tier activity.
+> The P4f load results below predate P4f-fix and are historical. See the addendum below for the current fuse policy and CI perf job.
+
+Plan work caps: Free 128 KiB / 256 normalize block steps / 128 regex windows; Pro 256 KiB / 512 / 192; Business 384 KiB / 768 / 256; Enterprise 512 KiB / 1,024 / 384. The current `budget_ms` is a coarse wall fuse (default/minimum 250 ms, configurable up to 5,000); while active WAF work exceeds GOMAXPROCS, the threshold scales with estimated runnable backlog and WAF EWMA and is capped at 10 s. A fuse trip marks a partial scan and adds one point, but does not apply fail-mode below the anomaly threshold. Work-cap events still use deterministic package caps and the configured fail-mode.
 
 Measured on WSL Ubuntu/Linux amd64, Go 1.26.11, Intel i5-11400H (6 cores/12 logical CPUs), GOMAXPROCS=12; command `go test ./edge/internal/waf -run '^$' -bench '^BenchmarkWAFLoadMatrix$' -benchtime=200x -benchmem`. Each cell runs 200 requests; p50/p99 and work/fuse rates are per-request samples; allocs/op is Go benchmark allocation per request. The table shows min–max over the 12 combinations of body 8/64/256 KiB and repeated-Aho, deep-JSON, multipart, and 200-query-parameter shapes:
 
@@ -52,7 +54,28 @@ Measured on WSL Ubuntu/Linux amd64, Go 1.26.11, Intel i5-11400H (6 cores/12 logi
 
 These are broad scenario ranges, not a service-level guarantee. High-concurrency worst-case requests still have p99 above one second and a nonzero fuse rate; work-cap rates reach 100% for some cases. That confirms bounded fail-mode behavior remains a risk for paid fail-closed sites with large valid requests. The regression test separately covers 50 concurrent 8 KiB traffic: default fuse **0/250**, clean rejects **0/20**, prefix SQLi blocked **50/50**; p50 **6,061,300 ns**, p99 **63,354,000 ns**, GOMAXPROCS=12/12 CPUs. GOMAXPROCS 2/4/12 clean 50-goroutine test: fuse **0/250** and rejected clean requests **0/250** in each setting.
 
-Work-cap cases are marked incomplete and follow the configured fail mode; benchmark mode is monitor, so work-cap percentage does not itself mean those requests were blocked. Free defaults fail-open; closed paid plans may reject incomplete scans. Keeping the fuse default at 100 ms with a backlog-scaled ceiling (5 s) reduces scheduler-induced false trips but does not eliminate them, as measured above. Further calibration remains TODO P4f-1; do not claim a sub-2-ms p99 or zero fuse rate at 50/200 concurrency.
+Work-cap cases are marked incomplete and follow the configured fail mode; benchmark mode is monitor, so work-cap percentage does not itself mean those requests were blocked. Free defaults fail-open; closed paid plans may reject incomplete scans. The older measurements show scheduler delay can exceed a short wall fuse, so those results do not validate the current policy.
+
+### P4f-fix — required perf job
+
+`TestWAFParallel50GOMAXPROCSMatrix` is tagged `perf`; CI runs it in a required, non-race job with `-count=30`. It exercises GOMAXPROCS 1/2/4/N and 50/200 goroutines, asserts zero clean fail-closed rejects and blocks every in-scope attack, and prints p50/p99 and fuse counts. Deterministic fuse/work-cap policy tests (fake clock, fake body reader, fake regex delay) remain in the normal race suite.
+
+No Linux/taskset 30-run measurement is available from this Windows sandbox. Do not treat Windows timings as a Linux baseline. TODO-P4f-1 remains open until WSL/CI captures 30-run output and establishes a latency tolerance from those measurements; no p99 limit is claimed before that evidence exists.
+
+Windows 11 sandbox run, `GOMAXPROCS=2 go test -tags=perf -count=30 -v ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'`, host reports 12 CPUs and the test itself covers GOMAXPROCS 1/2/4/12 × 50/200 goroutines. All 30 runs passed: zero clean rejects, zero fuse trips, all 50/50 or 200/200 attack requests blocked. The 30-run p50/p99 ranges of per-worker mean request latency (ns) were:
+
+| GOMAXPROCS | Goroutines | p50 range ns | p99 range ns |
+| ---: | ---: | ---: | ---: |
+| 1 | 50 | 0–203,400 | 260,100–1,672,500 |
+| 1 | 200 | 0–149,300 | 1,009,540–2,026,340 |
+| 2 | 50 | 0–211,840 | 202,820–3,915,760 |
+| 2 | 200 | 0–3,908,660 | 5,956,900–20,360,160 |
+| 4 | 50 | 0–1,801,860 | 1,191,260–3,109,880 |
+| 4 | 200 | 211,360–4,802,280 | 4,205,100–8,804,800 |
+| 12 | 50 | 400,720–2,582,580 | 400,720–3,182,960 |
+| 12 | 200 | 2,700,700–5,639,580 | 6,253,200–9,303,320 |
+
+This Windows timer reported 0 for some worker mean p50 values; those p50 cells are below its measured resolution and are not a usable latency baseline. CPU affinity was not pinned; this is not the requested Linux `taskset` run.
 
 Test loopback thật cho body chậm/treo/đứt giữa chừng PASS trong WSL Ubuntu; deadline đọc mặc định 1 giây làm handler kết thúc, paid fail-closed trả 403. `TestPerIPConnectionLimit` tiếp tục nằm trong suite listener và được xác minh cùng race suite. Test loopback chỉ chạy ngoài sandbox Windows.
 

@@ -137,12 +137,12 @@ func TestWAFLazyBodyExclusionBudgetAndThreshold(t *testing.T) {
 	}
 
 	clock := time.Now()
-	budgetPhase, _ := NewPhase(nil, func() time.Time { clock = clock.Add(60 * time.Millisecond); return clock })
+	budgetPhase, _ := NewPhase(nil, func() time.Time { clock = clock.Add(300 * time.Millisecond); return clock })
 	ctx2 := reqctx.New(httptest.NewRequest("GET", "http://edge.test/", nil), nil, "id", nil)
 	ctx2.Site = &wafcore.Site{FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "block"}}
 	got = budgetPhase.Handle(ctx2)
-	if got.Action != reqctx.ActionBlock || got.RuleID != "waf_budget" {
-		t.Fatalf("budget failure: %+v", got)
+	if got.Action != reqctx.ActionAllow || got.RuleID != "waf_budget" || got.Score == 0 || !containsString(got.Tags, "waf_degraded_fuse") {
+		t.Fatalf("clean fuse must be marked/scored without fail-closed reject: %+v", got)
 	}
 }
 
@@ -555,7 +555,6 @@ func (failingBody) Close() error             { return nil }
 func (r *delayedBody) Read(p []byte) (int, error) {
 	if !r.delayed {
 		r.delayed = true
-		time.Sleep(3 * time.Millisecond)
 	}
 	if len(r.data) == 0 {
 		return 0, io.EOF
@@ -566,15 +565,21 @@ func (r *delayedBody) Read(p []byte) (int, error) {
 }
 func (r *delayedBody) Close() error { return nil }
 
-func TestWorstCaseBodyLimitsAndBudgetFailMode(t *testing.T) {
-	phase, err := NewPhase(loadManagedRules(t), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestFuseAfterBodyReadDefersCleanFailClosedRequest(t *testing.T) {
 	for _, kb := range []int{8, 64, 256} {
 		for _, failMode := range []string{"open", "closed"} {
 			t.Run(fmt.Sprintf("body_%dKB_fail_%s", kb, failMode), func(t *testing.T) {
 				body := &delayedBody{data: []byte(strings.Repeat("a", kb*1024))}
+				base := time.Now()
+				phase, err := NewPhase(loadManagedRules(t), func() time.Time {
+					if body.delayed {
+						return base.Add(time.Second)
+					}
+					return base
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
 				r := httptest.NewRequest(http.MethodPost, "http://edge.test/submit", nil)
 				r.Body = body
 				r.Header.Set("Content-Type", "text/plain")
@@ -588,23 +593,17 @@ func TestWorstCaseBodyLimitsAndBudgetFailMode(t *testing.T) {
 					plan = "enterprise"
 				}
 				ctx.Site = &wafcore.Site{ID: "s", Plan: plan, Entitlements: wafcore.Entitlements{MaxBodyBytes: kb * 1024}, FailMode: failMode, WAF: wafcore.WAFConfig{Mode: "monitor", Sensitivity: "low", Paranoia: 1, BodyLimitKB: kb, BudgetMS: 1}}
-				started := time.Now()
 				decision := phase.Handle(ctx)
-				elapsed := time.Since(started)
-				if !ctx.BodyLoaded() || elapsed < 2*time.Millisecond {
-					t.Fatalf("body was not read within enforced budget path: loaded=%v elapsed=%s", ctx.BodyLoaded(), elapsed)
+				if !ctx.BodyLoaded() || !body.delayed {
+					t.Fatalf("fake fuse must trip only after body read: loaded=%v read=%v", ctx.BodyLoaded(), body.delayed)
 				}
 				if got := len(ctx.BodyText()); got != kb*1024 || ctx.BodyTruncated() {
 					t.Fatalf("WAF body buffer: got %d bytes truncated=%v, want complete %d-byte package scope", got, ctx.BodyTruncated(), kb*1024)
 				}
-				want := reqctx.ActionAllow
-				if failMode == "closed" {
-					want = reqctx.ActionBlock
+				if decision.Action != reqctx.ActionLogOnly || decision.RuleID != "waf_budget" {
+					t.Fatalf("clean wall-fuse decision must defer fail mode: %+v", decision)
 				}
-				if decision.Action != want || decision.RuleID != "waf_budget" {
-					t.Fatalf("budget decision=%+v want action=%v", decision, want)
-				}
-				if !strings.Contains(decision.Reason, "fuse exceeded") {
+				if !strings.Contains(decision.Reason, "fuse exceeded") || !containsString(decision.Tags, "waf_degraded_fuse") {
 					t.Fatalf("budget reason missing: %+v", decision)
 				}
 				if !containsString(decision.Tags, "waf_budget_exceeded") {
@@ -617,6 +616,65 @@ func TestWorstCaseBodyLimitsAndBudgetFailMode(t *testing.T) {
 				reqctx.Release(ctx)
 			})
 		}
+	}
+}
+
+func TestWAFFakeSlowRegexFuseDoesNotRejectCleanFailClosed(t *testing.T) {
+	clock := time.Now()
+	phase, err := NewPhase([]Rule{{ID: "never-match", Phase: "request", Targets: []string{"path"}, Pattern: `definitely-not-present`, Severity: "warning", Paranoia: 1}}, func() time.Time { return clock })
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase.afterRegex = func() { clock = clock.Add(time.Second) }
+	ctx := reqctx.New(httptest.NewRequest(http.MethodGet, "http://edge.test/safe", nil), nil, "fake-slow-regex", nil)
+	ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 1}}
+	d := phase.Handle(ctx)
+	if d.RuleID != "waf_budget" || d.Action != reqctx.ActionAllow || !containsString(d.Tags, "waf_budget_exceeded") {
+		t.Fatalf("fake slow regex must degrade and allow clean fail-closed request: action=%v rule=%s score=%d reason=%q tags=%v", d.Action, d.RuleID, d.Score, d.Reason, d.Tags)
+	}
+	reqctx.Release(ctx)
+}
+
+func TestWAFFuseBlocksOnlyWhenAccumulatedScoreReachesThreshold(t *testing.T) {
+	phase, err := NewPhase(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCtx := func(id string) *reqctx.RequestCtx {
+		ctx := reqctx.New(httptest.NewRequest(http.MethodGet, "http://edge.test/", nil), nil, id, nil)
+		ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high"}}
+		return ctx
+	}
+
+	clean := newCtx("clean-fuse")
+	cleanDecision := phase.budgetFailure(clean, 0, "simulated coarse fuse")
+	if cleanDecision.Action != reqctx.ActionAllow || cleanDecision.Score != 1 || !containsString(cleanDecision.Tags, "waf_degraded_fuse") {
+		t.Fatalf("clean fuse decision=%+v", cleanDecision)
+	}
+	reqctx.Release(clean)
+
+	attack := newCtx("scored-attack-fuse")
+	attackDecision := phase.budgetFailure(attack, sensitivityThreshold("high"), "fuse after attack evidence")
+	if attackDecision.Action != reqctx.ActionBlock || attackDecision.Score < sensitivityThreshold("high") {
+		t.Fatalf("scored attack must remain blocked: %+v", attackDecision)
+	}
+	reqctx.Release(attack)
+}
+
+func TestWAFFuseLogThrottleInterval(t *testing.T) {
+	if tierLogInterval < 2*time.Second {
+		t.Fatalf("overload tier log interval=%s, want several seconds", tierLogInterval)
+	}
+	old := globalTierLogAt.Swap(0)
+	defer globalTierLogAt.Store(old)
+	if !shouldLogTierChange(int64(4 * time.Second)) {
+		t.Fatal("first tier transition should be logged")
+	}
+	if shouldLogTierChange(int64(5 * time.Second)) {
+		t.Fatal("tier transitions inside throttle interval should be aggregated")
+	}
+	if !shouldLogTierChange(int64(8 * time.Second)) {
+		t.Fatal("tier transition after throttle interval should be logged")
 	}
 }
 
@@ -678,12 +736,8 @@ func TestBodyTruncationScoresAndPlanFailModeDefaults(t *testing.T) {
 				t.Fatalf("truncation fail mode action=%v want %v", decision.Action, wantAction)
 			}
 			budgetDecision := phase.budgetFailure(ctx, 0, "test budget")
-			want := reqctx.ActionAllow
-			if tc.want == "closed" {
-				want = reqctx.ActionBlock
-			}
-			if budgetDecision.Action != want {
-				t.Fatalf("plan %s budget action=%v, want %v", tc.plan, budgetDecision.Action, want)
+			if budgetDecision.Action != reqctx.ActionLogOnly || !containsString(budgetDecision.Tags, "waf_degraded_fuse") {
+				t.Fatalf("plan %s clean fuse must defer fail mode below anomaly threshold: %+v", tc.plan, budgetDecision)
 			}
 			reqctx.Release(ctx)
 		})
@@ -909,83 +963,6 @@ func TestLargeCleanBodiesFPR(t *testing.T) {
 	}
 }
 
-func TestWAFParallel50ReportsP99AndBudgetAction(t *testing.T) {
-	phase, err := NewPhase(loadManagedRules(t), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const workers, perWorker = 50, 5
-	latencies := make(chan int64, workers*perWorker)
-	budgetFailures := make(chan reqctx.Decision, workers*perWorker)
-	var attackCaught atomic.Int64
-	var wg sync.WaitGroup
-	for worker := 0; worker < workers; worker++ {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			for i := 0; i < perWorker; i++ {
-				body := `{"message":"ordinary search for select union drop script alert","worker":` + strconv.Itoa(worker) + `,"text":"` + strings.Repeat("safe documentation ", 350) + `"}`
-				wafMode := "monitor"
-				if i == 0 {
-					body = `{"q":"UNION SELECT password FROM users","text":"` + strings.Repeat("safe ", 200) + `"}`
-					wafMode = "block"
-				}
-				r := httptest.NewRequest(http.MethodPost, "http://edge.test/api", strings.NewReader(body))
-				r.Header.Set("Content-Type", "application/json")
-				ctx := reqctx.New(r, nil, "parallel", nil)
-				ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", Entitlements: wafcore.Entitlements{MaxBodyBytes: 256 * 1024}, FailMode: "closed", WAF: wafcore.WAFConfig{Mode: wafMode, Sensitivity: "high", Paranoia: 4, BodyLimitKB: 256}}
-				started := time.Now()
-				decision := phase.Handle(ctx)
-				if i == 0 && decision.Action == reqctx.ActionBlock {
-					attackCaught.Add(1)
-				}
-				latencies <- time.Since(started).Nanoseconds()
-				if containsString(decision.Tags, "waf_budget_exceeded") {
-					budgetFailures <- decision
-				}
-				reqctx.Release(ctx)
-			}
-		}(worker)
-	}
-	wg.Wait()
-	close(latencies)
-	close(budgetFailures)
-	samples := make([]int64, 0, workers*perWorker)
-	for sample := range latencies {
-		samples = append(samples, sample)
-	}
-	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	budgetCount := 0
-	for decision := range budgetFailures {
-		budgetCount++
-		if decision.Action != reqctx.ActionBlock || !containsString(decision.Tags, "waf_budget_exceeded") {
-			t.Fatalf("paid budget failure did not fail closed: %+v", decision)
-		}
-	}
-	if budgetCount == len(samples) {
-		t.Fatalf("CPU contention must not turn all 50-goroutine requests into fuse failures: %d/%d", budgetCount, len(samples))
-	}
-	cleanFPR := 0
-	for i := 0; i < 20; i++ {
-		r := httptest.NewRequest(http.MethodPost, "http://edge.test/api", strings.NewReader(`{"message":"`+strings.Repeat("ordinary documentation ", 180)+`"}`))
-		r.Header.Set("Content-Type", "application/json")
-		ctx := reqctx.New(r, nil, "parallel-clean", nil)
-		ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 4, BodyLimitKB: 8}}
-		d := phase.Handle(ctx)
-		if d.Action != reqctx.ActionAllow {
-			cleanFPR++
-		}
-		reqctx.Release(ctx)
-	}
-	if cleanFPR != 0 {
-		t.Fatalf("clean FPR increased under concurrent load: %d/20", cleanFPR)
-	}
-	if attackCaught.Load() != workers {
-		t.Fatalf("prefix attack was not caught for all concurrent attackers: %d/%d", attackCaught.Load(), workers)
-	}
-	t.Logf("parallel-50 body=8KB p50=%d ns p99=%d ns fuse_exceeded=%d/%d clean_false_positive=%d/20 prefix_attacks_blocked=%d/%d; GOMAXPROCS=%d CPUs=%d", samples[len(samples)*50/100], samples[(len(samples)*99+99)/100-1], budgetCount, len(samples), cleanFPR, attackCaught.Load(), workers, runtime.GOMAXPROCS(0), runtime.NumCPU())
-}
-
 func TestWAFDeterministicWorkCapsDoNotBecomeWallFuseFailures(t *testing.T) {
 	phase, err := NewPhase(loadManagedRules(t), nil)
 	if err != nil {
@@ -1028,16 +1005,46 @@ func TestWAFOverloadTierThresholds(t *testing.T) {
 	}
 }
 
+func TestWAFPersistentFuseHistoryDoesNotFailClosedCleanRequest(t *testing.T) {
+	phase, err := NewPhase(loadManagedRules(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase.outcomeMu.Lock()
+	phase.outcomeN = 32
+	for i := 0; i < phase.outcomeN; i++ {
+		phase.outcomes[i] = true
+	}
+	phase.outcomeMu.Unlock()
+	r := httptest.NewRequest(http.MethodGet, "http://edge.test/search?q=ordinary+documentation", nil)
+	ctx := reqctx.New(r, nil, "persistent-fuse-clean", nil)
+	ctx.Site = &wafcore.Site{ID: "s", Plan: "enterprise", FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 4}}
+	d := phase.Handle(ctx)
+	if d.Action != reqctx.ActionAllow || containsString(d.Tags, "waf_degraded_fail_mode") {
+		t.Fatalf("persistent historical fuse ratio must not reject clean request: action=%v rule=%s score=%d reason=%q tags=%v", d.Action, d.RuleID, d.Score, d.Reason, d.Tags)
+	}
+	if phase.Metrics().FailMode != 0 {
+		t.Fatalf("fuse-only overload still reported fail-mode transitions: %+v", phase.Metrics())
+	}
+	reqctx.Release(ctx)
+}
+
 func TestWAFFuseExpandsOnlyForRunnableBacklog(t *testing.T) {
-	base := 100 * time.Millisecond
-	if got := effectiveFuse(base, 4, 4); got != base {
+	base := minimumFuse
+	if got := effectiveFuse(base, 4, 4, 0); got != base {
 		t.Fatalf("no backlog fuse=%s want=%s", got, base)
 	}
-	if got := effectiveFuse(base, 8, 4); got <= base {
+	if got := effectiveFuse(base, 8, 4, 0); got <= base {
 		t.Fatalf("queued work should compensate scheduler wait, fuse=%s", got)
 	}
-	if got := effectiveFuse(5*time.Second, 100, 1); got > maxFuse {
+	if got := effectiveFuse(5*time.Second, 100, 1, 0); got > maxFuse {
 		t.Fatalf("adaptive fuse exceeded hard ceiling: %s", got)
+	}
+	if got := effectiveFuse(20*time.Millisecond, 1, 2, 0); got < minimumFuse {
+		t.Fatalf("small configured fuse below minimum: %s", got)
+	}
+	if got := effectiveFuse(base, 4, 4, int64(time.Second)); got <= base {
+		t.Fatalf("high WAF EWMA should expand the coarse fuse: %s", got)
 	}
 }
 
@@ -1068,57 +1075,6 @@ func TestWAFFailClosedCleanTrafficUnderConcurrency(t *testing.T) {
 	wg.Wait()
 	if n := rejected.Load(); n != 0 {
 		t.Fatalf("load alone caused fail-closed rejection: %d/%d", n, workers*perWorker)
-	}
-}
-
-func TestWAFParallel50GOMAXPROCSMatrix(t *testing.T) {
-	original := runtime.GOMAXPROCS(0)
-	defer runtime.GOMAXPROCS(original)
-	procs := []int{2, 4, runtime.NumCPU()}
-	seen := map[int]bool{}
-	for _, n := range procs {
-		if n < 1 || seen[n] {
-			continue
-		}
-		seen[n] = true
-		t.Run(fmt.Sprintf("gomaxprocs_%d", n), func(t *testing.T) {
-			runtime.GOMAXPROCS(n)
-			phase, err := NewPhase(loadManagedRules(t), nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			const workers, each = 50, 5
-			var wg sync.WaitGroup
-			var cleanReject, fuse atomic.Int64
-			for w := 0; w < workers; w++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for i := 0; i < each; i++ {
-						r := httptest.NewRequest(http.MethodPost, "http://edge.test/", strings.NewReader(`{"q":"ordinary documentation `+strings.Repeat("safe ", 200)+`"}`))
-						r.Header.Set("Content-Type", "application/json")
-						c := reqctx.New(r, nil, "load", nil)
-						c.Site = &wafcore.Site{ID: "s", Plan: "enterprise", FailMode: "closed", WAF: wafcore.WAFConfig{Mode: "block", Sensitivity: "high", Paranoia: 4, BodyLimitKB: 8}}
-						d := phase.Handle(c)
-						if d.Action == reqctx.ActionBlock {
-							cleanReject.Add(1)
-						}
-						if containsString(d.Tags, "waf_budget_exceeded") {
-							fuse.Add(1)
-						}
-						reqctx.Release(c)
-					}
-				}()
-			}
-			wg.Wait()
-			if cleanReject.Load() != 0 {
-				t.Fatalf("clean fail-closed requests rejected=%d/%d", cleanReject.Load(), workers*each)
-			}
-			if fuse.Load() == workers*each {
-				t.Fatalf("all clean requests hit fuse: %d", fuse.Load())
-			}
-			t.Logf("concurrency=50 GOMAXPROCS=%d CPUs=%d clean-fpr=%d/%d fuse=%d/%d", n, runtime.NumCPU(), cleanReject.Load(), workers*each, fuse.Load(), workers*each)
-		})
 	}
 }
 
