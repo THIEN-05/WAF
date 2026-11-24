@@ -44,7 +44,7 @@ type retryTransport struct {
 
 func (t retryTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	max := 1
-	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && t.attempts > 1 {
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && (r.Body == nil || r.Body == http.NoBody) && t.attempts > 1 {
 		max = t.attempts
 	}
 	var last error
@@ -232,7 +232,7 @@ func (p *OriginPool) Serve(w http.ResponseWriter, c *reqctx.RequestCtx) {
 				r.Host = c.Request.Host
 			}
 			for name := range r.Header {
-				if strings.HasPrefix(strings.ToLower(name), "x-forwarded-") || strings.EqualFold(name, "X-Real-IP") {
+				if strings.HasPrefix(strings.ToLower(name), "x-forwarded-") || strings.EqualFold(name, "X-Real-IP") || strings.EqualFold(name, "Forwarded") {
 					r.Header.Del(name)
 				}
 			}

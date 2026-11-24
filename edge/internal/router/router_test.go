@@ -27,6 +27,19 @@ func TestNormalizeHostPunycode(t *testing.T) {
 		t.Fatalf("NormalizeHost punycode=%q", got)
 	}
 }
+
+func TestNormalizeHostRejectsMalformedAuthority(t *testing.T) {
+	for _, raw := range []string{"known.test:bad", "known.test:", "known.test:65536", "known.test:80:evil", "2001:db8::1", "[not-ipv6]", "[2001:db8::1]:bad"} {
+		if got := NormalizeHost(raw); got != "" {
+			t.Errorf("NormalizeHost(%q)=%q, want empty", raw, got)
+		}
+	}
+	for raw, want := range map[string]string{"KNOWN.TEST.:443": "known.test", "[2001:db8::1]": "2001:db8::1", "[2001:db8::1]:443": "2001:db8::1"} {
+		if got := NormalizeHost(raw); got != want {
+			t.Errorf("NormalizeHost(%q)=%q, want %q", raw, got, want)
+		}
+	}
+}
 func TestResolveSNIAndSiteStates(t *testing.T) {
 	s := &wafcore.Snapshot{Sites: []wafcore.Site{{ID: "active", TenantID: "t", Status: "active", Plan: "pro", Domains: []string{"a.test"}, Entitlements: wafcore.Entitlements{MaxRules: 2}}, {ID: "suspended", TenantID: "t", Status: "suspended", Plan: "pro", Domains: []string{"b.test"}}, {ID: "pending", TenantID: "t", Status: "pending", Plan: "pro", Domains: []string{"c.test"}}}}
 	r := New(s)

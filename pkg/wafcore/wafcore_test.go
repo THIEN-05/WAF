@@ -44,6 +44,68 @@ func TestSnapshotYAMLRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLegacySnapshotMissingOptionalFieldsUsesSafeZeroValues(t *testing.T) {
+	const legacy = `schema_version: 1
+version: 7
+generated_at: 2026-01-01T00:00:00Z
+global:
+  managed_ruleset: legacy
+sites:
+  - id: site_old
+    tenant_id: tenant_old
+    status: active
+    plan: free
+    domains: [legacy.example]
+    origins:
+      - url: https://203.0.113.8
+        weight: 1
+    fail_mode: open
+`
+	var snapshot Snapshot
+	if err := yaml.Unmarshal([]byte(legacy), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("legacy snapshot rejected: %v", err)
+	}
+	site := snapshot.Sites[0]
+	if site.WAF.Mode != "" || site.WAF.BodyLimitKB != 0 || site.Bot.Mode != "" || site.Entitlements.BotJSChallenge || site.Origins[0].HostHeader != "" || site.Secrets.ChallengeHMACKeyID != "" {
+		t.Fatalf("omitted optional fields did not get zero-value defaults: %+v", site)
+	}
+}
+
+func TestSnapshotUnknownFieldsAreIgnoredForYAMLAndJSON(t *testing.T) {
+	const legacy = `schema_version: 1
+version: 7
+generated_at: 2026-01-01T00:00:00Z
+global:
+  managed_ruleset: legacy
+future_top_level: ignored
+sites:
+  - id: site_old
+    tenant_id: tenant_old
+    status: active
+    plan: free
+    domains: [legacy.example]
+    origins:
+      - url: https://203.0.113.8
+        weight: 1
+    fail_mode: open
+    future_site_field: ignored
+`
+	var fromYAML Snapshot
+	if err := yaml.Unmarshal([]byte(legacy), &fromYAML); err != nil {
+		t.Fatalf("YAML with unknown fields should be forward-compatible: %v", err)
+	}
+	var fromJSON Snapshot
+	if err := json.Unmarshal([]byte(`{"schema_version":1,"version":7,"generated_at":"2026-01-01T00:00:00Z","global":{"managed_ruleset":"legacy","future_field":true},"future_top_level":true}`), &fromJSON); err != nil {
+		t.Fatalf("JSON with unknown fields should be forward-compatible: %v", err)
+	}
+	if fromYAML.Version != 7 || fromJSON.Version != 7 {
+		t.Fatalf("known fields were not retained: YAML=%+v JSON=%+v", fromYAML, fromJSON)
+	}
+}
+
 func TestDocumentedExpressions(t *testing.T) {
 	cases := []struct {
 		name, expr string

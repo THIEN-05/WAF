@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/wafplatform/edge/internal/reqctx"
@@ -15,10 +16,14 @@ type Phase struct {
 	Verified     VerifiedBotChecker
 	IPTrust      IPReputation
 	Fingerprints FingerprintReputation
-	mu           sync.Mutex
-	behavior     map[string]*behavior
+	behavior     [32]behaviorShard
+	behaviorKeys atomic.Int64
 	maxKeys      int
 	now          func() time.Time
+}
+type behaviorShard struct {
+	mu      sync.Mutex
+	entries map[string]*behavior
 }
 type behavior struct {
 	count, notFound int
@@ -27,7 +32,11 @@ type behavior struct {
 	windowCount     int
 	lastPath        string
 	sequential      int
+	lastSeen        time.Time
 }
+
+const behaviorTTL = 10 * time.Minute
+
 type VerifiedBotChecker interface{ IsVerified(string, net.IP) bool }
 type IPReputation interface{ Score(net.IP, uint32) int }
 type FingerprintReputation interface{ IsAutomation(string, string) bool }
@@ -36,7 +45,11 @@ type NoReputation struct{}
 func (NoReputation) Score(net.IP, uint32) int { return 0 }
 
 func NewPhase(ch *ChallengeManager, verified VerifiedBotChecker) *Phase {
-	return &Phase{Challenges: ch, Verified: verified, IPTrust: NoReputation{}, behavior: map[string]*behavior{}, maxKeys: 100_000, now: time.Now}
+	p := &Phase{Challenges: ch, Verified: verified, IPTrust: NoReputation{}, maxKeys: 100_000, now: time.Now}
+	for i := range p.behavior {
+		p.behavior[i].entries = make(map[string]*behavior)
+	}
+	return p
 }
 func (p *Phase) Name() string { return "bot" }
 func (p *Phase) Handle(c *reqctx.RequestCtx) reqctx.Decision {
@@ -51,15 +64,25 @@ func (p *Phase) Handle(c *reqctx.RequestCtx) reqctx.Decision {
 	}
 	now := p.now()
 	key := c.Site.ID + "|" + c.ClientIP.String()
-	p.mu.Lock()
-	b := p.behavior[key]
-	if b == nil {
-		if len(p.behavior) >= p.maxKeys {
-			p.evictOneLocked()
-		}
-		b = &behavior{windowStart: now}
-		p.behavior[key] = b
+	shard := p.shard(key)
+	shard.mu.Lock()
+	b := shard.entries[key]
+	if b != nil && now.Sub(b.lastSeen) >= behaviorTTL {
+		delete(shard.entries, key)
+		p.behaviorKeys.Add(-1)
+		b = nil
 	}
+	if b == nil {
+		b = p.newBehaviorLocked(shard, now)
+		if b != nil {
+			shard.entries[key] = b
+		} else {
+			// When all bounded state slots are occupied by live keys, new keys
+			// still receive stateless UA/header scoring and are not remembered.
+			b = &behavior{windowStart: now, lastSeen: now}
+		}
+	}
+	b.lastSeen = now
 	b.count++
 	if now.Sub(b.windowStart) >= 10*time.Second || now.Before(b.windowStart) {
 		b.windowStart, b.windowCount = now, 0
@@ -76,7 +99,7 @@ func (p *Phase) Handle(c *reqctx.RequestCtx) reqctx.Decision {
 	}
 	validCookie := c.Site.Entitlements.BotJSChallenge && p.Challenges != nil && p.Challenges.ValidCookie(c.Cookie(VerificationCookie), c.Site.ID, c.Header("User-Agent"), c.ClientIP, now)
 	count, nf, seq, rate, staticCount := b.count, b.notFound, b.sequential, b.windowCount, b.staticCount
-	p.mu.Unlock()
+	shard.mu.Unlock()
 	score := 0
 	ua := strings.ToLower(c.Header("User-Agent"))
 	switch {
@@ -154,18 +177,51 @@ func (p *Phase) RecordResponse(siteID string, ip net.IP, path string, status int
 		return
 	}
 	key := siteID + "|" + ip.String()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if b := p.behavior[key]; b != nil {
+	shard := p.shard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if b := shard.entries[key]; b != nil {
+		if p.now().Sub(b.lastSeen) >= behaviorTTL {
+			delete(shard.entries, key)
+			p.behaviorKeys.Add(-1)
+			return
+		}
 		b.notFound++
 	}
 }
-func (p *Phase) evictOneLocked() {
-	for k := range p.behavior {
-		delete(p.behavior, k)
-		return
+
+func (p *Phase) shard(key string) *behaviorShard {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h = (h ^ uint32(key[i])) * 16777619
+	}
+	return &p.behavior[int(h%uint32(len(p.behavior)))]
+}
+
+func (p *Phase) newBehaviorLocked(shard *behaviorShard, now time.Time) *behavior {
+	if int(p.behaviorKeys.Load()) >= p.maxKeys {
+		for key, existing := range shard.entries {
+			if now.Sub(existing.lastSeen) >= behaviorTTL {
+				delete(shard.entries, key)
+				p.behaviorKeys.Add(-1)
+			}
+		}
+	}
+	for {
+		current := p.behaviorKeys.Load()
+		if current >= int64(p.maxKeys) {
+			return nil
+		}
+		if p.behaviorKeys.CompareAndSwap(current, current+1) {
+			return &behavior{windowStart: now, lastSeen: now}
+		}
 	}
 }
+
+func (p *Phase) BehaviorKeyCount() int {
+	return int(p.behaviorKeys.Load())
+}
+
 func pathSequence(a, b string) bool {
 	if a == "" || len(a) > 120 || len(b) > 120 {
 		return false

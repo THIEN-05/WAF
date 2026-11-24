@@ -237,6 +237,34 @@ func TestFakeGeoResolverAndMMDBOpenErrors(t *testing.T) {
 	}
 }
 
+func TestMMDBFilesWhenOperatorDatabasesAreConfigured(t *testing.T) {
+	countryPath := os.Getenv("EDGE_GEOIP_COUNTRY_MMDB")
+	asnPath := os.Getenv("EDGE_GEOIP_ASN_MMDB")
+	if countryPath == "" && asnPath == "" {
+		t.Skip("set EDGE_GEOIP_COUNTRY_MMDB and/or EDGE_GEOIP_ASN_MMDB to run with licensed GeoLite2 files")
+	}
+	for _, path := range []string{countryPath, asnPath} {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Skipf("configured MMDB file is unavailable at %q: %v", path, err)
+		}
+	}
+	resolver, err := OpenMMDB(countryPath, asnPath)
+	if err != nil {
+		t.Fatalf("open configured MMDB files: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := resolver.Close(); err != nil {
+			t.Errorf("close MMDB resolver: %v", err)
+		}
+	})
+	if _, err = resolver.Resolve(net.ParseIP("1.1.1.1")); err != nil {
+		t.Fatalf("lookup using configured MMDB files: %v", err)
+	}
+}
+
 func newAccessContext(site wafcore.Site, clientIP string) *reqctx.RequestCtx {
 	return &reqctx.RequestCtx{Site: &site, ClientIP: net.ParseIP(clientIP)}
 }

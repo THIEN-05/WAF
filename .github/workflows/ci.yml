@@ -16,6 +16,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Check Go formatting and module metadata
+        run: |
+          gofmt -w $(git ls-files '*.go')
+          go mod tidy
+          git diff --exit-code
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.15.0

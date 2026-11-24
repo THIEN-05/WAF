@@ -50,16 +50,51 @@ type verifiedCookie struct {
 	Expires int64  `json:"e"`
 }
 type ChallengeManager struct {
-	keysMu  sync.RWMutex
-	keys    KeyRing
-	mu      sync.Mutex
-	used    map[string]time.Time
-	maxUsed int
-	now     func() time.Time
+	keysMu          sync.RWMutex
+	keys            KeyRing
+	mu              sync.Mutex
+	used            map[string]time.Time
+	maxUsed         int
+	verifyBuckets   map[string]verifyBucket
+	verifyOps       uint64
+	maxVerifyKeys   int
+	verifyRate      int
+	verifyWindow    time.Duration
+	verifyBodyLimit int64
+	verifyTimeout   time.Duration
+	now             func() time.Time
+}
+
+type verifyBucket struct {
+	window time.Time
+	count  int
 }
 
 func NewChallengeManager(keys KeyRing) *ChallengeManager {
-	return &ChallengeManager{keys: keys, used: map[string]time.Time{}, maxUsed: 100_000, now: time.Now}
+	return &ChallengeManager{keys: keys, used: map[string]time.Time{}, maxUsed: 100_000, verifyBuckets: map[string]verifyBucket{}, maxVerifyKeys: 10_000, verifyRate: 20, verifyWindow: time.Minute, verifyBodyLimit: 8 << 10, verifyTimeout: time.Second, now: time.Now}
+}
+
+func (m *ChallengeManager) ConfigureVerifyLimits(rate int, window time.Duration, maxIPs int, bodyLimit int64, timeout time.Duration) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rate > 0 {
+		m.verifyRate = rate
+	}
+	if window > 0 {
+		m.verifyWindow = window
+	}
+	if maxIPs > 0 {
+		m.maxVerifyKeys = maxIPs
+	}
+	if bodyLimit > 0 {
+		m.verifyBodyLimit = bodyLimit
+	}
+	if timeout > 0 {
+		m.verifyTimeout = timeout
+	}
 }
 func (m *ChallengeManager) SetKeyRing(keys KeyRing) {
 	if m == nil {
@@ -259,25 +294,50 @@ func FindNonce(ticket string, difficulty int) string {
 }
 
 func (m *ChallengeManager) ServeVerify(w http.ResponseWriter, r *http.Request, site string, ip net.IP, ua string) {
-	m.ServeVerifyKey(w, r, site, "", ip, ua)
+	m.ServeVerifyRequestID(w, r, site, "", ip, ua, "")
 }
 func (m *ChallengeManager) ServeVerifyKey(w http.ResponseWriter, r *http.Request, site, keyID string, ip net.IP, ua string) {
+	m.ServeVerifyRequestID(w, r, site, keyID, ip, ua, "")
+}
+func (m *ChallengeManager) ServeVerifyRequestID(w http.ResponseWriter, r *http.Request, site, keyID string, ip net.IP, ua, requestID string) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		verifyError(w, http.StatusMethodNotAllowed, "method_not_allowed", requestID)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if ip == nil || !m.allowVerify(ip.String(), m.now()) {
+		verifyError(w, http.StatusTooManyRequests, "rate_limited", requestID)
+		return
+	}
+	verifyDeadline := time.Now().Add(m.verifyTimeout)
+	if m.verifyTimeout > 0 {
+		_ = http.NewResponseController(w).SetReadDeadline(verifyDeadline)
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, m.verifyBodyLimit)
 	var body struct {
 		Token string `json:"token"`
 		Nonce string `json:"nonce"`
 	}
-	if json.NewDecoder(r.Body).Decode(&body) != nil {
-		http.Error(w, "invalid proof", http.StatusBadRequest)
+	decodeErr := json.NewDecoder(r.Body).Decode(&body)
+	if decodeErr != nil {
+		var timeout net.Error
+		if errors.As(decodeErr, &timeout) && timeout.Timeout() {
+			verifyError(w, http.StatusRequestTimeout, "body_timeout", requestID)
+			return
+		}
+		verifyError(w, http.StatusBadRequest, "invalid_proof", requestID)
+		return
+	}
+	if m.verifyTimeout > 0 && time.Now().After(verifyDeadline) {
+		verifyError(w, http.StatusRequestTimeout, "body_timeout", requestID)
 		return
 	}
 	value, err := m.VerifyForKey(body.Token, body.Nonce, site, ua, ip, keyID, m.now())
+	if m.verifyTimeout > 0 && time.Now().After(verifyDeadline) {
+		verifyError(w, http.StatusRequestTimeout, "proof_timeout", requestID)
+		return
+	}
 	if err != nil {
-		http.Error(w, "invalid proof", http.StatusForbidden)
+		verifyError(w, http.StatusForbidden, "invalid_proof", requestID)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: VerificationCookie, Value: value, Path: "/", MaxAge: 1800, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
@@ -286,7 +346,78 @@ func (m *ChallengeManager) ServeVerifyKey(w http.ResponseWriter, r *http.Request
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func (m *ChallengeManager) allowVerify(ip string, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.verifyOps++
+	if m.verifyOps%128 == 0 {
+		for key, bucket := range m.verifyBuckets {
+			if now.Sub(bucket.window) >= m.verifyWindow || now.Before(bucket.window) {
+				delete(m.verifyBuckets, key)
+			}
+		}
+	}
+	b, ok := m.verifyBuckets[ip]
+	if !ok {
+		if len(m.verifyBuckets) >= m.maxVerifyKeys {
+			return false
+		}
+		b.window = now
+	}
+	if now.Sub(b.window) >= m.verifyWindow || now.Before(b.window) {
+		b = verifyBucket{window: now}
+	}
+	if b.count >= m.verifyRate {
+		return false
+	}
+	b.count++
+	m.verifyBuckets[ip] = b
+	return true
+}
+
+func verifyError(w http.ResponseWriter, status int, code, requestID string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if requestID != "" {
+		w.Header().Set("X-Request-ID", requestID)
+	}
+	w.WriteHeader(status)
+	if requestID == "" {
+		_, _ = fmt.Fprintf(w, `{"error":%q}`, code)
+		return
+	}
+	_, _ = fmt.Fprintf(w, `{"error":%q,"request_id":%q}`, code, requestID)
+}
+
+func IsHTMLNavigation(r *http.Request) bool {
+	if r == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Requested-With")), "XMLHttpRequest") {
+		return false
+	}
+	mode := strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode"))
+	if mode != "" && !strings.EqualFold(mode, "navigate") {
+		return false
+	}
+	for _, media := range strings.Split(r.Header.Get("Accept"), ",") {
+		if strings.EqualFold(strings.TrimSpace(strings.SplitN(media, ";", 2)[0]), "text/html") {
+			return true
+		}
+	}
+	return false
+}
 func ChallengePage(w http.ResponseWriter, token string) {
+	challengePage(w, token, false)
+}
+
+func ChallengePageForRequest(w http.ResponseWriter, r *http.Request, token string) {
+	challengePage(w, token, r != nil && r.Method == http.MethodHead)
+}
+
+func challengePage(w http.ResponseWriter, token string, head bool) {
 	var nonceBytes [16]byte
 	if _, err := rand.Read(nonceBytes[:]); err != nil {
 		http.Error(w, "challenge unavailable", http.StatusServiceUnavailable)
@@ -298,6 +429,9 @@ func ChallengePage(w http.ResponseWriter, token string) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'nonce-"+nonce+"'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.WriteHeader(http.StatusForbidden)
+	if head {
+		return
+	}
 	encoded, _ := json.Marshal(token)
 	_, _ = fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>Checking browser</title><p>Checking your browser…</p><script nonce="%s">(()=>{const token=%s,difficulty=%d;let n=0;async function run(){while(true){const bytes=new TextEncoder().encode(token+"."+n++),h=new Uint8Array(await crypto.subtle.digest("SHA-256",bytes));let z=0;for(const b of h){if(!b){z+=8;continue}for(let m=128;(b&m)===0;m>>=1)z++;break}if(z>=difficulty){await fetch("/__waf/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token,nonce:String(n-1)})});location.reload();return}if(n%%512===0)await new Promise(requestAnimationFrame)}}run()})()</script>`, nonce, encoded, extractDifficulty(token))
 }

@@ -1,5 +1,17 @@
 # Benchmark
 
+## Gate G microbenchmarks — 2026-11-24
+
+Measured in WSL Ubuntu/Linux amd64, Go 1.26.11, Intel Core i5-11400H @ 2.70 GHz, GOMAXPROCS=12, `-benchtime=1000x -benchmem`:
+
+| Benchmark | ns/op | B/op | allocs/op |
+| --- | ---: | ---: | ---: |
+| `BenchmarkAccessCheck` | 200.7 | 17 | 1 |
+| `BenchmarkRateLimitAllow` | 901.2 | 298 | 7 |
+| `BenchmarkWAF` | 6,986 | 6,191 | 26 |
+
+Commands: `go test -run '^$' -bench '^BenchmarkAccessCheck$' -benchtime=1000x -benchmem ./edge/internal/access`; analogous command with `BenchmarkRateLimitAllow` in `./edge/internal/ratelimit` and `BenchmarkWAF` in `./edge/internal/waf`. The WAF benchmark fixture includes the required `owasp-sqli` tag. Historical benchmark entries below measured on Windows are retained for traceability and are **Windows, not performance evidence**; use Linux/WSL measurements for current comparisons.
+
 ## P4e — toàn phạm vi package, cửa sổ regex và deadline body — 2026-11-24
 
 Đo trên WSL Ubuntu/Linux amd64, Go 1.26.11, Intel Core i5-11400H @ 2.70 GHz; `-benchtime=100x -benchmem`. Mỗi body benchmark đặt đúng gói/cap 8/64/256 KiB; WAF budget 2 ms. `budget-exceeded-%` là tỷ lệ request mà WAF phát hiện vượt ngân sách và phát `waf_budget_exceeded`; Free áp dụng fail-open, Pro/Enterprise áp dụng fail-closed. Đây là trạng thái/hành vi khi p99 vượt 2 ms, không tuyên bố giới hạn wall-clock cứng.
@@ -19,11 +31,28 @@
 
 Lệnh đo: `go test -run '^$' -bench '^BenchmarkWAFWorstCase$' -benchtime=100x -benchmem ./edge/internal/waf`.
 
-Đo tải nhẹ song song: test `TestWAFParallel50ReportsP99AndBudgetAction` chạy 50 goroutine × 5 request JSON 8 KiB. WSL/Linux ghi p50 **2,090,501 ns**, p99 **22,048,227 ns**, budget vượt **250/250**. Các request dùng plan Enterprise/fail-closed và test xác nhận cả 250 đều trả decision block có `waf_budget_exceeded`; scheduler/CPU contention làm latency request tổng cao hơn 2 ms, nên đây không phải hard real-time guarantee.
+Đo tải nhẹ song song P4e: `TestWAFParallel50ReportsP99AndBudgetAction` chạy 50 goroutine × 5 request JSON 8 KiB, p50 **2,090,501 ns**, p99 **22,048,227 ns**, và **250/250** chạm ngân sách 2 ms do đồng hồ tường bao gồm scheduler wait. Đây là baseline cũ; benchmark P4f thay chính sách budget.
 
 FPR body lớn: test 30 mẫu sạch cho mỗi paranoia (JSON, form, text, multipart) ghi **0/30 (0.00%)** ở P1, P2, P3 và P4. Ngưỡng test cố định 0%; nếu body vượt cap, đó là trường hợp thiếu quan sát được báo riêng bằng `waf_body_truncated`, không tính là mẫu sạch đầy đủ.
 
-Thay đổi thuật toán: Aho-Corasick quét cả phạm vi body theo block 4 KiB, overlap 512 byte; các vùng keyword chồng lấn được gộp rồi tách thành cửa sổ regex ≤512 byte. Tối đa 128 cửa sổ/request, giữ 64 đầu + 64 cuối; khi bị cắt, gắn scan/body truncated và áp fail mode. Khử trùng keyword Aho và yêu cầu biên từ cho tiền lọc chữ-số dài tối đa 3 ký tự để từ phổ biến như `or` trong `ordinary` không tạo cửa sổ giả. Test bypass bao phủ 64 trường hợp path/query/header/cookie/form/JSON/XML/multipart, padding 1/2/8/60 KiB, vị trí giữa/cuối; test riêng chứng minh phần cuối vẫn được quét sau khi K cửa sổ đã đầy.
+Thay đổi thuật toán: Aho-Corasick quét phạm vi theo gói theo block 4 KiB với overlap 512 byte; regex RE2 chạy trên cửa sổ tối đa 512 byte quanh keyword. **Chỉ candidate windows trong byte đã buffer** có thể giữ đầu/cuối; khi body vượt entitlement, edge chỉ buffer prefix và không đọc tail, gắn `waf_body_truncated`, cộng mặc định 3 điểm, rồi áp fail mode. Free fail-open có padding bypass risk ở body tail; xem mitigations trong DECISIONS.
+
+## P4f — deterministic WAF budget and overload
+
+Plan work caps: Free 128 KiB / 256 normalize block steps / 128 regex windows; Pro 256 KiB / 512 / 192; Business 384 KiB / 768 / 256; Enterprise 512 KiB / 1,024 / 384. `budget_ms` is a coarse wall fuse (default 100 ms, configurable 1–5,000); while active WAF work exceeds GOMAXPROCS, the threshold scales with the estimated runnable backlog and is capped at 5 s. Only effective fuse trips emit `waf_budget_exceeded`. Work-cap events emit `waf_work_exhausted` and truncation tags. Overload tiers use runnable-backlog proxy, WAF phase EWMA, and a rolling 64-request fuse ratio; `Phase.Metrics()` and audit counters expose tier activity.
+
+Measured on WSL Ubuntu/Linux amd64, Go 1.26.11, Intel i5-11400H (6 cores/12 logical CPUs), GOMAXPROCS=12; command `go test ./edge/internal/waf -run '^$' -bench '^BenchmarkWAFLoadMatrix$' -benchtime=200x -benchmem`. Each cell runs 200 requests; p50/p99 and work/fuse rates are per-request samples; allocs/op is Go benchmark allocation per request. The table shows min–max over the 12 combinations of body 8/64/256 KiB and repeated-Aho, deep-JSON, multipart, and 200-query-parameter shapes:
+
+| Goroutines | p50 ns | p99 ns | allocs/op | work-cap % | fuse % |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 460,845–38,778,809 | 1,008,564–45,479,975 | 59–2,454 | 0–100 | 0 |
+| 10 | 1,726,275–84,023,832 | 3,202,801–101,019,255 | 62–2,462 | 0–100 | 0–4.5 |
+| 50 | 2,550,293–307,082,113 | 27,030,867–1,176,596,897 | 63–2,443 | 0–100 | 0–7.0 |
+| 200 | 17,999,359–1,043,977,640 | 33,467,356–1,602,541,791 | 64–2,424 | 0–98.5 | 0–9.0 |
+
+These are broad scenario ranges, not a service-level guarantee. High-concurrency worst-case requests still have p99 above one second and a nonzero fuse rate; work-cap rates reach 100% for some cases. That confirms bounded fail-mode behavior remains a risk for paid fail-closed sites with large valid requests. The regression test separately covers 50 concurrent 8 KiB traffic: default fuse **0/250**, clean rejects **0/20**, prefix SQLi blocked **50/50**; p50 **6,061,300 ns**, p99 **63,354,000 ns**, GOMAXPROCS=12/12 CPUs. GOMAXPROCS 2/4/12 clean 50-goroutine test: fuse **0/250** and rejected clean requests **0/250** in each setting.
+
+Work-cap cases are marked incomplete and follow the configured fail mode; benchmark mode is monitor, so work-cap percentage does not itself mean those requests were blocked. Free defaults fail-open; closed paid plans may reject incomplete scans. Keeping the fuse default at 100 ms with a backlog-scaled ceiling (5 s) reduces scheduler-induced false trips but does not eliminate them, as measured above. Further calibration remains TODO P4f-1; do not claim a sub-2-ms p99 or zero fuse rate at 50/200 concurrency.
 
 Test loopback thật cho body chậm/treo/đứt giữa chừng PASS trong WSL Ubuntu; deadline đọc mặc định 1 giây làm handler kết thúc, paid fail-closed trả 403. `TestPerIPConnectionLimit` tiếp tục nằm trong suite listener và được xác minh cùng race suite. Test loopback chỉ chạy ngoài sandbox Windows.
 
@@ -237,3 +266,14 @@ Lệnh: `go test -count=1 -v ./edge/internal/waf -run TestManagedCorpusTPRFPR`. 
 Đây là độ đo trên bộ mẫu ngắn, tự viết để kiểm tra hồi quy; 100% không phải ước lượng tỷ lệ bắt được trên lưu lượng thực tế. Bộ sạch có các từ `select`, `union`, `drop`, tìm kiếm có dấu nháy, tên như `O'Neil`, JSON/form và đường dẫn hợp lệ. Các test né tránh bao gồm URL mã hóa kép, hoa/thường, comment SQL xen kẽ, whitespace lạ, NUL, Unicode và CL+TE.
 
 - TODO-1: so sánh cùng corpus với Coraza + OWASP CRS, ghi phiên bản CRS và TPR/FPR theo nhóm; cần tải/cài dependency từ mạng.
+## P5a — TLS fingerprint cost (WSL/Linux)
+
+Command: `go test -run '^$' -bench '^BenchmarkFingerprint(PeekAndCompute|ClientHello)$' -benchtime=1000x -benchmem ./edge/internal/listener`.
+Go 1.26.11, linux/amd64, Intel Core i5-11400H:
+
+| Benchmark | ns/op | B/op | allocs/op |
+| --- | ---: | ---: | ---: |
+| `BenchmarkFingerprintClientHello` (parser only) | 5,829 | 818 | 44 |
+| `BenchmarkFingerprintPeekAndCompute` (bounded read + fingerprint) | 9,854 | 4,068 | 94 |
+
+Measured on the small synthetic benchmark ClientHello used by the fixture builder; it is a parser/peek microbenchmark, not full TLS handshake throughput.

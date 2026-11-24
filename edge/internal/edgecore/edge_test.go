@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/wafplatform/edge/internal/access"
 	"github.com/example/wafplatform/edge/internal/bot"
 	"github.com/example/wafplatform/edge/internal/pipeline"
 	"github.com/example/wafplatform/edge/internal/proxy"
@@ -27,6 +28,20 @@ type panicPhase struct{}
 
 func (panicPhase) Name() string                              { return "panic-test" }
 func (panicPhase) Handle(*reqctx.RequestCtx) reqctx.Decision { panic("phase boom") }
+
+type challengePhase struct{}
+
+func (challengePhase) Name() string { return "rules" }
+func (challengePhase) Handle(*reqctx.RequestCtx) reqctx.Decision {
+	return reqctx.Decision{Action: reqctx.ActionChallenge, Phase: "rules", RuleID: "api-challenge"}
+}
+
+type rateLimitedPhase struct{}
+
+func (rateLimitedPhase) Name() string { return "ratelimit" }
+func (rateLimitedPhase) Handle(*reqctx.RequestCtx) reqctx.Decision {
+	return reqctx.Decision{Action: reqctx.ActionRateLimited, Phase: "ratelimit", RuleID: "api-limit", RetryAfter: time.Second}
+}
 func siteSnapshot(status, failMode, origin string, version uint64) *wafcore.Snapshot {
 	return &wafcore.Snapshot{SchemaVersion: 1, Version: version, GeneratedAt: time.Now(), Global: wafcore.GlobalConfig{ManagedRuleset: "test"}, Sites: []wafcore.Site{{ID: "site", TenantID: "tenant", Status: status, Plan: "pro", Domains: []string{"site.test"}, Origins: []wafcore.Origin{{URL: origin, Weight: 1}}, FailMode: failMode}}}
 }
@@ -44,6 +59,7 @@ func TestBotChallengeVerifyEndpointRequiresEntitlementAndRejectsReplay(t *testin
 	challengeReq := httptest.NewRequest(http.MethodGet, "http://site.test/private", nil)
 	challengeReq.Host, challengeReq.RemoteAddr = "site.test", "198.51.100.6:12345"
 	challengeReq.Header.Set("User-Agent", "curl/8.0")
+	challengeReq.Header.Set("Accept", "text/html")
 	challengeResp := httptest.NewRecorder()
 	e.ServeHTTP(challengeResp, challengeReq)
 	if challengeResp.Code != http.StatusForbidden || !strings.Contains(challengeResp.Body.String(), "/__waf/verify") {
@@ -92,6 +108,67 @@ func TestBotChallengeVerifyEndpointRequiresEntitlementAndRejectsReplay(t *testin
 	e.ServeHTTP(freeVerify, freeRequest)
 	if freeVerify.Code != http.StatusNotFound {
 		t.Fatalf("unentitled verification status=%d want 404", freeVerify.Code)
+	}
+}
+
+func TestBotChallengeUsesJSONForAPIClients(t *testing.T) {
+	snap := siteSnapshot("active", "closed", "http://127.0.0.1:8080", 1)
+	snap.Sites[0].Bot = wafcore.BotConfig{Mode: "challenge", Threshold: 1, ChallengeDifficulty: 8}
+	snap.Sites[0].Entitlements.BotJSChallenge = true
+	snap.Sites[0].Secrets.ChallengeHMACKeyID = "challenge-v1"
+	e := New(snap, "edge-api-challenge")
+	defer e.Close()
+	e.SetBotChallengeKeys(bot.StaticKeyRing{Active: "challenge-v1", Keys: map[string][]byte{"challenge-v1": []byte(strings.Repeat("k", 32))}})
+	for name, req := range map[string]*http.Request{
+		"post-json": httptest.NewRequest(http.MethodPost, "http://site.test/api", strings.NewReader(`{"x":1}`)),
+		"get-xhr": func() *http.Request {
+			r := httptest.NewRequest(http.MethodGet, "http://site.test/api", nil)
+			r.Header.Set("Accept", "text/html")
+			r.Header.Set("X-Requested-With", "XMLHttpRequest")
+			return r
+		}(),
+		"get-no-html": httptest.NewRequest(http.MethodGet, "http://site.test/api", nil),
+	} {
+		req.Host, req.RemoteAddr = "site.test", "198.51.100.6:12345"
+		req.Header.Set("User-Agent", "curl/8.0")
+		if name == "post-json" {
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+		}
+		rr := httptest.NewRecorder()
+		e.ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden || rr.Header().Get("Content-Type") != "application/json; charset=utf-8" || rr.Header().Get("X-Request-ID") == "" || !strings.Contains(rr.Body.String(), `"error":"challenge_required"`) || strings.Contains(rr.Body.String(), "<html") {
+			t.Errorf("%s challenge response status=%d headers=%v body=%q", name, rr.Code, rr.Header(), rr.Body.String())
+		}
+	}
+}
+
+func TestRuleChallengeUsesJSONForAPIClients(t *testing.T) {
+	e := New(siteSnapshot("active", "closed", "http://127.0.0.1:8080", 1), "edge-rule-api-challenge")
+	defer e.Close()
+	e.SetPipeline(pipeline.New(e.metrics, challengePhase{}))
+	r := httptest.NewRequest(http.MethodPost, "http://site.test/api", strings.NewReader(`{"x":1}`))
+	r.Host, r.RemoteAddr = "site.test", "198.51.100.7:12345"
+	r.Header.Set("Accept", "application/json")
+	r.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	e.ServeHTTP(rr, r)
+	if rr.Code != http.StatusForbidden || rr.Header().Get("Content-Type") != "application/json; charset=utf-8" || rr.Header().Get("X-Request-ID") == "" || !strings.Contains(rr.Body.String(), `"error":"challenge_required"`) {
+		t.Fatalf("API rule challenge status=%d headers=%v body=%q", rr.Code, rr.Header(), rr.Body.String())
+	}
+}
+
+func TestAPIRateLimitIsMachineReadable(t *testing.T) {
+	e := New(siteSnapshot("active", "closed", "http://127.0.0.1:8080", 1), "edge-api-rate-limit")
+	defer e.Close()
+	e.SetPipeline(pipeline.New(e.metrics, rateLimitedPhase{}))
+	r := httptest.NewRequest(http.MethodPost, "http://site.test/api", strings.NewReader(`{"x":1}`))
+	r.Host, r.RemoteAddr = "site.test", "198.51.100.9:12345"
+	r.Header.Set("Accept", "application/json")
+	rr := httptest.NewRecorder()
+	e.ServeHTTP(rr, r)
+	if rr.Code != http.StatusTooManyRequests || rr.Header().Get("Content-Type") != "application/json; charset=utf-8" || rr.Header().Get("Retry-After") != "1" || !strings.Contains(rr.Body.String(), `"error":"rate_limited"`) || !strings.Contains(rr.Body.String(), `"request_id":"`+rr.Header().Get("X-Request-ID")+`"`) {
+		t.Fatalf("API rate-limit response status=%d headers=%v body=%q", rr.Code, rr.Header(), rr.Body.String())
 	}
 }
 func localOrigin(t *testing.T, handler http.HandlerFunc) (*httptest.Server, string) {
@@ -223,6 +300,56 @@ func TestLoopbackSampleSnapshotServesThroughFakeOrigin(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "proto=HTTP/1.1") {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
+func TestLoopbackInspectedChunkedBodyTrailerAndExpectContinueReachOrigin(t *testing.T) {
+	origin, port := localOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "origin body read failed", http.StatusBadRequest)
+			return
+		}
+		_, _ = fmt.Fprintf(w, "body=%s trailer=%s", body, r.Trailer.Get("X-Checksum"))
+	})
+	defer origin.Close()
+	const target = "http://203.0.113.77:80"
+	pool := proxy.NewOriginPool([]wafcore.Origin{{URL: target, Weight: 1}}, "edge-test")
+	pool.SetResolver(func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.77")}, nil })
+	pool.SetDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
+		dialer := net.Dialer{}
+		return dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := reqctx.New(r, nil, "0123456789abcdef0123456789abcdef", net.ParseIP("192.0.2.8"))
+		defer reqctx.Release(ctx)
+		ctx.Site = &wafcore.Site{Origins: []wafcore.Origin{{URL: target, Weight: 1}}}
+		_ = ctx.BodyText()
+		pool.Serve(w, ctx)
+	}))
+	defer srv.Close()
+
+	const body = "ordinary chunked data"
+	request, err := http.NewRequest(http.MethodPost, srv.URL+"/submit", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "site.test"
+	request.ContentLength = -1
+	request.TransferEncoding = []string{"chunked"}
+	request.Trailer = http.Header{"X-Checksum": []string{"checksum-value"}}
+	request.Header.Set("Expect", "100-continue")
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("request with Expect: 100-continue failed: %v", err)
+	}
+	closeOnCleanup(t, resp.Body)
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || string(got) != "body="+body+" trailer=checksum-value" {
+		t.Fatalf("status=%d origin response=%q", resp.StatusCode, got)
 	}
 }
 
@@ -411,6 +538,65 @@ func TestUntrustedForwardedForDoesNotOverrideRemoteAddress(t *testing.T) {
 	if want := net.ParseIP("198.51.100.24"); !got.Equal(want) {
 		t.Fatalf("client IP=%v, want remote address %v despite spoofed X-Forwarded-For", got, want)
 	}
+}
+
+func TestUntrustedForwardingHeadersCannotBypassIPPolicies(t *testing.T) {
+	t.Run("allow-list cannot override blocked peer", func(t *testing.T) {
+		snapshot := siteSnapshot("active", "closed", "http://127.0.0.1:1", 1)
+		snapshot.Sites[0].Access = wafcore.AccessConfig{AllowIPs: []string{"203.0.113.0/24"}, BlockIPs: []string{"198.51.100.0/24"}}
+		e := New(snapshot, "edge-test")
+		req := httptest.NewRequest(http.MethodGet, "http://site.test/", nil)
+		req.RemoteAddr = "198.51.100.24:43122"
+		req.Header.Set("X-Forwarded-For", "203.0.113.99, 192.0.2.99")
+		req.Header.Set("Forwarded", "for=203.0.113.99")
+		rr := httptest.NewRecorder()
+		e.ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("spoofed XFF bypassed peer block: status=%d body=%q", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("geo policy uses peer address", func(t *testing.T) {
+		snapshot := siteSnapshot("active", "closed", "http://127.0.0.1:1", 1)
+		snapshot.Sites[0].Access.BlockCountries = []string{"US"}
+		e := New(snapshot, "edge-test")
+		e.SetGeoResolver(access.FakeGeoResolver{"198.51.100.24": {Country: "VN"}, "203.0.113.99": {Country: "US"}})
+		req := httptest.NewRequest(http.MethodGet, "http://site.test/", nil)
+		req.RemoteAddr = "198.51.100.24:43122"
+		req.Header.Set("X-Forwarded-For", "203.0.113.99")
+		rr := httptest.NewRecorder()
+		e.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("geo policy did not use transport peer (expected allow-to-origin 502), status=%d body=%q", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("rate limit key uses peer across changing XFF", func(t *testing.T) {
+		snapshot := siteSnapshot("active", "closed", "http://127.0.0.1:1", 1)
+		snapshot.Sites[0].RateLimits = []wafcore.RateLimit{{ID: "ip-limit", Match: "http.path starts_with '/'", Key: "ip", Limit: 1, WindowS: 60, Action: "throttle"}}
+		e := New(snapshot, "edge-test")
+		srv := httptest.NewServer(e)
+		defer srv.Close()
+		for i, spoof := range []string{"203.0.113.1", "203.0.113.2"} {
+			req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = "site.test"
+			req.Header.Set("X-Forwarded-For", spoof)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeOnCleanup(t, resp.Body)
+			if i == 0 && resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("first request status=%d, want origin attempt", resp.StatusCode)
+			}
+			if i == 1 && resp.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("changing spoofed XFF bypassed same-peer rate limit: status=%d", resp.StatusCode)
+			}
+		}
+	})
 }
 
 type hijackWriter struct {

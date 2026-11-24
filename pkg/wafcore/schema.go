@@ -97,10 +97,11 @@ type Origin struct {
 }
 
 type WAFConfig struct {
-	Mode               string         `json:"mode" yaml:"mode"`
-	Sensitivity        string         `json:"sensitivity" yaml:"sensitivity"`
-	BodyLimitKB        int            `json:"body_limit_kb" yaml:"body_limit_kb"`
-	Paranoia           int            `json:"paranoia,omitempty" yaml:"paranoia,omitempty"`
+	Mode        string `json:"mode" yaml:"mode"`
+	Sensitivity string `json:"sensitivity" yaml:"sensitivity"`
+	BodyLimitKB int    `json:"body_limit_kb" yaml:"body_limit_kb"`
+	Paranoia    int    `json:"paranoia,omitempty" yaml:"paranoia,omitempty"`
+	// BudgetMS configures the coarse WAF wall-clock fuse; deterministic work caps are plan-based.
 	BudgetMS           int            `json:"budget_ms,omitempty" yaml:"budget_ms,omitempty"`
 	ScanLimitBytes     int            `json:"scan_limit_bytes,omitempty" yaml:"scan_limit_bytes,omitempty"`
 	BodyReadTimeoutMS  int            `json:"body_read_timeout_ms,omitempty" yaml:"body_read_timeout_ms,omitempty"`
@@ -252,8 +253,8 @@ func (s Snapshot) Validate() error {
 		if site.WAF.Paranoia < 0 || site.WAF.Paranoia > 4 {
 			errs = append(errs, p+".waf.paranoia: must be between 1 and 4 when set")
 		}
-		if site.WAF.BudgetMS < 0 {
-			errs = append(errs, p+".waf.budget_ms: must not be negative")
+		if site.WAF.BudgetMS < 0 || site.WAF.BudgetMS > 5000 {
+			errs = append(errs, p+".waf.budget_ms: must be between 0 and 5000 ms")
 		}
 		if site.WAF.BodyReadTimeoutMS < 0 || site.WAF.BodyReadTimeoutMS > 30000 {
 			errs = append(errs, p+".waf.body_read_timeout_ms: must be between 0 and 30000")

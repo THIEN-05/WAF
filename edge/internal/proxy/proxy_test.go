@@ -140,6 +140,72 @@ func TestRetryOnlyGETAndHEADDialFailures(t *testing.T) {
 	}
 }
 
+func TestRetryTransportNeverRetriesAfterRequestBodyWasSent(t *testing.T) {
+	var calls atomic.Int32
+	rt := retryTransport{base: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		if _, err := io.ReadAll(r.Body); err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("synthetic late dial failure")}
+	}), attempts: 2}
+	request := httptest.NewRequest(http.MethodGet, "http://example.test", strings.NewReader("body"))
+	_, _ = rt.RoundTrip(request)
+	if calls.Load() != 1 {
+		t.Fatalf("calls=%d, want no retry after request body was sent", calls.Load())
+	}
+}
+
+func TestRetryTransportRetriesGetAndHeadOnlyForDialErrors(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			var calls atomic.Int32
+			rt := retryTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return nil, errors.New("response header failure")
+			}), attempts: 2}
+			_, _ = rt.RoundTrip(httptest.NewRequest(method, "http://example.test", nil))
+			if calls.Load() != 1 {
+				t.Fatalf("calls=%d; non-dial error must not retry", calls.Load())
+			}
+		})
+	}
+}
+
+func TestProxyErrorsCarryRequestIDAndDoNotReflectTransportDetails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		code int
+	}{
+		{name: "bad gateway", err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused: secret")}, code: http.StatusBadGateway},
+		{name: "gateway timeout", err: &net.OpError{Op: "dial", Net: "tcp", Err: timeoutTestError{}}, code: http.StatusGatewayTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://site.test/", nil)
+			ctx := reqctx.New(request, nil, "0123456789abcdef0123456789abcdef", net.ParseIP("192.0.2.4"))
+			ctx.Site = &wafcore.Site{Origins: []wafcore.Origin{{URL: "http://203.0.113.8:80", Weight: 1}}}
+			pool := NewOriginPool(ctx.Site.Origins, "edge")
+			pool.resolve = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.8")}, nil }
+			pool.dialIP = func(context.Context, string, string) (net.Conn, error) { return nil, tc.err }
+			rr := httptest.NewRecorder()
+			pool.Serve(rr, ctx)
+			if rr.Code != tc.code || rr.Header().Get("X-Request-ID") != ctx.RequestID {
+				t.Fatalf("status=%d request_id=%q, want %d and %q", rr.Code, rr.Header().Get("X-Request-ID"), tc.code, ctx.RequestID)
+			}
+			if strings.Contains(rr.Body.String(), "connection refused") || strings.Contains(rr.Body.String(), "secret") {
+				t.Fatalf("transport detail leaked to response: %q", rr.Body.String())
+			}
+		})
+	}
+}
+
+type timeoutTestError struct{}
+
+func (timeoutTestError) Error() string   { return "dial timeout secret" }
+func (timeoutTestError) Timeout() bool   { return true }
+func (timeoutTestError) Temporary() bool { return true }
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -356,7 +422,7 @@ func TestLoopbackSSEFlushesBeforeOriginCompletes(t *testing.T) {
 
 func TestLoopbackProxyRewritesForwardingHeaders(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, "xff=%s|xreal=%s|proto=%s|host=%s|id=%s|via=%s|fwdcustom=%s|hop=%s|connection=%s|originhost=%s", r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-IP"), r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Request-ID"), r.Header.Get("Via"), r.Header.Get("X-Forwarded-Custom"), r.Header.Get("X-Hop-Secret"), r.Header.Get("Connection"), r.Host)
+		_, _ = fmt.Fprintf(w, "xff=%s|xreal=%s|proto=%s|host=%s|id=%s|via=%s|forwarded=%s|fwdcustom=%s|hop=%s|connection=%s|keepalive=%s|proxyauth=%s|te=%s|originhost=%s", r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-IP"), r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Request-ID"), r.Header.Get("Via"), r.Header.Get("Forwarded"), r.Header.Get("X-Forwarded-Custom"), r.Header.Get("X-Hop-Secret"), r.Header.Get("Connection"), r.Header.Get("Keep-Alive"), r.Header.Get("Proxy-Authorization"), r.Header.Get("TE"), r.Host)
 	}))
 	defer origin.Close()
 	_, port, _ := net.SplitHostPort(strings.TrimPrefix(origin.URL, "http://"))
@@ -379,17 +445,22 @@ func TestLoopbackProxyRewritesForwardingHeaders(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "203.0.113.200")
 	req.Header.Set("X-Real-IP", "203.0.113.201")
 	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "evil.example")
 	req.Header.Set("X-Forwarded-Custom", "forged")
+	req.Header.Set("Forwarded", "for=203.0.113.200;host=evil.example;proto=https")
 	req.Header.Set("Via", "1.1 client-proxy")
 	req.Header.Set("Connection", "X-Hop-Secret")
 	req.Header.Set("X-Hop-Secret", "must-not-reach-origin")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Proxy-Authorization", "Basic client-secret")
+	req.Header.Set("TE", "trailers")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	closeOnCleanup(t, resp.Body)
 	body, _ := io.ReadAll(resp.Body)
-	for _, want := range []string{"xff=192.0.2.9", "xreal=", "proto=http", "host=original.test", "id=0123456789abcdef0123456789abcdef", "via=1.1 edge-node", "fwdcustom=", "hop=", "connection=", "originhost=origin-header.test"} {
+	for _, want := range []string{"xff=192.0.2.9", "xreal=", "proto=http", "host=original.test", "id=0123456789abcdef0123456789abcdef", "via=1.1 edge-node", "forwarded=", "fwdcustom=", "hop=", "connection=", "keepalive=", "proxyauth=", "te=", "originhost=origin-header.test"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("forwarded response %q missing %q", body, want)
 		}

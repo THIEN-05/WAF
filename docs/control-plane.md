@@ -398,6 +398,12 @@ Sau khi ghi thành công, phát sự kiện config.changed kèm tenant\_id, site
 
 **Kiểm thử**: contract test với edge thật dùng chung schema, snapshot hỏng, rollback, canary dừng giữa chừng, mất kết nối giữa chừng.
 
+### Hợp đồng schema snapshot dùng chung
+
+CP và edge dùng trực tiếp `pkg/wafcore.Snapshot`; `schema_version` hiện là 1. Snapshot cũ có thể bỏ các trường tùy chọn mới: chúng nhận zero value và các năng lực không bật mặc định. YAML/JSON decoder hiện bỏ qua trường chưa biết để edge cũ có thể đọc snapshot được mở rộng; CP vẫn phải xác thực và chỉ phát trường thuộc contract.
+
+Các trường được bổ sung trong quá trình P1–P5a (ngoài trường nền P1): `Entitlements.max_body_bytes`, `max_regex_bytes`, `max_counter_keys`, `bot_js_challenge`, `bot_captcha`, `verified_bots`; `Origin.host_header`; `WAF.paranoia`, `budget_ms`, `scan_limit_bytes`, `body_read_timeout_ms`, `truncated_body_score`, `exclusions[]` (`rule_id`, `path`, `param`); `RateLimit.algorithm`; `Rule.mode`, `policy`, `tag`, `phase`, `expires_at`; `Bot.challenge_difficulty`; `Secrets.challenge_hmac_key_id`, `origin_credential_ids`, `additional`; `Access.block_countries`, `block_asns`. P5a không thêm trường schema mới. Trường `expires_at` dùng RFC3339 thời gian; secret value không được đưa vào snapshot, chỉ có ID tham chiếu.
+
 ## ***5.9 Quản lý đội edge (Edge Fleet)***
 
 **Mục đích**: biết có những edge nào, khỏe hay không, và thêm/gỡ/cập nhật chúng một cách tự động (khớp mục 8.1 của tài liệu Data Plane).

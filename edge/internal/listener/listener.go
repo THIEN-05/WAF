@@ -67,6 +67,7 @@ func (c *CertCache) Get(host string) *tls.Certificate {
 type Config struct {
 	HTTPAddr, TLSAddr              string
 	ReadHeaderTimeout, IdleTimeout time.Duration
+	ClientHelloTimeout             time.Duration
 	MaxHeaderBytes, MaxPerIP       int
 	TrustedProxyCIDRs              []string
 	EnableProxyProtocol            bool
@@ -146,6 +147,9 @@ func Start(cfg Config, handler http.Handler) (*Servers, error) {
 	if cfg.IdleTimeout == 0 {
 		cfg.IdleTimeout = 90 * time.Second
 	}
+	if cfg.ClientHelloTimeout == 0 {
+		cfg.ClientHelloTimeout = 3 * time.Second
+	}
 	if cfg.MaxHeaderBytes == 0 {
 		cfg.MaxHeaderBytes = 48 << 10
 	}
@@ -188,7 +192,9 @@ func Start(cfg Config, handler http.Handler) (*Servers, error) {
 	}
 	servers := &Servers{HTTP: httpSrv, TLS: tlsSrv, limit: limiter, listeners: []net.Listener{httpLn, tlsLn}, HTTPAddr: httpLn.Addr().String(), TLSAddr: tlsLn.Addr().String()}
 	go func() { _ = httpSrv.Serve(httpLn) }()
-	go func() { _ = tlsSrv.Serve(tls.NewListener(helloCaptureListener{Listener: tlsLn}, tlsCfg)) }()
+	go func() {
+		_ = tlsSrv.Serve(tls.NewListener(helloCaptureListener{Listener: tlsLn, PeekTimeout: cfg.ClientHelloTimeout}, tlsCfg))
+	}()
 	return servers, nil
 }
 func (s *Servers) Shutdown(ctx context.Context) error {
@@ -279,43 +285,72 @@ type proxyProtocolListener struct {
 	trusted []*net.IPNet
 }
 
+const proxyProtocolV1MaxLine = 108
+
 func (l proxyProtocolListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
-	remote := net.ParseIP(host)
-	trusted := false
-	for _, n := range l.trusted {
-		if n.Contains(remote) {
-			trusted = true
-			break
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
 		}
+		host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+		remote := net.ParseIP(host)
+		trusted := false
+		for _, n := range l.trusted {
+			if n.Contains(remote) {
+				trusted = true
+				break
+			}
+		}
+		if !trusted {
+			return c, nil
+		}
+		parsed, parseErr := parseProxyProtocolV1(c)
+		if parseErr != nil {
+			// A malformed preamble must not turn one bad connection into a
+			// permanent http.Server.Serve accept failure.
+			_ = c.Close()
+			continue
+		}
+		return parsed, nil
 	}
-	if !trusted {
-		return c, nil
+}
+
+func parseProxyProtocolV1(c net.Conn) (net.Conn, error) {
+	if err := c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return nil, fmt.Errorf("set PROXY protocol read deadline: %w", err)
 	}
-	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
-	br := bufio.NewReader(c)
-	line, e := br.ReadString('\n')
-	_ = c.SetReadDeadline(time.Time{})
+	br := bufio.NewReaderSize(c, proxyProtocolV1MaxLine+1)
+	line, e := br.ReadSlice('\n')
+	clearErr := c.SetReadDeadline(time.Time{})
 	if e != nil {
 		return nil, e
 	}
-	fields := strings.Fields(line)
+	if clearErr != nil {
+		return nil, fmt.Errorf("clear PROXY protocol read deadline: %w", clearErr)
+	}
+	if len(line) > proxyProtocolV1MaxLine || !strings.HasSuffix(string(line), "\r\n") {
+		return nil, fmt.Errorf("invalid or oversized PROXY protocol v1 header")
+	}
+	fields := strings.Fields(string(line))
 	if len(fields) < 2 || fields[0] != "PROXY" {
 		return nil, fmt.Errorf("invalid PROXY protocol v1 header")
 	}
 	if fields[1] == "UNKNOWN" {
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("invalid PROXY UNKNOWN header")
+		}
 		return &bufferedConn{Conn: c, r: br}, nil
 	}
 	if len(fields) != 6 || (fields[1] != "TCP4" && fields[1] != "TCP6") {
 		return nil, fmt.Errorf("invalid PROXY protocol address")
 	}
 	src := net.ParseIP(fields[2])
+	dst := net.ParseIP(fields[3])
 	port, e := strconv.Atoi(fields[4])
-	if src == nil || e != nil {
+	dstPort, dstPortErr := strconv.Atoi(fields[5])
+	validFamily := src != nil && dst != nil && ((fields[1] == "TCP4" && src.To4() != nil && dst.To4() != nil) || (fields[1] == "TCP6" && src.To4() == nil && dst.To4() == nil))
+	if !validFamily || e != nil || dstPortErr != nil || port < 0 || port > 65535 || dstPort < 0 || dstPort > 65535 {
 		return nil, fmt.Errorf("invalid PROXY source")
 	}
 	return &proxyConn{bufferedConn: bufferedConn{Conn: c, r: br}, remote: &net.TCPAddr{IP: src, Port: port}}, nil

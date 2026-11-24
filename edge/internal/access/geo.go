@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 
 	"github.com/oschwald/maxminddb-golang"
@@ -38,10 +37,6 @@ func OpenMMDB(countryPath, asnPath string) (*MMDBResolver, error) {
 		r.country = reader
 	}
 	if asnPath != "" {
-		if countryPath != "" && sameFile(countryPath, asnPath) {
-			r.asn = r.country
-			return r, nil
-		}
 		reader, err := maxminddb.Open(asnPath)
 		if err != nil {
 			if closeErr := r.Close(); closeErr != nil {
@@ -52,12 +47,6 @@ func OpenMMDB(countryPath, asnPath string) (*MMDBResolver, error) {
 		r.asn = reader
 	}
 	return r, nil
-}
-
-func sameFile(left, right string) bool {
-	leftInfo, leftErr := os.Stat(left)
-	rightInfo, rightErr := os.Stat(right)
-	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
 }
 
 func (r *MMDBResolver) Resolve(ip net.IP) (GeoInfo, error) {

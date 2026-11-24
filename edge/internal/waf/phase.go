@@ -2,11 +2,15 @@ package waf
 
 import (
 	"fmt"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/wafplatform/edge/internal/reqctx"
@@ -35,12 +39,59 @@ const (
 	maxQueryParams          = 200
 	scanChunkBytes          = 4096
 	scanChunkOverlap        = maxRegexWindowBytes
+	defaultFuse             = 100 * time.Millisecond
+	maxFuse                 = 5 * time.Second
 )
 
+type workLimit struct {
+	bytes, normalizeSteps, regexWindows int
+}
+
+type workMeter struct {
+	limit                               workLimit
+	bytes, normalizeSteps, regexWindows int
+}
+
+func planWorkLimit(plan string) workLimit {
+	switch strings.ToLower(plan) {
+	case "pro":
+		return workLimit{256 * 1024, 512, 192}
+	case "business":
+		return workLimit{384 * 1024, 768, 256}
+	case "enterprise":
+		return workLimit{512 * 1024, 1024, 384}
+	default:
+		return workLimit{128 * 1024, 256, 128}
+	}
+}
+
 type Phase struct {
-	rules     []compiledRule
-	prefilter *automaton
-	now       func() time.Time
+	rules       []compiledRule
+	prefilter   *automaton
+	now         func() time.Time
+	active      atomic.Int64
+	requests    atomic.Uint64
+	fuses       atomic.Uint64
+	workCaps    atomic.Uint64
+	degrade1    atomic.Uint64
+	degrade2    atomic.Uint64
+	degrade3    atomic.Uint64
+	lastLevel   atomic.Int64
+	ewmaNanos   atomic.Int64
+	lastTierLog atomic.Int64
+	outcomeMu   sync.Mutex
+	outcomes    [64]bool
+	outcomeN    int
+	outcomeAt   int
+}
+
+type OverloadMetrics struct {
+	Active, EWMAWAFNanos                                               int64
+	Requests, FuseTrips, WorkCaps, DropParanoia, ReduceScope, FailMode uint64
+}
+
+func (p *Phase) Metrics() OverloadMetrics {
+	return OverloadMetrics{Active: p.active.Load(), EWMAWAFNanos: p.ewmaNanos.Load(), Requests: p.requests.Load(), FuseTrips: p.fuses.Load(), WorkCaps: p.workCaps.Load(), DropParanoia: p.degrade1.Load(), ReduceScope: p.degrade2.Load(), FailMode: p.degrade3.Load()}
 }
 
 func NewPhase(rules []Rule, now func() time.Time) (*Phase, error) {
@@ -56,7 +107,25 @@ func NewPhase(rules []Rule, now func() time.Time) (*Phase, error) {
 
 func (p *Phase) Name() string { return "waf" }
 
-func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
+func (p *Phase) Handle(ctx *reqctx.RequestCtx) (decision reqctx.Decision) {
+	phaseStarted := time.Now()
+	active := p.active.Add(1)
+	defer func() {
+		sample := time.Since(phaseStarted).Nanoseconds()
+		old := p.ewmaNanos.Load()
+		for !p.ewmaNanos.CompareAndSwap(old, (old*7+sample)/8) {
+			old = p.ewmaNanos.Load()
+		}
+		p.active.Add(-1)
+		p.outcomeMu.Lock()
+		p.outcomes[p.outcomeAt] = hasString(decision.Tags, "waf_budget_exceeded")
+		p.outcomeAt = (p.outcomeAt + 1) % len(p.outcomes)
+		if p.outcomeN < len(p.outcomes) {
+			p.outcomeN++
+		}
+		p.outcomeMu.Unlock()
+	}()
+	p.requests.Add(1)
 	if ctx.Site == nil {
 		return wafDecision(reqctx.ActionAllow, "waf_no_site", 0, "no routed site", nil)
 	}
@@ -69,16 +138,49 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 	if paranoia == 0 {
 		paranoia = 1
 	}
-	budget := 2 * time.Millisecond
+	level := int64(0)
+	procs := int64(max(1, runtime.GOMAXPROCS(0)))
+	if active-procs >= procs {
+		level = 1
+	}
+	if active-procs >= 4*procs {
+		level = 2
+	}
+	requests, fuseTrips := p.recentFuseRatio()
+	level = overloadTier(active, procs, p.ewmaNanos.Load(), fuseTrips, requests, level)
+	if prev := p.lastLevel.Swap(level); prev != level {
+		nowLog := time.Now().UnixNano()
+		last := p.lastTierLog.Load()
+		if nowLog-last > 100_000_000 && p.lastTierLog.CompareAndSwap(last, nowLog) {
+			log.Printf("waf overload tier changed: level=%d active=%d estimated_runnable_queue=%d ewma_ns=%d fuse_ratio=%.3f", level, active, max(int64(0), active-procs), p.ewmaNanos.Load(), fuseTrips)
+		}
+	}
+	if level >= 3 {
+		p.degrade3.Add(1)
+		ctx.AddTag("waf_degraded_fail_mode")
+		if effectiveFailMode(ctx) == "closed" {
+			return wafDecision(reqctx.ActionBlock, "waf_overload", 0, "persistent WAF fuse ratio; fail closed", ctx.Tags())
+		}
+		return wafDecision(reqctx.ActionAllow, "waf_overload", 0, "persistent WAF fuse ratio; fail open", ctx.Tags())
+	}
+	if level >= 1 && paranoia > 1 {
+		paranoia = 1
+		p.degrade1.Add(1)
+		ctx.AddTag("waf_degraded_paranoia")
+	}
+	fuse := defaultFuse
 	if ctx.Site.WAF.BudgetMS > 0 {
-		budget = time.Duration(ctx.Site.WAF.BudgetMS) * time.Millisecond
+		fuse = time.Duration(ctx.Site.WAF.BudgetMS) * time.Millisecond
+		if fuse > maxFuse {
+			fuse = maxFuse
+		}
 	}
 	started := p.now()
-	if p.overBudget(started, budget) {
+	if p.overFuse(started, fuse) {
 		return p.budgetFailure(ctx, 0, "WAF request budget exceeded")
 	}
 	if err := ctx.BodyReadError(); err != nil {
-		return p.budgetFailure(ctx, 0, "request body read failed: "+err.Error())
+		return p.bodyReadFailure(ctx, 0, "request body read failed: "+err.Error())
 	}
 	needBody := false
 	for _, rule := range p.rules {
@@ -93,7 +195,19 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 	if configured := ctx.Site.WAF.ScanLimitBytes; configured > 0 && configured < maxRequestScanBytes {
 		maxBytes = configured
 	}
+	work := workMeter{limit: planWorkLimit(ctx.Site.Plan)}
+	if level >= 2 {
+		work.limit.bytes /= 2
+		work.limit.normalizeSteps /= 2
+		work.limit.regexWindows /= 2
+		p.degrade2.Add(1)
+		ctx.AddTag("waf_degraded_scope")
+	}
+	if work.limit.bytes < maxBytes {
+		maxBytes = work.limit.bytes
+	}
 	remaining := maxBytes
+	workTruncated := false
 	matched := make(map[string]struct{})
 	firstMatchedRule := ""
 	score := 0
@@ -134,15 +248,12 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 		}
 	}
 	evaluate := func(target scanTarget, candidate string) (reqctx.Decision, bool) {
-		if p.overBudget(started, budget) {
-			return p.budgetFailure(ctx, score, "WAF request budget exceeded between regex windows"), true
+		if p.overFuse(started, fuse) {
+			return p.budgetFailure(ctx, score, "WAF request fuse exceeded between regex windows"), true
 		}
 		found := make(map[string]struct{})
 		p.prefilter.scan(candidate, found)
-		for ruleIndex, rule := range p.rules {
-			if ruleIndex%4 == 0 && p.overBudget(started, budget) {
-				return p.budgetFailure(ctx, score, "WAF request budget exceeded between rule groups"), true
-			}
+		for _, rule := range p.rules {
 			if rule.rule.Paranoia > paranoia || !containsTarget(rule.rule.Targets, target.kind) || excluded(ctx.Site.WAF.Exclusions, rule.rule.ID, ctx.Path, target.param) {
 				continue
 			}
@@ -175,8 +286,8 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 	requestWindowCount := 0
 	var deferredTail []queuedRegexCandidate
 	for _, target := range targets {
-		if p.overBudget(started, budget) {
-			return p.budgetFailure(ctx, score, "WAF request budget exceeded")
+		if p.overFuse(started, fuse) {
+			return p.budgetFailure(ctx, score, "WAF request fuse exceeded")
 		}
 		if target.kind == "body" {
 			if ctx.Request == nil || !supportedBodyType(ctx.Request.Header.Get("Content-Type")) {
@@ -196,13 +307,13 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 			}
 			target.raw = ctx.BodyPrefix(limit)
 			if err := ctx.BodyReadError(); err != nil {
-				return p.budgetFailure(ctx, score, "request body read failed: "+err.Error())
+				return p.bodyReadFailure(ctx, score, "request body read failed: "+err.Error())
 			}
 			if ctx.BodyTruncated() {
 				markBodyTruncated()
 			}
-			if p.overBudget(started, budget) {
-				return p.budgetFailure(ctx, score, "WAF request budget exceeded while buffering body prefix")
+			if p.overFuse(started, fuse) {
+				return p.budgetFailure(ctx, score, "WAF request fuse exceeded while buffering body prefix")
 			}
 		}
 		if len(target.raw) > maxTargetScanBytes {
@@ -219,16 +330,36 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 				markBodyTruncated()
 			}
 		}
+		if len(target.raw) > work.limit.bytes-work.bytes {
+			workTruncated = true
+			target.raw = sampleHeadTail(target.raw, max(0, work.limit.bytes-work.bytes))
+			markScanTruncated()
+			if target.kind == "body" {
+				markBodyTruncated()
+			}
+		}
+		work.bytes += len(target.raw)
 		remaining -= len(target.raw)
 		if target.raw == "" {
 			continue
 		}
 		var headCandidates, tailCandidates []regexCandidate
 		targetWindowCount := 0
-		for _, rawChunk := range scanChunks(target.raw, target.kind == "body") {
-			normalized, ok := normalizeBounded(rawChunk, target.path, func() bool { return p.overBudget(started, budget) })
+		chunks := scanChunks(target.raw, target.kind == "body")
+		chunks = prioritizeHeadTail(chunks)
+		for _, rawChunk := range chunks {
+			if work.normalizeSteps >= work.limit.normalizeSteps || p.overFuse(started, fuse) {
+				workTruncated = work.normalizeSteps >= work.limit.normalizeSteps
+				markScanTruncated()
+				if target.kind == "body" {
+					markBodyTruncated()
+				}
+				break
+			}
+			work.normalizeSteps++
+			normalized, ok := normalizeBounded(rawChunk, target.path, func() bool { return p.overFuse(started, fuse) })
 			if !ok {
-				return p.budgetFailure(ctx, score, "WAF request budget exceeded during normalization")
+				return p.budgetFailure(ctx, score, "WAF request fuse exceeded during normalization")
 			}
 			values := []string{rawChunk}
 			if normalized.Decoded != rawChunk {
@@ -244,33 +375,45 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 				values = append(values, "../")
 			}
 			for _, value := range values {
-				if p.overBudget(started, budget) {
-					return p.budgetFailure(ctx, score, "WAF request budget exceeded between normalization and rule evaluation")
+				if p.overFuse(started, fuse) {
+					return p.budgetFailure(ctx, score, "WAF request fuse exceeded between normalization and rule evaluation")
 				}
 				lowerValue := strings.ToLower(value)
 				var windows []scanWindow
 				var complete bool
+				remainingWindows := work.limit.regexWindows - work.regexWindows
+				if target.kind == "body" && remainingWindows > maxRegexWindowsPerRequest {
+					remainingWindows = maxRegexWindowsPerRequest
+				}
 				if hasUnfilteredRule(p.rules, target.kind, ctx.Site.WAF.Exclusions, ctx.Path) {
-					windows, complete = boundedWindows(len(lowerValue))
+					windows, complete = boundedWindowsLimit(len(lowerValue), remainingWindows)
 				} else {
-					windows, complete = p.prefilter.windows(lowerValue, func() bool { return p.overBudget(started, budget) })
+					windows, complete = p.prefilter.windowsLimit(lowerValue, remainingWindows, func() bool { return p.overFuse(started, fuse) })
 				}
 				if !complete {
+					workTruncated = true
 					markScanTruncated()
 					if target.kind == "body" {
 						markBodyTruncated()
 					}
 				}
 				for _, window := range windows {
+					if work.regexWindows >= work.limit.regexWindows {
+						workTruncated = true
+						complete = false
+						break
+					}
 					targetWindowCount++
+					work.regexWindows++
 					if targetWindowCount > maxRegexWindowsPerRequest {
+						workTruncated = true
 						markScanTruncated()
 						if target.kind == "body" {
 							markBodyTruncated()
 						}
 					}
-					if p.overBudget(started, budget) {
-						return p.budgetFailure(ctx, score, "WAF request budget exceeded during keyword scan")
+					if p.overFuse(started, fuse) {
+						return p.budgetFailure(ctx, score, "WAF request fuse exceeded during keyword scan")
 					}
 					start, end := min(window.start, len(lowerValue)), min(window.end, len(lowerValue))
 					if start > end {
@@ -320,6 +463,10 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 			return decision
 		}
 	}
+	if workTruncated {
+		ctx.AddTag("waf_work_exhausted")
+		p.workCaps.Add(1)
+	}
 	if bodyTruncated {
 		markBodyTruncated()
 		if effectiveFailMode(ctx) == "closed" {
@@ -334,13 +481,16 @@ func (p *Phase) Handle(ctx *reqctx.RequestCtx) reqctx.Decision {
 		}
 	}
 	if score == 0 && !inputTruncated {
-		return wafDecision(reqctx.ActionAllow, "waf_allow", 0, "no managed rule matched", nil)
+		return wafDecision(reqctx.ActionAllow, "waf_allow", 0, "no managed rule matched", ctx.Tags())
 	}
 	if mode == "monitor" {
 		return wafDecision(reqctx.ActionLogOnly, firstMatchedRule, score, "WAF monitor match or incomplete bounded scan", ctx.Tags())
 	}
 	if inputTruncated && firstMatchedRule == "" {
-		return p.budgetFailure(ctx, score, "WAF scan byte limit exceeded")
+		if effectiveFailMode(ctx) == "closed" {
+			return wafDecision(reqctx.ActionBlock, "waf_scan_truncated", score, "WAF deterministic work limit exceeded (fail closed)", ctx.Tags())
+		}
+		return wafDecision(reqctx.ActionAllow, "waf_scan_truncated", score, "WAF deterministic work limit exceeded (fail open)", ctx.Tags())
 	}
 	return wafDecision(reqctx.ActionAllow, firstMatchedRuleOrAllow(firstMatchedRule), score, fmt.Sprintf("WAF score %d below threshold %d", score, threshold), ctx.Tags())
 }
@@ -359,6 +509,25 @@ func scanChunks(raw string, body bool) []string {
 		}
 	}
 	return chunks
+}
+
+// prioritizeHeadTail lets the deterministic regex-window cap inspect both ends
+// of the bytes actually buffered before spending work on the middle.
+func prioritizeHeadTail(chunks []string) []string {
+	if len(chunks) < 3 {
+		return chunks
+	}
+	out := make([]string, 0, len(chunks))
+	left, right := 0, len(chunks)-1
+	for left <= right {
+		out = append(out, chunks[left])
+		left++
+		if left <= right {
+			out = append(out, chunks[right])
+			right--
+		}
+	}
+	return out
 }
 
 func sampleHeadTail(raw string, limit int) string {
@@ -385,7 +554,10 @@ func hasUnfilteredRule(rules []compiledRule, target string, exclusions []wafcore
 	return false
 }
 
-func boundedWindows(length int) ([]scanWindow, bool) {
+func boundedWindowsLimit(length, limit int) ([]scanWindow, bool) {
+	if limit < 0 {
+		limit = 0
+	}
 	if length <= 0 {
 		return nil, true
 	}
@@ -396,8 +568,11 @@ func boundedWindows(length int) ([]scanWindow, bool) {
 	for start := 0; start < length; start += maxRegexWindowBytes / 2 {
 		end := min(start+maxRegexWindowBytes, length)
 		out = append(out, scanWindow{start, end})
-		if len(out) > maxRegexWindowsPerRequest {
-			half := maxRegexWindowsPerRequest / 2
+		if len(out) > limit {
+			half := limit / 2
+			if half == 0 {
+				return nil, false
+			}
 			selected := append(append(make([]scanWindow, 0, maxRegexWindowsPerRequest), out[:half]...), out[len(out)-half:]...)
 			return selected, false
 		}
@@ -408,11 +583,61 @@ func boundedWindows(length int) ([]scanWindow, bool) {
 	return out, true
 }
 
-func (p *Phase) overBudget(start time.Time, budget time.Duration) bool {
-	return p.now().Sub(start) > budget
+func (p *Phase) overFuse(start time.Time, fuse time.Duration) bool {
+	active := p.active.Load()
+	procs := int64(max(1, runtime.GOMAXPROCS(0)))
+	return p.now().Sub(start) > effectiveFuse(fuse, active, procs)
+}
+
+func effectiveFuse(fuse time.Duration, active, procs int64) time.Duration {
+	procs = max(1, procs)
+	if active > procs {
+		ratio := float64(active) / float64(procs)
+		scale := 1 + ratio*ratio*ratio*ratio*ratio*ratio*ratio*ratio
+		fuse = time.Duration(float64(fuse) * scale)
+		if fuse > maxFuse {
+			fuse = maxFuse
+		}
+	}
+	return fuse
+}
+
+func (p *Phase) recentFuseRatio() (int64, float64) {
+	p.outcomeMu.Lock()
+	defer p.outcomeMu.Unlock()
+	f := int64(0)
+	for i := 0; i < p.outcomeN; i++ {
+		if p.outcomes[i] {
+			f++
+		}
+	}
+	if p.outcomeN == 0 {
+		return 0, 0
+	}
+	return int64(p.outcomeN), float64(f) / float64(p.outcomeN)
+}
+
+func overloadTier(active, procs, ewmaNanos int64, fuseRatio float64, recent, current int64) int64 {
+	level := current
+	backlog := max(int64(0), active-procs)
+	if backlog >= procs {
+		level = 2
+	} else if backlog > 0 && level < 1 {
+		level = 1
+	}
+	if ewmaNanos >= 30_000_000 {
+		level = 2
+	} else if ewmaNanos >= 12_000_000 && level < 1 {
+		level = 1
+	}
+	if recent >= 32 && fuseRatio >= 0.25 && active <= procs {
+		level = 3
+	}
+	return level
 }
 
 func (p *Phase) budgetFailure(ctx *reqctx.RequestCtx, score int, reason string) reqctx.Decision {
+	p.fuses.Add(1)
 	if ctx.BodyTruncated() && !hasString(ctx.Tags(), "waf_body_truncated") {
 		ctx.AddTag("waf_body_truncated")
 		truncatedScore := ctx.Site.WAF.TruncatedBodyScore
@@ -431,6 +656,31 @@ func (p *Phase) budgetFailure(ctx *reqctx.RequestCtx, score int, reason string) 
 		return wafDecision(reqctx.ActionBlock, "waf_budget", score, reason+" (fail closed)", ctx.Tags())
 	}
 	return wafDecision(reqctx.ActionAllow, "waf_budget", score, reason+" (fail open)", ctx.Tags())
+}
+
+func (p *Phase) bodyReadFailure(ctx *reqctx.RequestCtx, score int, reason string) reqctx.Decision {
+	ruleID := "waf_body_read_error"
+	if ctx.BodyTruncated() && !hasString(ctx.Tags(), "waf_body_truncated") {
+		ctx.AddTag("waf_body_truncated")
+		addTruncatedBodyScore(ctx, &score)
+	}
+	if ctx.BodyReadTimedOut() {
+		ctx.AddTag("waf_body_read_timeout")
+		ruleID = "waf_body_read_timeout"
+	}
+	ctx.WAFScore = score
+	if effectiveFailMode(ctx) == "closed" {
+		return wafDecision(reqctx.ActionBlock, ruleID, score, reason+" (fail closed)", ctx.Tags())
+	}
+	return wafDecision(reqctx.ActionAllow, ruleID, score, reason+" (fail open)", ctx.Tags())
+}
+
+func addTruncatedBodyScore(ctx *reqctx.RequestCtx, score *int) {
+	v := ctx.Site.WAF.TruncatedBodyScore
+	if v == 0 {
+		v = 3
+	}
+	*score += v
 }
 
 func effectiveFailMode(ctx *reqctx.RequestCtx) string {

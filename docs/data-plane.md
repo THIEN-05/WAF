@@ -260,6 +260,10 @@ return cur
 
 **Kiểm thử**: unit test thuật toán với đồng hồ giả; test song song nhiều goroutine; k6 mô phỏng vượt hạn mức; kiểm tra hành vi khi Redis chết (mặc định hạ cấp về bộ đếm cục bộ).
 
+**Chạy k6 cục bộ**: khởi chạy edge với snapshot có hạn mức thấp cho `POST /login`, rồi chạy `k6 run -e BASE_URL=http://127.0.0.1:8080 -e SITE_HOST=site.test test/k6/ratelimit.js`. Có thể đặt `VUS` và `DURATION` để đổi tải. Script chỉ gửi request tới `BASE_URL` do người vận hành chỉ định; không trỏ vào hệ thống bên thứ ba.
+
+**MMDB GeoLite2 tùy chọn**: tạo tài khoản MaxMind, tải GeoLite2 Country và/hoặc GeoLite2 ASN theo điều khoản MaxMind, giải nén ngoài repository (ví dụ `D:/waf-data/GeoLite2-Country.mmdb`), rồi đặt `EDGE_GEOIP_COUNTRY_MMDB` và `EDGE_GEOIP_ASN_MMDB` tới các file đó. Không commit hoặc phân phối file dữ liệu. Test `TestMMDBFilesWhenOperatorDatabasesAreConfigured` tự skip khi không cấu hình hoặc file chưa được cấp.
+
 ## ***5.6 Rule engine và DSL (P6)***
 
 **Mục đích**: cho khách tự viết điều kiện lọc, được biên dịch sẵn để chạy nhanh.
@@ -346,7 +350,9 @@ Loader YAML hỗ trợ `path`, `args`, `body`, `cookies`, `headers` và `protoco
 
 * Tiền lọc bằng Aho-Corasick: chỉ chạy regex khi có từ khóa nghi ngờ.  
 * Dừng sớm khi điểm đã vượt ngưỡng.  
-* Giới hạn độ dài từng mục tiêu quét và đặt **ngân sách thời gian** mỗi request (ví dụ 2 ms); vượt ngân sách thì áp dụng fail-mode và ghi log.
+* Ngân sách công việc xác định theo gói: Free 128 KiB/256 bước normalize/128 cửa sổ regex; Pro 256 KiB/512/192; Business 384 KiB/768/256; Enterprise 512 KiB/1.024/384. Đây là byte target đầu vào đã nhận xử lý, số normalize block và số candidate regex thực chạy; hết trần gắn `waf_scan_truncated`/`waf_work_exhausted` (body còn gắn `waf_body_truncated`) rồi áp fail-mode. `budget_ms` là cầu chì đồng hồ tường mặc định 100 ms, cấu hình tối đa 5.000 ms; khi số WAF in-flight vượt GOMAXPROCS, ngưỡng được nhân theo backlog ước lượng (tối đa 5 giây) để không tính thời gian scheduler chờ như một pha bị treo. Chỉ cầu chì sau hiệu chỉnh mới phát `waf_budget_exceeded`.
+* Khi quá tải, edge ước lượng backlog runnable bằng `max(WAF in-flight − GOMAXPROCS, 0)`, theo dõi EWMA độ trễ pha và tỷ lệ fuse trong 64 request gần nhất. Mức 1 (backlog >0 hoặc EWMA ≥12 ms) bỏ luật paranoia >1; mức 2 (backlog ≥GOMAXPROCS hoặc EWMA ≥30 ms) còn giảm một nửa trần công việc; mức 3 chỉ khi tối thiểu 32 request gần nhất có tỷ lệ fuse ≥25% và backlog hiện tại đã thoát ngưỡng, khi đó áp fail-mode. Mỗi mức có counter, tag audit và log khi chuyển mức. Quá tải tự nó không được tính là lỗi fuse.
+* Khi body vượt cap entitlement, WAF chỉ buffer và quét prefix tối đa cap (đọc thêm 1 byte để nhận biết vượt); **không đọc hay quét đuôi thực** vì phần dư được stream tới origin. Trong vùng thực sự đã buffer, các candidate regex có thể giữ đầu và cuối; điều này không có nghĩa là body tail đã được kiểm tra. Free mặc định fail-open vì vậy có thể bị né bằng padding vượt cap. Giảm thiểu: cộng điểm body truncated (mặc định 3), giới hạn Content-Length/body theo loại nội dung và rate-limit chặt hơn cho request body lớn; gói trả phí nên đặt fail-closed/challenge.
 
 **Nguồn luật**: OWASP Core Rule Set là nguồn tham khảo tốt (kiểm tra giấy phép), nhưng viết bằng cú pháp SecRule và dùng một số tính năng regex mà RE2 không hỗ trợ, nên cần **chuyển đổi/viết lại thủ công** sang định dạng YAML của hệ thống. Coraza (WAF mã nguồn mở bằng Go, chạy được CRS) có thể dùng làm **chuẩn so sánh** để đo tỷ lệ phát hiện của engine tự viết.
 

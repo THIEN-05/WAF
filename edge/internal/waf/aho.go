@@ -87,9 +87,12 @@ func (a *automaton) scan(text string, found map[string]struct{}) {
 	}
 }
 
-func (a *automaton) windows(text string, expired func() bool) ([]scanWindow, bool) {
+func (a *automaton) windowsLimit(text string, limit int, expired func() bool) ([]scanWindow, bool) {
 	if a == nil {
 		return nil, false
+	}
+	if limit < 0 {
+		limit = 0
 	}
 	var out []scanWindow
 	pending := scanWindow{}
@@ -156,10 +159,13 @@ func (a *automaton) windows(text string, expired func() bool) ([]scanWindow, boo
 			}
 		}
 	}
-	if len(out) > maxRegexWindowsPerRequest {
+	if len(out) > limit {
 		// Preserve candidates from both ends when the per-request budget is hit.
-		half := maxRegexWindowsPerRequest / 2
-		selected := make([]scanWindow, 0, maxRegexWindowsPerRequest)
+		half := limit / 2
+		if half == 0 {
+			return nil, false
+		}
+		selected := make([]scanWindow, 0, limit)
 		selected = append(selected, out[:half]...)
 		selected = append(selected, out[len(out)-half:]...)
 		return selected, false

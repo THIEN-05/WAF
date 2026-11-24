@@ -1,6 +1,118 @@
 # Tiến độ
 
+## Gate G — đóng nợ nền tảng P2–P5a — 2026-11-24
+
+### Đã xác minh
+
+- Line-ending policy: `.gitattributes` buộc LF cho repo và `.go`/`.sh`/`.yml`/`.yaml`/`.md`; `.editorconfig` cũng đặt `end_of_line = lf`. Đã chạy `git add --renormalize .`, sau đó stage riêng config để không gộp code chưa commit; commit riêng `bb6adda chore: enforce LF`. `git ls-files --eol` → `index: no i/crlf files`; `git diff --check` → exit 0. `.gitignore` bỏ qua `.env*` (giữ `.env.example`), file `.mmdb`, `.pem`/`.key`/`.p12`/`.pfx`, thư mục secrets và corpus ngoài.
+- Cổng HTTP: `TestHTTPChallengeAndRedirect`, `TestHTTPRedirectRejectsUnknownHost`, `TestHTTPRedirectUsesCanonicalHostAndKeepsPathQuery` trong `edge/internal/listener/listener_test.go`; `TestCanonicalHTTPHostUsesRouterAndRejectsMalformedHosts` trong `edge/internal/edgecore/edge_test.go`. ACME callback vẫn chạy trước canonical host lookup; callback là ranh giới cấp token từ CP. Test kiểm tra unknown/malicious Host, canonical host/path/query và redirect 308. Kiểm tra này tìm ra lỗi thật `known.test:bad` từng bị chuẩn hóa thành `known.test`; `router.NormalizeHost` nay kiểm tra port số, range 0..65535, IPv6 bracket, và từ chối authority lỗi; `TestNormalizeHostRejectsMalformedAuthority` khóa hành vi.
+- IP/header: `TestLoopbackProxyRewritesForwardingHeaders` kiểm tra XFF/X-Real-IP/X-Forwarded-* /Forwarded client bị xóa, Via/X-Request-ID/host header được edge đặt lại, hop-by-hop cùng header trong Connection bị gỡ. `TestUntrustedForwardedForDoesNotOverrideRemoteAddress` và `TestUntrustedForwardingHeadersCannotBypassIPPolicies` bao gồm XFF nhiều giá trị giả mạo trước allow/block, GeoIP và key rate limit. `TestAccessIPv4MappedIPv6AndAllowPrecedence`, `TestAccessGeoResolverErrorUsesSiteFailMode`, `TestTemporaryBanCleanupRemovesExpiredEntries`, `TestTemporaryBanExpiresAndRespectsCapacity` trong `edge/internal/access/access_test.go` khóa IPv4-mapped, thứ tự allow/block, Geo fail mode và dọn ban hết hạn. XFF hiện không được tin từ bất kỳ nguồn nào; IP chính sách lấy từ `RemoteAddr`/PROXY protocol.
+- PROXY v1: `TestProxyProtocolV1OnlyFromTrustedCIDR` cùng test mới `TestProxyProtocolV1RejectsMalformedTruncatedAndOversizedHeaders`, `TestProxyProtocolV1MalformedConnectionDoesNotStopAccepting` và `TestProxyProtocolV1IsIgnoredFromUntrustedSource` trong `edge/internal/listener/listener_test.go`. Parser giới hạn 108 byte, yêu cầu CRLF, đúng family/địa chỉ/port, deadline, bỏ kết nối sai mà không làm dừng `http.Server.Serve`.
+- Reverse proxy: `TestLoopbackProxyHTTP1HTTP2SSEAndWebSocket`, `TestLoopbackSSEFlushesBeforeOriginCompletes`, `TestLoopViaRejected`, `TestLoopbackProxyRewritesForwardingHeaders`; test mới `TestRetryTransportNeverRetriesAfterRequestBodyWasSent`, `TestRetryTransportRetriesGetAndHeadOnlyForDialErrors`, `TestProxyErrorsCarryRequestIDAndDoNotReflectTransportDetails` trong `edge/internal/proxy/proxy_test.go`. Kiểm tra header lỗi 502/504 có request ID và không phản chiếu lỗi transport.
+- Body WAF/rules: `TestBodyInspectionReadsOnceAndReplaysOriginalBytes`, `TestBodyPrefixCapStreamsRemainderAndPreservesFraming`, `TestGzipBodyIsInspectedBoundedlyAndRawBytesReplayToOrigin`, `TestGzipExpansionAndUnsupportedEncodingAreMarkedTruncated` trong `edge/internal/reqctx/body_test.go`; `TestLoopbackInspectedChunkedBodyTrailerAndExpectContinueReachOrigin` trong `edge/internal/edgecore/edge_test.go`; deadline slow/hung/truncated hiện có `TestLoopbackBodyReadDeadlineSlowAndHungClients`, `TestLoopbackTruncatedBodyReleasesListener`. Gzip được giải nén trong giới hạn byte/tỷ lệ; encoding không hỗ trợ đánh dấu truncated; origin nhận raw body/framing.
+- P5a hồi quy hiện hữu: `TestFingerprintIndependentFoxIOChromeCapture`, `TestFingerprintIndependentFoxIOTLS12ALPNCapture`, `TestClientHelloAcrossTLSRecordsAndOver16KiBCap`, `FuzzFingerprintClientHello`, loopback timeout trong `edge/internal/listener/fingerprint_test.go`; pool isolation/reset trong `edge/internal/reqctx/pool_test.go`; async DNS/cache ở `TestVerifiedResolverAsyncBoundedDeduplicatedAndNonblocking`, `TestVerifiedResolverNegativeCacheAndCapacity`, `TestVerifiedBotBypassesChallengeAndFreeHasNoChallengeEntitlement`; cookie/PoW/rate/body challenge ở `TestChallengeCookieBindingExpiryRotationAndReplay`, `TestChallengeVerifyHandlerRejectsBadProofAndSetsCookie`, `TestChallengeVerifyRateLimitMethodBodyAndRequestID`, `TestLoopbackChallengeVerifyBodyReadDeadline` (`edge/internal/bot/bot_test.go`). Không viết lại các test này.
+- Wafcore: fixture round-trip đã có ở `TestSnapshotYAMLRoundTrip` và golden vị trí DSL ở `TestDSLErrorGolden` trong `pkg/wafcore/wafcore_test.go`. Test mới `TestLegacySnapshotMissingOptionalFieldsUsesSafeZeroValues` và `TestSnapshotUnknownFieldsAreIgnoredForYAMLAndJSON` xác nhận snapshot cũ nhận zero-value và decoder bỏ qua field chưa biết theo `docs/DECISIONS.md`. Danh sách schema P1–P5a được thêm ở `docs/control-plane.md` mục 5.8; P5a không thêm field schema.
+- Benchmark WSL Linux, Go 1.26.11, Intel Core i5-11400H, GOMAXPROCS=12, `-benchtime=1000x -benchmem`: `BenchmarkAccessCheck` 200.7 ns/op, 17 B/op, 1 alloc; `BenchmarkRateLimitAllow` 901.2 ns/op, 298 B/op, 7 allocs; `BenchmarkWAF` 6,986 ns/op, 6,191 B/op, 26 allocs. Kết quả ghi tại `docs/BENCHMARKS.md`; số Windows lịch sử được đánh dấu không dùng làm bằng chứng.
+- Công cụ/CI: k6 script `test/k6/ratelimit.js` đã có; hướng dẫn thêm ở `docs/data-plane.md` §5.5. `TestMMDBFilesWhenOperatorDatabasesAreConfigured` skip nếu không có file được cấp; cách lấy GeoLite2 và đặt env ngoài repo được ghi tại §5.5. Workflow vẫn có job lint, race, govulncheck bắt buộc, Redis integration có service và Compose độc lập; ClickHouse/SeaweedFS chuyển sang profile riêng; bước CI chạy gofmt/tidy rồi `git diff --exit-code`.
+
+### Chưa xác minh — lệnh chạy lại
+
+- Đã xác minh WSL Go 1.26.11: `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → exit 0; `go build ./...` → exit 0; `go test -count=1 ./...` → PASS; `go test -race -count=1 ./...` → PASS (chạy lại sau sửa listener cuối); `govulncheck ./...` → `No vulnerabilities found.`. Redis localhost thật: `REDIS_ADDR=127.0.0.1:6379 go test -tags=integration -race -count=5 ./edge/internal/ratelimit` → `ok ... 31.136s`.
+- `docker compose -f deploy/docker-compose.yml config -q` → exit 0 trên Windows Docker CLI 29.1.2; không thể chạy pull/up vì Docker Desktop Linux engine không khởi động/không có pipe, và WSL không có Docker CLI. GitHub Actions chưa chạy trên commit mới; không tuyên bố CI xanh. `git diff --exit-code` sau gofmt/tidy được cấu hình trong job lint; không chạy local trên working tree còn các thay đổi phase chưa commit.
+- k6 chưa xác minh vì `k6` không có trong PATH (`k6 version` báo command not found); lệnh chạy ở `docs/data-plane.md` §5.5. MMDB test `TestMMDBFilesWhenOperatorDatabasesAreConfigured` → `SKIP` do chưa cấp file GeoLite2 (cần tài khoản MaxMind); test giả và lỗi mở file vẫn chạy.
+- Loopback cần chạy ngoài sandbox Windows; đã chạy trong WSL Ubuntu và toàn bộ full race suite ở trên PASS.
+
+### Nợ kỹ thuật
+
+- **TODO-G-1:** PROXY protocol v2 chưa triển khai. Repo hiện chỉ cấu hình v1; chưa có NLB/v2 contract cụ thể. Cần fixture/header v2 chuẩn và quyết định CRC32C/LOCAL trước khi thêm parser; hiện test v1 malformed/untrusted/length giới hạn đã có.
+- **TODO-G-2:** chưa có test chạy với GeoLite2 MMDB thật nếu không có file cấp phép; test giả và lỗi mở file đã có.
+- **TODO-G-3:** chưa xác nhận GitHub Actions xanh sau commit/push; local test không thay thế kết quả CI.
+- **TODO-P4f-1** còn mở: benchmark WAF concurrency 200 vẫn từng cho p99 >1 giây và work cap chạm 100%, dù full race Gate G hiện PASS. Cần hoàn tất đánh giá tải cao/clean fail-closed trước khi tuyên bố an toàn overload.
+
+### Rà soát `//nolint` không-test
+
+- Có 11 vị trí hiện hữu, không thêm mới: `edge/cmd/edge/main.go:207,237,264` (G304: path do operator cấu hình; `TestLoadSampleYAMLSnapshotNeedsExplicitDevelopmentFlag`, `TestLoadChallengeKeyringRequiresStrongAndSelectableKeys`); `edge/internal/configsync/holder.go:42,44,79,114` (G304: snapshot/keyring file path từ cấu hình; `TestLoadPublicKeysFromEnvAndFile`, `TestApplySignedSnapshot`); `edge/internal/listener/fingerprint.go:4,277` (G401 JA3 bắt buộc MD5 không dùng làm xác thực; hai test vector độc lập JA3/JA4); `edge/internal/proxy/proxy.go:138` (G115: modulo total positive, không vượt max int; `TestWeightedOriginSelectionCounterNearUint64Maximum`); `edge/internal/proxy/proxy.go:257` (G706 false positive trên RequestID đã lọc hex và log `%q`; `TestProxyErrorDoesNotLogOrReflectUnsafeRequestID`). Kỳ vọng chỉ một nolint G706 không đúng với repo hiện tại; các suppression G304/G401/G115 đã tồn tại và có lý do/test nêu trên.
+
+### Quét an toàn
+
+- Không tìm thấy `http.Redirect` trong edge; cổng :80 tạo absolute URL từ canonical host do router trả về. `RequestID` sinh bằng 16 byte ngẫu nhiên rồi hex; không đọc X-Request-ID client. `TestLoopbackEdgeGeneratesRequestIDAndIgnoresClientHeader` kiểm tra điều này; log edge dùng `%q` cho request ID và panic value; proxy lỗi không phản chiếu chi tiết transport.
+- Không tìm thấy `defer Close()` bị bỏ qua ở đường ghi file. `configsync.persist` kiểm tra `Write`, `Sync`, `Close` trên success và error branches trước atomic rename. Đã rà ép kiểu nhạy tràn: rate limiter có test clock rollback/extreme refill; punycode có test miền 0..35 và biên; host port validation có test range; proxy origin counter có test gần `uint64` wrap. Những ép kiểu còn lại là parse/copy có trần hoặc giới hạn bởi cấu trúc dữ liệu.
+
+## P5a — hardening fingerprint, RequestCtx, bot resolver và challenge — 2026-11-24
+
+### Đã xác minh
+
+- Fingerprint parser ghép ClientHello qua tối đa 16 TLS handshake record; giới hạn hello 16 KiB và record capture 64 KiB. Deadline peek cố định 3 giây được gỡ khi hello hoàn chỉnh. Cả hai raw vector độc lập trong `testdata/fingerprints/` khớp JA3/JA4 kỳ vọng; test malformed/truncated, over-16-KiB, GREASE/extension lặp, fragmentation và trần số record đều PASS.
+- Test loopback `TestLoopbackSlowClientHelloTimeoutReleasesConnections` gửi 16 kết nối với ClientHello dở dang, kiểm tra giới hạn connection/IP, mọi kết nối được dọn, số goroutine tăng không quá 4 và heap sau GC không tăng quá 8 MiB. `TestLoopbackChallengeVerifyBodyReadDeadline` xác minh body verify chậm trả JSON 408 có request ID, handler/writer được giải phóng. Các test loopback này chỉ chạy ngoài sandbox Windows; đã chạy trong WSL Ubuntu.
+- `RequestCtx.Release` zero toàn struct. Test reflection dirty mọi field và thất bại nếu thêm struct field không thể dirty; danh sách miễn trừ field connection hiện rỗng. `New` reset trước khi áp fingerprint. Pool stress 40 goroutine × 200 vòng chạy dưới race detector.
+- Verified bot DNS chuyển cache miss sang queue 128, 8 worker mặc định, 100 lookup/giây, timeout 300 ms, cache dương/âm bounded 10.000 / TTL 10 phút. Miss luôn “chưa xác minh”, reverse DNS cần forward-confirm. Test resolver giả kiểm tra 10.000 IP User-Agent Googlebot không block request, trần đồng thời/rate, singleflight, negative cache, forward mismatch và 1 triệu địa chỉ với cache cap.
+- State hành vi bot chia 32 shard, cap 100.000, TTL 10 phút; khi cap đầy key mới tiếp tục được đánh giá stateless và không ghi counter mới. Test sinh 1 triệu IP xác nhận cap; test kiểm tra expiry/reinit.
+- Challenge API/XHR nhận JSON máy đọc được với request ID; navigation GET/HEAD `Accept: text/html` nhận HTML có CSP nonce, `no-store`. `/__waf/verify` POST-only, IP rate limit 20/phút, body cap 8 KiB, read/process timeout 1 giây; cookie có Secure/HttpOnly/SameSite=Lax/Path=/, không Domain. Test HMAC/PoW/replay/rotation/verified-bot bypass/Free entitlement được giữ và chạy lại.
+- WSL Ubuntu, Go 1.26.11: `go test -race -run TestLoopbackSlowClientHelloTimeoutReleasesConnections -count=1 -v ./edge/internal/listener` → PASS; `go test -race -run TestLoopbackChallengeVerifyBodyReadDeadline -count=1 -v ./edge/internal/bot` → PASS.
+- Fuzz final parser: `go test -run ^$ -fuzz FuzzFingerprintClientHello -fuzztime=60s ./edge/internal/listener` → PASS, 2,637,817 executions trong 60.141 s, không panic.
+- Benchmark WSL/Linux (Intel Core i5-11400H, Go 1.26.11, `-benchtime=1000x -benchmem`): parser-only 5,829 ns/op, 818 B/op, 44 allocs/op; bounded peek + compute 9,854 ns/op, 4,068 B/op, 94 allocs/op. Đã ghi ở `docs/BENCHMARKS.md`.
+- Vector nguồn: FoxIO JA4 pcap commit `4ab8e3f18f4b27e0b896c4ec2c251e20506eb87e` (SHA-256 file được so đúng); expected đối chiếu community project commit `797a8b074e135f659da1ee3193b5a4cc111dfc26` và Salesforce JA3 commit `502cc6395811c54743b0561419d61900a6df3ff7` / dpkt v1.9.1. Mỗi test ghi URL + commit trong comment.
+- WSL Ubuntu, Go 1.26.11: `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...` → `0 issues.` (chạy lại sau thay đổi cuối); `go vet ./...` → exit 0; `go build ./...` → exit 0; `go test -count=1 ./...` → PASS tất cả package; `go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...` → `No vulnerabilities found.` (chạy lại sau thay đổi cuối).
+- Các package đã đổi (`bot`, `edgecore`, `listener`, `reqctx`) PASS `go test -race -count=1`. Full `go test -race -count=1 ./...` **FAIL trong cả hai lần thử** ở test tải có sẵn `edge/internal/waf/TestWAFParallel50GOMAXPROCSMatrix`: lần 1 `gomaxprocs_12`, lần 2 `gomaxprocs_2`; mỗi lần `clean fail-closed requests rejected=1/250`. Đây là lỗi P4f ngoài phạm vi P5a; không sửa/loại test. Vì race toàn repo còn đỏ, P5a chưa được đánh dấu hoàn tất.
+- `git diff --check` → exit 0; chỉ cảnh báo Git rằng một số working-copy CRLF sẽ được chuẩn hóa LF.
+
+### Chưa xác minh / cần chạy lại
+
+- Chưa xác nhận GitHub Actions sau commit/push. Loopback tests cần môi trường ngoài sandbox Windows; đã xác minh cục bộ trong WSL. Để tái hiện race failure P4f và kiểm tra run mới sau khi xử lý TODO-P4f-1:
+
+```sh
+go test -race -count=1 ./...
+go test -race -count=5 ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'
+```
+
+- Trên Windows sandbox, loopback bị chặn (WinSock “access to a socket … forbidden”); WSL chạy được qua `/usr/local/go/bin/go` (Go 1.26.11). `wsl.exe -l -q` bị AccessDenied trong sandbox, nhưng lệnh WSL được chạy ngoài sandbox đã PASS cho các test loopback kể trên.
+
+### Nợ kỹ thuật
+
+- **TODO-P5a-1:** PoW replay cache vẫn riêng từng edge; chưa chống replay proof xuyên edge.
+- **TODO-P5a-2:** chưa có feed sản xuất cho IP/ASN/Tor hoặc vendor prefix; `IPReputation`/prefix remain operator adapters.
+- **TODO-P5a-3:** cấp/rotate HMAC keyring qua mTLS thuộc P6b; hiện keyring operator/env hoặc interface, thiếu key khi entitlement bật là startup error.
+- **TODO-P5a-4:** net/http không giữ thứ tự header wire nên tín hiệu thứ tự header chưa được chấm.
+- **TODO-P5a-5:** hai raw ClientHello source độc lập đã có; bộ vector vẫn chỉ có hai mẫu, chưa bao phủ rộng nhiều client/phiên bản TLS.
+- **P4f status:** TODO-P4f-1 vẫn mở; tải 200 goroutine từng đo p99 1.603 s và work cap chạm 100%, chưa đủ bằng chứng để đóng khả năng overload fail-closed.
+- **Gate G status:** phần code/test được tìm thấy: ACME HTTP-01 trước canonical redirect (`TestHTTPChallengeAndRedirect`), forged XFF bị xóa và IP transport được đặt lại (`TestLoopbackProxyRewritesForwardingHeaders`), `.gitattributes` đặt `eol=lf`. Chưa coi đây là test CI mới độc lập ngoài những test hiện hữu.
+- Inventory `//nolint` trong code không-test (11 vị trí; không thêm vị trí mới): `edge/cmd/edge/main.go:207,237,264`; `edge/internal/configsync/holder.go:42,44,79,114`; `edge/internal/listener/fingerprint.go:4,277`; `edge/internal/proxy/proxy.go:138,257`.
+
+## P4f — ngân sách WAF theo work và suy giảm quá tải — 2026-11-24
+
+### Đã xác minh
+
+- Thay 2 ms đồng hồ tường bằng work caps theo gói (Free 128 KiB/256 normalize steps/128 regex windows; Pro 256 KiB/512/192; Business 384 KiB/768/256; Enterprise 512 KiB/1.024/384). Khi hết trần, tag `waf_work_exhausted` + `waf_scan_truncated`; body có thêm truncation và áp fail-mode. Timeout đọc body được tách riêng khỏi `waf_budget_exceeded`.
+- `budget_ms` là cầu chì wall-clock mặc định 100 ms, cấu hình 1–5.000 ms; ngưỡng được bù theo backlog WAF/GOMAXPROCS và có trần 5 giây. `waf_budget_exceeded` chỉ từ cầu chì. Overload levels dựa trên backlog ước lượng, EWMA WAF và rolling 64-request fuse ratio: bỏ paranoia >1 → chia đôi work cap → chỉ cuối cùng áp fail-mode khi persistent fuse ratio cao và backlog hạ. Có accessor metrics `Phase.Metrics()`, counter audit Prometheus và log chuyển tier.
+- Test WSL Linux `TestWAFParallel50ReportsP99AndBudgetAction`: 50 goroutine × 5 (250) request, p50 **5,584,535 ns**, p99 **63,856,855 ns**, fuse **0/250**, clean FPR **0/20**, payload SQLi đầu body bị block **50/50**; GOMAXPROCS=12/12 CPUs. Test fail-closed clean load ở GOMAXPROCS=2/4/12: mỗi cấu hình **0/250** clean rejects, **0/250** fuse. Work-cap unit test cũng xác minh cap không bị gắn nhầm `waf_budget_exceeded`.
+- Đã chạy ma trận Linux/WSL `BenchmarkWAFLoadMatrix`, 200 request/cell, body 8/64/256 KiB, repeated Aho, deep JSON, multipart, 200 params, concurrency 1/10/50/200; CPU i5-11400H 6C/12T, Go 1.26.11, GOMAXPROCS 12. Số tóm tắt p50/p99, allocs/op, work-cap/fuse % được ghi ở [BENCHMARKS.md](BENCHMARKS.md). Mức xấu nhất quan sát p99 **1,602,541,791 ns**, work-cap đến **100%**, fuse đến **9%** ở 200 goroutine.
+- Đã sửa docs để nói chính xác body over-cap chỉ quét prefix đã buffer; không đọc/quét tail thật. Free fail-open vẫn có padding bypass risk; mitigation đã ghi: truncation anomaly +3, cap Content-Length theo content type, và rate-limit chặt body lớn.
+
+- WSL Ubuntu, Go 1.26.11: `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...` → `0 issues.`; `go vet ./...` → exit 0; `go test -count=1 ./...` → PASS toàn bộ package; `go test -race -count=1 ./...` → PASS toàn bộ package (waf 19.158s, ratelimit 4.661s). Không có test đỏ.
+- `TestWAFParallel50ReportsP99AndBudgetAction` và `TestWAFParallel50GOMAXPROCSMatrix` chạy lại sau thay đổi: 50 goroutine × 5; clean 0/250 reject và 0/250 fuse ở GOMAXPROCS 2, 4, 12; 50/50 SQLi prefix bị chặn. Output cụ thể và máy đo đã ghi bên trên.
+- `git diff --check` → PASS.
+
+### Chưa xác minh — lệnh tự chạy lại
+
+- Chưa chạy integration Redis riêng sau P4f (không sửa ratelimit); chưa chạy GitHub Actions sau commit/push. Có thể tự chạy trong WSL/Linux:
+
+```sh
+golangci-lint run ./...
+go vet ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
+go test -tags=integration -race -count=5 ./edge/internal/ratelimit
+```
+
+### Nợ kỹ thuật
+
+- **TODO-P4f-1:** benchmark tải 50/200 goroutine cho thấy p99 worst-case vượt 1 giây; work cap chạm tối đa 100%, fuse còn chạm đến 9%. Với fail-closed, request hợp lệ bị cắt bởi cap/fuse vẫn có thể bị từ chối. Cần hiệu chỉnh work units/overload thresholds dựa trên profile Linux và xác nhận tỷ lệ reject sạch dưới tải trước khi tuyên bố an toàn tải cao. Hiện test fail-closed sạch đã chứng minh 50 goroutine với workload 8 KiB, không chứng minh upload 64–256 KiB ở 200 goroutine.
+- **TODO-2:** audit writer còn in-memory, chưa bền qua restart.
+- **TODO-3:** body read deadlines đã xác minh WSL P4e; không thay đổi trong P4f.
+
 ## P4e — WAF buffer bypass và deadline đọc body — 2026-11-24
+
+> Historical P4e validation below predates P4f; P4f supersedes the 2 ms wall-clock budget and body-read timeout tagging semantics.
 
 ### Đã xác minh
 

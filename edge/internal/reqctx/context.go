@@ -2,12 +2,14 @@ package reqctx
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,6 +78,7 @@ var pool = sync.Pool{New: func() any { return &RequestCtx{} }}
 
 func New(r *http.Request, s *wafcore.Snapshot, requestID string, clientIP net.IP) *RequestCtx {
 	c := pool.Get().(*RequestCtx)
+	*c = RequestCtx{}
 	c.Request = r
 	c.Snapshot = s
 	c.RequestID = requestID
@@ -116,34 +119,7 @@ func New(r *http.Request, s *wafcore.Snapshot, requestID string, clientIP net.IP
 	return c
 }
 func Release(c *RequestCtx) {
-	c.Request = nil
-	c.Snapshot = nil
-	c.Site = nil
-	c.ClientIP = nil
-	c.Host = ""
-	c.SNI = ""
-	c.RequestID = ""
-	c.Path = ""
-	c.Query = ""
-	c.Protocol = ""
-	c.JA3 = ""
-	c.JA4 = ""
-	c.GeoCountry = ""
-	c.GeoASN = 0
-	c.GeoResolved = false
-	c.WAFScore = 0
-	c.BotScore = 0
-	c.BotVerified = false
-	c.BotChallengeToken = ""
-	c.Entitlements = wafcore.Entitlements{}
-	c.decision = Decision{}
-	c.parsedQuery = nil
-	c.bodyText = ""
-	c.bodyLoaded = false
-	c.bodyTruncated = false
-	c.bodyReadErr = nil
-	c.skippedPhases = nil
-	c.tags = nil
+	*c = RequestCtx{}
 	pool.Put(c)
 }
 func (c *RequestCtx) QueryValues() url.Values {
@@ -238,13 +214,50 @@ func (c *RequestCtx) BodyPrefix(maxBytes int) string {
 	captured, err := io.ReadAll(io.LimitReader(original, limit+1))
 	c.bodyReadErr = err
 	c.bodyTruncated = int64(len(captured)) > limit || err != nil
-	if int64(len(captured)) > limit {
-		c.bodyText = string(captured[:limit])
-	} else {
-		c.bodyText = string(captured)
+	inspect := captured
+	if int64(len(inspect)) > limit {
+		inspect = inspect[:limit]
 	}
+	c.bodyText, c.bodyTruncated = inspectBody(c.Request.Header.Get("Content-Encoding"), inspect, int(limit), c.bodyTruncated)
 	c.Request.Body = &replayBody{Reader: io.MultiReader(bytes.NewReader(captured), original), closer: original}
 	return c.bodyText
+}
+
+func inspectBody(contentEncoding string, body []byte, maxBytes int, truncated bool) (string, bool) {
+	encoding := strings.TrimSpace(strings.ToLower(contentEncoding))
+	if encoding == "" || encoding == "identity" {
+		return string(body), truncated
+	}
+	if encoding != "gzip" {
+		// Unsupported encodings remain byte-for-byte available to the origin, but
+		// cannot be treated as inspected plaintext by the WAF.
+		return string(body), true
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return string(body), true
+	}
+	defer func() { _ = reader.Close() }()
+	maxOutput := maxBytes
+	// Bound both absolute expansion and expansion ratio. A minimum window allows
+	// small gzip headers to be inspected while the absolute package cap remains
+	// the stronger limit for ordinary request bodies.
+	ratioCap := len(body) * 20
+	if ratioCap < 1024 {
+		ratioCap = 1024
+	}
+	if ratioCap < maxOutput {
+		maxOutput = ratioCap
+	}
+	decoded, readErr := io.ReadAll(io.LimitReader(reader, int64(maxOutput)+1))
+	if len(decoded) > maxOutput {
+		decoded = decoded[:maxOutput]
+		truncated = true
+	}
+	if readErr != nil {
+		truncated = true
+	}
+	return string(decoded), truncated
 }
 
 func (c *RequestCtx) BodyTruncated() bool  { return c.bodyTruncated }

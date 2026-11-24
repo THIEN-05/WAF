@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -41,18 +42,29 @@ func New(s *wafcore.Snapshot) *Router {
 }
 func NormalizeHost(host string) string {
 	host = strings.TrimSpace(strings.ToLower(host))
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	} else if strings.HasPrefix(host, "[") && strings.Contains(host, "]") {
-		if i := strings.Index(host, "]"); i > 0 {
-			host = host[1:i]
-		}
-	} else if strings.Count(host, ":") == 1 {
-		if i := strings.LastIndex(host, ":"); i >= 0 {
-			if _, err := net.LookupPort("tcp", host[i+1:]); err == nil {
-				host = host[:i]
+	switch {
+	case strings.HasPrefix(host, "["):
+		if h, port, err := net.SplitHostPort(host); err == nil {
+			if !validHostPort(port) || net.ParseIP(h) == nil {
+				return ""
 			}
+			host = h
+		} else if strings.HasSuffix(host, "]") {
+			host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+			if net.ParseIP(host) == nil {
+				return ""
+			}
+		} else {
+			return ""
 		}
+	case strings.Count(host, ":") > 1:
+		return "" // IPv6 authorities must use brackets.
+	case strings.Contains(host, ":"):
+		h, port, err := net.SplitHostPort(host)
+		if err != nil || h == "" || !validHostPort(port) {
+			return ""
+		}
+		host = h
 	}
 	host = strings.TrimSuffix(host, ".")
 	if !utf8.ValidString(host) {
@@ -67,6 +79,11 @@ func NormalizeHost(host string) string {
 		labels[i] = encoded
 	}
 	return strings.Join(labels, ".")
+}
+
+func validHostPort(port string) bool {
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 0 && n <= 65535
 }
 func (r *Router) Route(host string) *wafcore.Site {
 	h := NormalizeHost(host)

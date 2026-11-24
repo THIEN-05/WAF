@@ -50,7 +50,7 @@ func (p *Pipeline) Run(c *reqctx.RequestCtx) reqctx.Decision {
 				seenTags[tag] = struct{}{}
 				tags = append(tags, tag)
 				if sink, ok := p.observer.(interface{ EnqueueAudit(AuditEvent) bool }); ok {
-					if tag == AuditWAFBudgetExceeded || tag == AuditWAFBodyTruncated || tag == AuditWAFBodyReadTimeout {
+					if tag == AuditWAFBudgetExceeded || tag == AuditWAFBodyTruncated || tag == AuditWAFBodyReadTimeout || tag == AuditWAFWorkExhausted || tag == AuditWAFDegradedParanoia || tag == AuditWAFDegradedScope || tag == AuditWAFDegradedFailMode {
 						sink.EnqueueAudit(AuditEvent{Kind: tag, At: time.Now()})
 					}
 				}
@@ -149,6 +149,10 @@ func (h *Histogram) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	out.Printf("edge_waf_budget_exceeded_total %d\n", auditCounts[AuditWAFBudgetExceeded])
 	out.Printf("edge_waf_body_truncated_total %d\n", auditCounts[AuditWAFBodyTruncated])
 	out.Printf("edge_waf_body_read_timeout_total %d\n", auditCounts[AuditWAFBodyReadTimeout])
+	out.Printf("edge_waf_work_exhausted_total %d\n", auditCounts[AuditWAFWorkExhausted])
+	out.Printf("edge_waf_degraded_paranoia_total %d\n", auditCounts[AuditWAFDegradedParanoia])
+	out.Printf("edge_waf_degraded_scope_total %d\n", auditCounts[AuditWAFDegradedScope])
+	out.Printf("edge_waf_degraded_fail_mode_total %d\n", auditCounts[AuditWAFDegradedFailMode])
 	out.Printf("edge_waf_audit_dropped_total %d\n", h.audit.Dropped())
 	if out.err != nil {
 		log.Printf("metrics exporter: lỗi ghi phản hồi: %v", out.err)

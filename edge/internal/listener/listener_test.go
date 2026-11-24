@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/example/wafplatform/edge/internal/router"
 )
 
 func TestHTTPChallengeAndRedirect(t *testing.T) {
@@ -23,9 +25,12 @@ func TestHTTPChallengeAndRedirect(t *testing.T) {
 		path   string
 		status int
 		body   string
-	}{{"/.well-known/acme-challenge/good", 200, "proof-good"}, {"/.well-known/acme-challenge/missing", 404, ""}, {"/path?q=1", 308, ""}} {
+		host   string
+	}{{"/.well-known/acme-challenge/good", 200, "proof-good", "unknown.test"}, {"/.well-known/acme-challenge/missing", 404, "", "known.test"}, {"/path?q=1", 308, "", "known.test"}} {
 		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://known.test"+tc.path, nil))
+		req := httptest.NewRequest(http.MethodGet, "http://known.test"+tc.path, nil)
+		req.Host = tc.host
+		h.ServeHTTP(rr, req)
 		if rr.Code != tc.status {
 			t.Errorf("%s status=%d", tc.path, rr.Code)
 		}
@@ -40,7 +45,7 @@ func TestHTTPChallengeAndRedirect(t *testing.T) {
 
 func TestHTTPRedirectRejectsUnknownHost(t *testing.T) {
 	h := NewHTTPHandler(nil, "443", canonicalTestHTTPHost)
-	for _, host := range []string{"evil.com", "known.test@evil.com", "known.test:80:evil", "known.test:bad", "user@known.test", "known.test/evil"} {
+	for _, host := range []string{"evil.com", "known.test@evil.com", "known.test:80:evil", "known.test:bad", "user@known.test", "known.test/evil", "known.test\r\nX-Evil: yes", strings.Repeat("a", 300) + ".test", "[2001:db8::1]", "xn--e1afmkfd.xn--p1ai"} {
 		r := httptest.NewRequest(http.MethodGet, "http://known.test/path", nil)
 		r.Host = host
 		rr := httptest.NewRecorder()
@@ -69,13 +74,18 @@ func TestHTTPRedirectUsesCanonicalHostAndKeepsPathQuery(t *testing.T) {
 	if err != nil || u.Host != "known.test" || !strings.HasPrefix(u.Path, "//evil.com/") {
 		t.Fatalf("external redirect location=%q parsed=%+v err=%v", rr.Header().Get("Location"), u, err)
 	}
+	r.URL.Path = "/\\evil.com/path"
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	u, err = url.Parse(rr.Header().Get("Location"))
+	if err != nil || u.Host != "known.test" {
+		t.Fatalf("backslash path escaped canonical host: location=%q parsed=%+v err=%v", rr.Header().Get("Location"), u, err)
+	}
 }
 
 func canonicalTestHTTPHost(host string) (string, bool) {
-	if host == "known.test" || host == "KNOWN.TEST.:80" {
-		return "known.test", true
-	}
-	return "", false
+	canonical := router.NormalizeHost(host)
+	return canonical, canonical == "known.test"
 }
 func TestMissingCertificateFallsBack(t *testing.T) {
 	cache := NewCertCache()
@@ -223,6 +233,107 @@ func TestProxyProtocolV1OnlyFromTrustedCIDR(t *testing.T) {
 	buf := make([]byte, 7)
 	if _, err = io.ReadFull(conn, buf); err != nil || string(buf) != "payload" {
 		t.Fatalf("buffered payload=%q err=%v", buf, err)
+	}
+}
+
+func TestProxyProtocolV1RejectsMalformedTruncatedAndOversizedHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name, header string
+	}{
+		{name: "truncated", header: "PROXY TCP4 198.51.100.7"},
+		{name: "bad signature", header: "NOTPROXY TCP4 198.51.100.7 203.0.113.1 42312 443\r\n"},
+		{name: "bad address", header: "PROXY TCP4 not-an-ip 203.0.113.1 42312 443\r\n"},
+		{name: "bad ports", header: "PROXY TCP4 198.51.100.7 203.0.113.1 99999 443\r\n"},
+		{name: "bad unknown fields", header: "PROXY UNKNOWN extra\r\n"},
+		{name: "oversized", header: "PROXY UNKNOWN " + strings.Repeat("x", 200) + "\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serverConn, clientConn := net.Pipe()
+			base := &queueListener{conns: []net.Conn{fakeConn{serverConn, &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 1000}}}, closed: make(chan struct{})}
+			close(base.closed)
+			_, trusted, _ := net.ParseCIDR("192.0.2.0/24")
+			writeDone := make(chan struct{})
+			go func() {
+				_, _ = io.WriteString(clientConn, tc.header)
+				_ = clientConn.Close()
+				close(writeDone)
+			}()
+			conn, err := (proxyProtocolListener{Listener: base, trusted: []*net.IPNet{trusted}}).Accept()
+			if err == nil || conn != nil {
+				t.Fatalf("malformed header accepted: conn=%v err=%v", conn, err)
+			}
+			<-writeDone
+			_ = clientConn.Close()
+		})
+	}
+}
+
+func TestProxyProtocolV1MalformedConnectionDoesNotStopAccepting(t *testing.T) {
+	badServer, badClient := net.Pipe()
+	goodServer, goodClient := net.Pipe()
+	t.Cleanup(func() {
+		if err := badClient.Close(); err != nil {
+			t.Errorf("close malformed proxy client: %v", err)
+		}
+	})
+	t.Cleanup(func() {
+		if err := goodClient.Close(); err != nil {
+			t.Errorf("close valid proxy client: %v", err)
+		}
+	})
+	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 1000}
+	base := &queueListener{conns: []net.Conn{fakeConn{badServer, remote}, fakeConn{goodServer, remote}}, closed: make(chan struct{})}
+	close(base.closed)
+	_, trusted, _ := net.ParseCIDR("192.0.2.0/24")
+	go func() {
+		_, _ = io.WriteString(badClient, "not a proxy header\r\n")
+		_ = badClient.Close()
+	}()
+	go func() { _, _ = io.WriteString(goodClient, "PROXY TCP4 198.51.100.7 203.0.113.1 42312 443\r\npayload") }()
+	conn, err := (proxyProtocolListener{Listener: base, trusted: []*net.IPNet{trusted}}).Accept()
+	if err != nil {
+		t.Fatalf("listener stopped after malformed preamble: %v", err)
+	}
+	closeOnCleanup(t, conn)
+	if got := conn.RemoteAddr().String(); got != "198.51.100.7:42312" {
+		t.Fatalf("valid peer after malformed preamble=%q", got)
+	}
+	payload := make([]byte, 7)
+	if _, err := io.ReadFull(conn, payload); err != nil || string(payload) != "payload" {
+		t.Fatalf("payload=%q err=%v", payload, err)
+	}
+}
+
+func TestProxyProtocolV1IsIgnoredFromUntrustedSource(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("close untrusted proxy protocol client: %v", err)
+		}
+	})
+	base := &queueListener{conns: []net.Conn{fakeConn{serverConn, &net.TCPAddr{IP: net.ParseIP("198.51.100.10"), Port: 1000}}}, closed: make(chan struct{})}
+	_, trusted, _ := net.ParseCIDR("192.0.2.0/24")
+	conn, err := (proxyProtocolListener{Listener: base, trusted: []*net.IPNet{trusted}}).Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("close untrusted proxy protocol accepted connection: %v", err)
+		}
+	})
+	if got := conn.RemoteAddr().String(); got != "198.51.100.10:1000" {
+		t.Fatalf("untrusted PROXY header changed peer address to %q", got)
+	}
+	const header = "PROXY TCP4 203.0.113.7 203.0.113.1 42312 443\r\n"
+	writeDone := make(chan error, 1)
+	go func() { _, writeErr := io.WriteString(clientConn, header); writeDone <- writeErr }()
+	buf := make([]byte, len(header))
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != header {
+		t.Fatalf("untrusted header was consumed: bytes=%q err=%v", buf, err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write untrusted header: %v", err)
 	}
 }
 

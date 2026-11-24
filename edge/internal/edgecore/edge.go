@@ -266,7 +266,7 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(tw, r)
 			return
 		}
-		e.botManager.Load().ServeVerifyKey(tw, r, c.Site.ID, c.Site.Secrets.ChallengeHMACKeyID, c.ClientIP, c.Header("User-Agent"))
+		e.botManager.Load().ServeVerifyRequestID(tw, r, c.Site.ID, c.Site.Secrets.ChallengeHMACKeyID, c.ClientIP, c.Header("User-Agent"), c.RequestID)
 		return
 	}
 	requestPipeline := state.pipeline
@@ -302,7 +302,7 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if decision.Terminal() {
 		e.metrics.Blocked(actionName(decision.Action))
 		if decision.Phase == "ratelimit" {
-			log.Printf("giới hạn tốc độ request_id=%s rule_id=%s", c.RequestID, decision.RuleID)
+			log.Printf("giới hạn tốc độ request_id=%q rule_id=%q", c.RequestID, decision.RuleID)
 		}
 		if decision.RetryAfter > 0 {
 			retrySeconds := int64((decision.RetryAfter + time.Second - 1) / time.Second)
@@ -314,18 +314,36 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if decision.Action == reqctx.ActionChallenge {
 			switch {
 			case decision.Phase == "bot" && c.BotChallengeToken != "":
-				bot.ChallengePage(tw, c.BotChallengeToken)
+				if bot.IsHTMLNavigation(c.Request) {
+					bot.ChallengePageForRequest(tw, c.Request, c.BotChallengeToken)
+				} else {
+					writeAPIChallenge(tw, c.RequestID)
+				}
 			case decision.Phase == "bot":
-				response.Block(tw, c, http.StatusServiceUnavailable, "challenge unavailable")
+				if bot.IsHTMLNavigation(c.Request) {
+					response.Block(tw, c, http.StatusServiceUnavailable, "challenge unavailable")
+				} else {
+					writeAPIChallengeStatus(tw, http.StatusServiceUnavailable, "challenge_unavailable", c.RequestID)
+				}
 			default:
-				response.Challenge(tw, c)
+				if bot.IsHTMLNavigation(c.Request) {
+					response.Challenge(tw, c)
+				} else {
+					writeAPIChallenge(tw, c.RequestID)
+				}
 			}
 		} else {
 			status := http.StatusForbidden
+			code := "request_blocked"
 			if decision.Action == reqctx.ActionRateLimited {
 				status = http.StatusTooManyRequests
+				code = "rate_limited"
 			}
-			response.Block(tw, c, status, decision.Reason)
+			if bot.IsHTMLNavigation(c.Request) {
+				response.Block(tw, c, status, decision.Reason)
+			} else {
+				writeAPIChallengeStatus(tw, status, code, c.RequestID)
+			}
 		}
 		return
 	}
@@ -333,6 +351,19 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if phase := e.botPhase.Load(); phase != nil && tw.status == http.StatusNotFound {
 		phase.RecordResponse(c.Site.ID, c.ClientIP, c.Path, tw.status)
 	}
+}
+
+func writeAPIChallenge(w http.ResponseWriter, requestID string) {
+	writeAPIChallengeStatus(w, http.StatusForbidden, "challenge_required", requestID)
+}
+
+func writeAPIChallengeStatus(w http.ResponseWriter, status int, code, requestID string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Request-ID", requestID)
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, `{"error":%q,"request_id":%q}`, code, requestID)
 }
 
 func needsBodyInspection(site *wafcore.Site) bool {
@@ -349,7 +380,7 @@ func needsBodyInspection(site *wafcore.Site) bool {
 
 func (e *Edge) recoverPanic(tw *trackingWriter, c *reqctx.RequestCtx, recovered any) {
 	e.metrics.Blocked("panic")
-	log.Printf("edge panic request_id=%s: phục hồi sau panic: %v", c.RequestID, recovered)
+	log.Printf("edge panic request_id=%q: phục hồi sau panic: %q", c.RequestID, fmt.Sprint(recovered))
 	if tw.wrote {
 		if h, ok := tw.ResponseWriter.(http.Hijacker); ok {
 			conn, _, err := h.Hijack()

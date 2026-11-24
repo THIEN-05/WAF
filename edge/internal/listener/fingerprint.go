@@ -10,9 +10,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const maxClientHelloBytes = 16 << 10
+const maxCapturedHelloBytes = 64 << 10
+const maxClientHelloRecords = 16
 
 // helloCaptureConn observes the bytes TLS reads without consuming or delaying them.
 type helloCaptureConn struct {
@@ -27,7 +30,7 @@ func (c *helloCaptureConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.mu.Lock()
-		remaining := maxClientHelloBytes - len(c.buf)
+		remaining := maxCapturedHelloBytes - len(c.buf)
 		if remaining > 0 {
 			copyN := n
 			if copyN > remaining {
@@ -35,9 +38,66 @@ func (c *helloCaptureConn) Read(p []byte) (int, error) {
 			}
 			c.buf = append(c.buf, p[:copyN]...)
 		}
+		complete := rawRecordsComplete(c.buf)
+		observed := []byte(nil)
+		if complete {
+			observed = append([]byte(nil), c.buf...)
+		}
 		c.mu.Unlock()
+		if complete && (parseErrIsComplete(observed) || rawClientHelloComplete(observed)) {
+			_ = c.SetReadDeadline(time.Time{})
+		}
 	}
 	return n, err
+}
+
+func parseErrIsComplete(raw []byte) bool {
+	ja3, _, err := fingerprintClientHello(raw)
+	return err == nil && ja3 != ""
+}
+
+func rawRecordsComplete(raw []byte) bool {
+	records := 0
+	for offset := 0; offset < len(raw); {
+		if len(raw)-offset < 5 {
+			return false
+		}
+		length := int(binary.BigEndian.Uint16(raw[offset+3 : offset+5]))
+		if length == 0 || len(raw)-offset-5 < length {
+			return false
+		}
+		offset += 5 + length
+		records++
+		if records > maxClientHelloRecords {
+			return false
+		}
+	}
+	return len(raw) > 0
+}
+
+func rawClientHelloComplete(raw []byte) bool {
+	var handshake []byte
+	for offset := 0; offset < len(raw); {
+		if len(raw)-offset < 5 || raw[offset] != 22 {
+			return false
+		}
+		length := int(binary.BigEndian.Uint16(raw[offset+3 : offset+5]))
+		if length == 0 || len(raw)-offset-5 < length {
+			return false
+		}
+		handshake = append(handshake, raw[offset+5:offset+5+length]...)
+		offset += 5 + length
+		if len(handshake) >= 4 {
+			if handshake[0] != 1 {
+				return false
+			}
+			total := 4 + (int(handshake[1]) << 16) + (int(handshake[2]) << 8) + int(handshake[3])
+			if len(handshake) >= total {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *helloCaptureConn) Fingerprint() (string, string) {
@@ -50,27 +110,62 @@ func (c *helloCaptureConn) Fingerprint() (string, string) {
 	return c.ja3, c.ja4
 }
 
-type helloCaptureListener struct{ net.Listener }
+type helloCaptureListener struct {
+	net.Listener
+	PeekTimeout time.Duration
+}
 
 func (l helloCaptureListener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
+	if l.PeekTimeout > 0 {
+		_ = c.SetReadDeadline(time.Now().Add(l.PeekTimeout))
+	}
 	return &helloCaptureConn{Conn: c}, nil
 }
 
 func fingerprintClientHello(record []byte) (string, string, error) {
-	// Parse only a single TLS record containing a complete ClientHello. A fragmented
-	// or oversized hello is intentionally left without a fingerprint.
-	if len(record) < 9 || record[0] != 22 {
-		return "", "", fmt.Errorf("not a TLS handshake record")
+	if len(record) > maxCapturedHelloBytes {
+		return "", "", fmt.Errorf("captured TLS hello exceeds limit")
 	}
-	recordLen := int(binary.BigEndian.Uint16(record[3:5]))
-	if recordLen > maxClientHelloBytes-5 || len(record) < 5+recordLen {
-		return "", "", fmt.Errorf("incomplete TLS record")
+	// Reassemble a ClientHello fragmented over handshake records. The retained
+	// handshake payload is strictly capped at 16 KiB; record headers do not count
+	// toward that protocol limit.
+	var b []byte
+	records := 0
+	for offset := 0; offset < len(record); {
+		if len(record)-offset < 5 || record[offset] != 22 {
+			return "", "", fmt.Errorf("not a complete TLS handshake record")
+		}
+		recordLen := int(binary.BigEndian.Uint16(record[offset+3 : offset+5]))
+		if recordLen == 0 || len(record)-offset-5 < recordLen {
+			return "", "", fmt.Errorf("incomplete TLS record")
+		}
+		b = append(b, record[offset+5:offset+5+recordLen]...)
+		offset += 5 + recordLen
+		records++
+		if records > maxClientHelloRecords {
+			return "", "", fmt.Errorf("ClientHello spans too many TLS records")
+		}
+		if len(b) >= 4 {
+			hlen := int(b[1])<<16 | int(b[2])<<8 | int(b[3])
+			if hlen+4 > maxClientHelloBytes {
+				return "", "", fmt.Errorf("ClientHello exceeds %d bytes", maxClientHelloBytes)
+			}
+			if len(b) >= hlen+4 {
+				b = b[:hlen+4]
+				break
+			}
+		}
+		if len(b) > maxClientHelloBytes {
+			return "", "", fmt.Errorf("ClientHello exceeds %d bytes", maxClientHelloBytes)
+		}
 	}
-	b := record[5 : 5+recordLen]
+	if len(b) < 4 {
+		return "", "", fmt.Errorf("incomplete ClientHello handshake")
+	}
 	if len(b) < 4 || b[0] != 1 {
 		return "", "", fmt.Errorf("not a ClientHello")
 	}
