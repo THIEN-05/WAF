@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/wafplatform/edge/internal/bot"
 	"github.com/example/wafplatform/edge/internal/pipeline"
 	"github.com/example/wafplatform/edge/internal/proxy"
 	"github.com/example/wafplatform/edge/internal/reqctx"
@@ -28,6 +29,70 @@ func (panicPhase) Name() string                              { return "panic-tes
 func (panicPhase) Handle(*reqctx.RequestCtx) reqctx.Decision { panic("phase boom") }
 func siteSnapshot(status, failMode, origin string, version uint64) *wafcore.Snapshot {
 	return &wafcore.Snapshot{SchemaVersion: 1, Version: version, GeneratedAt: time.Now(), Global: wafcore.GlobalConfig{ManagedRuleset: "test"}, Sites: []wafcore.Site{{ID: "site", TenantID: "tenant", Status: status, Plan: "pro", Domains: []string{"site.test"}, Origins: []wafcore.Origin{{URL: origin, Weight: 1}}, FailMode: failMode}}}
+}
+
+func TestBotChallengeVerifyEndpointRequiresEntitlementAndRejectsReplay(t *testing.T) {
+	snap := siteSnapshot("active", "closed", "http://127.0.0.1:8080", 1)
+	snap.Sites[0].Bot = wafcore.BotConfig{Mode: "challenge", Threshold: 30, ChallengeDifficulty: 8}
+	snap.Sites[0].Entitlements.BotJSChallenge = true
+	snap.Sites[0].Secrets.ChallengeHMACKeyID = "challenge-v1"
+	e := New(snap, "edge-test")
+	defer e.Close()
+	key := []byte(strings.Repeat("k", 32))
+	e.SetBotChallengeKeys(bot.StaticKeyRing{Active: "challenge-v1", Keys: map[string][]byte{"challenge-v1": key}})
+
+	challengeReq := httptest.NewRequest(http.MethodGet, "http://site.test/private", nil)
+	challengeReq.Host, challengeReq.RemoteAddr = "site.test", "198.51.100.6:12345"
+	challengeReq.Header.Set("User-Agent", "curl/8.0")
+	challengeResp := httptest.NewRecorder()
+	e.ServeHTTP(challengeResp, challengeReq)
+	if challengeResp.Code != http.StatusForbidden || !strings.Contains(challengeResp.Body.String(), "/__waf/verify") {
+		t.Fatalf("challenge response status=%d body=%q", challengeResp.Code, challengeResp.Body.String())
+	}
+
+	ticket, err := e.botManager.Load().IssueForKey("site", "challenge-v1", "curl/8.0", net.ParseIP("198.51.100.6"), 8, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := bot.FindNonce(ticket, 8)
+	body := fmt.Sprintf(`{"token":%q,"nonce":%q}`, ticket, nonce)
+	verify := httptest.NewRequest(http.MethodPost, "http://site.test/__waf/verify", strings.NewReader(body))
+	verify.Host, verify.RemoteAddr = "site.test", "198.51.100.6:12345"
+	verify.Header.Set("User-Agent", "curl/8.0")
+	response := httptest.NewRecorder()
+	e.ServeHTTP(response, verify)
+	if response.Code != http.StatusNoContent || len(response.Result().Cookies()) != 1 || !response.Result().Cookies()[0].Secure {
+		t.Fatalf("verification response=%d cookies=%v body=%q", response.Code, response.Result().Cookies(), response.Body.String())
+	}
+	replay := httptest.NewRecorder()
+	replayedRequest := httptest.NewRequest(http.MethodPost, "http://site.test/__waf/verify", strings.NewReader(body))
+	replayedRequest.Host, replayedRequest.RemoteAddr = "site.test", "198.51.100.6:12345"
+	replayedRequest.Header.Set("User-Agent", "curl/8.0")
+	e.ServeHTTP(replay, replayedRequest)
+	if replay.Code != http.StatusForbidden {
+		t.Fatalf("replayed proof status=%d want 403", replay.Code)
+	}
+	verifiedRequest := httptest.NewRequest(http.MethodGet, "http://site.test/private", nil)
+	verifiedRequest.Host, verifiedRequest.RemoteAddr = "site.test", "198.51.100.6:12345"
+	verifiedRequest.Header.Set("User-Agent", "curl/8.0")
+	verifiedRequest.AddCookie(response.Result().Cookies()[0])
+	verifiedResponse := httptest.NewRecorder()
+	e.ServeHTTP(verifiedResponse, verifiedRequest)
+	if verifiedResponse.Code == http.StatusForbidden && strings.Contains(verifiedResponse.Body.String(), "Checking your browser") {
+		t.Fatal("valid verification cookie did not bypass challenge")
+	}
+
+	snap.Sites[0].Entitlements.BotJSChallenge = false
+	if err := e.Apply(snap); err != nil {
+		t.Fatal(err)
+	}
+	freeVerify := httptest.NewRecorder()
+	freeRequest := httptest.NewRequest(http.MethodPost, "http://site.test/__waf/verify", strings.NewReader(body))
+	freeRequest.Host, freeRequest.RemoteAddr = "site.test", "198.51.100.6:12345"
+	e.ServeHTTP(freeVerify, freeRequest)
+	if freeVerify.Code != http.StatusNotFound {
+		t.Fatalf("unentitled verification status=%d want 404", freeVerify.Code)
+	}
 }
 func localOrigin(t *testing.T, handler http.HandlerFunc) (*httptest.Server, string) {
 	t.Helper()

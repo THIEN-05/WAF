@@ -2,6 +2,7 @@ package reqctx
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,13 @@ import (
 
 	"github.com/example/wafplatform/pkg/wafcore"
 )
+
+type fingerprintContextKey struct{}
+type FingerprintSource interface{ Fingerprint() (ja3, ja4 string) }
+
+func WithFingerprintSource(ctx context.Context, source FingerprintSource) context.Context {
+	return context.WithValue(ctx, fingerprintContextKey{}, source)
+}
 
 type Action uint8
 
@@ -47,6 +55,9 @@ type RequestCtx struct {
 	GeoASN                        uint32
 	GeoResolved                   bool
 	WAFScore                      int
+	BotScore                      int
+	BotVerified                   bool
+	BotChallengeToken             string
 	Method, Path, Query, Protocol string
 	Entitlements                  wafcore.Entitlements
 	decision                      Decision
@@ -81,10 +92,16 @@ func New(r *http.Request, s *wafcore.Snapshot, requestID string, clientIP net.IP
 	c.Site = nil
 	c.JA3 = ""
 	c.JA4 = ""
+	if source, ok := r.Context().Value(fingerprintContextKey{}).(FingerprintSource); ok && source != nil {
+		c.JA3, c.JA4 = source.Fingerprint()
+	}
 	c.GeoCountry = ""
 	c.GeoASN = 0
 	c.GeoResolved = false
 	c.WAFScore = 0
+	c.BotScore = 0
+	c.BotVerified = false
+	c.BotChallengeToken = ""
 	c.Entitlements = wafcore.Entitlements{}
 	c.decision = Decision{}
 	c.parsedQuery = nil
@@ -114,6 +131,9 @@ func Release(c *RequestCtx) {
 	c.GeoASN = 0
 	c.GeoResolved = false
 	c.WAFScore = 0
+	c.BotScore = 0
+	c.BotVerified = false
+	c.BotChallengeToken = ""
 	c.Entitlements = wafcore.Entitlements{}
 	c.decision = Decision{}
 	c.parsedQuery = nil
@@ -159,6 +179,8 @@ func (c *RequestCtx) String(field string) string {
 		return c.GeoCountry
 	case "tls.ja3":
 		return c.JA3
+	case "tls.ja4":
+		return c.JA4
 	}
 	return ""
 }
@@ -173,6 +195,8 @@ func (c *RequestCtx) Number(field string) float64 {
 		}
 	case "waf.score":
 		return float64(c.WAFScore)
+	case "bot.score":
+		return float64(c.BotScore)
 	}
 	return 0
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/example/wafplatform/edge/internal/access"
+	"github.com/example/wafplatform/edge/internal/bot"
 	"github.com/example/wafplatform/edge/internal/pipeline"
 	"github.com/example/wafplatform/edge/internal/proxy"
 	"github.com/example/wafplatform/edge/internal/ratelimit"
@@ -44,6 +45,11 @@ type Edge struct {
 	via          string
 	security     response.SecurityHeaders
 	poolFactory  func([]wafcore.Origin, string) *proxy.OriginPool
+	botManager   atomic.Pointer[bot.ChallengeManager]
+	botVerified  bot.VerifiedBotChecker
+	botIPTrust   bot.IPReputation
+	botFPTrust   bot.FingerprintReputation
+	botPhase     atomic.Pointer[bot.Phase]
 	managedWAF   []waf.Rule
 	poolMu       sync.Mutex
 	pools        map[string]*proxy.OriginPool
@@ -63,6 +69,7 @@ func New(s *wafcore.Snapshot, via string) *Edge {
 	h := pipeline.NewHistogram()
 	healthCtx, healthCancel := context.WithCancel(context.Background())
 	e := &Edge{via: via, metrics: h, histogram: h, poolFactory: proxy.NewOriginPool, pools: map[string]*proxy.OriginPool{}, healthCtx: healthCtx, healthCancel: healthCancel}
+	e.botManager.Store(bot.NewChallengeManager(bot.StaticKeyRing{}))
 	e.banTable = access.NewBanTable(100_000, time.Now)
 	e.rateLimiter = ratelimit.NewLimiter(ratelimit.Config{})
 	e.underAttack = access.DisabledUnderAttack{}
@@ -123,6 +130,28 @@ func (e *Edge) SetUnderAttack(attack access.UnderAttack) {
 func (e *Edge) SetRedisSync(syncer *ratelimit.AsyncRedisSync) {
 	e.rateLimiter.SetRedisSync(syncer)
 }
+func (e *Edge) SetBotChallengeKeys(keys bot.KeyRing) {
+	e.trafficMu.Lock()
+	defer e.trafficMu.Unlock()
+	if manager := e.botManager.Load(); manager != nil {
+		manager.SetKeyRing(keys)
+	} else {
+		e.botManager.Store(bot.NewChallengeManager(keys))
+	}
+	e.rebuildPipelineLocked()
+}
+func (e *Edge) SetVerifiedBotResolver(resolver bot.VerifiedBotChecker) {
+	e.trafficMu.Lock()
+	defer e.trafficMu.Unlock()
+	e.botVerified = resolver
+	e.rebuildPipelineLocked()
+}
+func (e *Edge) SetBotReputation(ip bot.IPReputation, fingerprints bot.FingerprintReputation) {
+	e.trafficMu.Lock()
+	defer e.trafficMu.Unlock()
+	e.botIPTrust, e.botFPTrust = ip, fingerprints
+	e.rebuildPipelineLocked()
+}
 func (e *Edge) SetPipeline(p *pipeline.Pipeline) { e.pipeline.Store(p) }
 
 func (e *Edge) buildPipeline(snapshot *wafcore.Snapshot) (*pipeline.Pipeline, error) {
@@ -136,7 +165,13 @@ func (e *Edge) buildPipeline(snapshot *wafcore.Snapshot) (*pipeline.Pipeline, er
 	if err != nil {
 		return nil, err
 	}
-	return pipeline.New(e.metrics, accessPhase, ratePhase, rulesPhase, wafPhase), nil
+	botPhase := bot.NewPhase(e.botManager.Load(), e.botVerified)
+	if e.botIPTrust != nil {
+		botPhase.IPTrust = e.botIPTrust
+	}
+	botPhase.Fingerprints = e.botFPTrust
+	e.botPhase.Store(botPhase)
+	return pipeline.New(e.metrics, accessPhase, ratePhase, rulesPhase, wafPhase, botPhase), nil
 }
 
 func (e *Edge) rebuildPipelineLocked() {
@@ -225,6 +260,14 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		response.Block(tw, c, status, http.StatusText(status))
 		return
 	}
+	if r.URL.Path == "/__waf/verify" {
+		if !c.Site.Entitlements.BotJSChallenge {
+			http.NotFound(tw, r)
+			return
+		}
+		e.botManager.Load().ServeVerifyKey(tw, r, c.Site.ID, c.Site.Secrets.ChallengeHMACKeyID, c.ClientIP, c.Header("User-Agent"))
+		return
+	}
 	requestPipeline := state.pipeline
 	if override := e.pipeline.Load(); override != nil {
 		requestPipeline = override
@@ -243,7 +286,14 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			tw.Header().Set("Retry-After", fmt.Sprintf("%d", retrySeconds))
 		}
 		if decision.Action == reqctx.ActionChallenge {
-			response.Challenge(tw, c)
+			switch {
+			case decision.Phase == "bot" && c.BotChallengeToken != "":
+				bot.ChallengePage(tw, c.BotChallengeToken)
+			case decision.Phase == "bot":
+				response.Block(tw, c, http.StatusServiceUnavailable, "challenge unavailable")
+			default:
+				response.Challenge(tw, c)
+			}
 		} else {
 			status := http.StatusForbidden
 			if decision.Action == reqctx.ActionRateLimited {
@@ -254,6 +304,9 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	e.proxySite(tw, c)
+	if phase := e.botPhase.Load(); phase != nil && tw.status == http.StatusNotFound {
+		phase.RecordResponse(c.Site.ID, c.ClientIP, c.Path, tw.status)
+	}
 }
 
 func (e *Edge) recoverPanic(tw *trackingWriter, c *reqctx.RequestCtx, recovered any) {
@@ -315,12 +368,14 @@ func actionName(a reqctx.Action) string {
 
 type trackingWriter struct {
 	http.ResponseWriter
-	wrote bool
+	wrote  bool
+	status int
 }
 
 func (w *trackingWriter) WriteHeader(code int) {
 	if !w.wrote {
 		w.wrote = true
+		w.status = code
 		w.ResponseWriter.WriteHeader(code)
 	}
 }

@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/example/wafplatform/edge/internal/reqctx"
 )
 
 type Fingerprinter interface {
@@ -174,10 +176,19 @@ func Start(cfg Config, handler http.Handler) (*Servers, error) {
 		_, _ = cfg.Fingerprinter.Fingerprint(hello)
 		return cfg.Cache.Get(hello.ServerName), nil
 	}}
-	tlsSrv := &http.Server{Handler: handler, TLSConfig: tlsCfg, ReadHeaderTimeout: cfg.ReadHeaderTimeout, IdleTimeout: cfg.IdleTimeout, MaxHeaderBytes: cfg.MaxHeaderBytes}
+	tlsSrv := &http.Server{Handler: handler, TLSConfig: tlsCfg, ReadHeaderTimeout: cfg.ReadHeaderTimeout, IdleTimeout: cfg.IdleTimeout, MaxHeaderBytes: cfg.MaxHeaderBytes,
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			if tlsConn, ok := conn.(*tls.Conn); ok {
+				if capture, ok := tlsConn.NetConn().(*helloCaptureConn); ok {
+					return reqctx.WithFingerprintSource(ctx, capture)
+				}
+			}
+			return ctx
+		},
+	}
 	servers := &Servers{HTTP: httpSrv, TLS: tlsSrv, limit: limiter, listeners: []net.Listener{httpLn, tlsLn}, HTTPAddr: httpLn.Addr().String(), TLSAddr: tlsLn.Addr().String()}
 	go func() { _ = httpSrv.Serve(httpLn) }()
-	go func() { _ = tlsSrv.Serve(tls.NewListener(tlsLn, tlsCfg)) }()
+	go func() { _ = tlsSrv.Serve(tls.NewListener(helloCaptureListener{Listener: tlsLn}, tlsCfg)) }()
 	return servers, nil
 }
 func (s *Servers) Shutdown(ctx context.Context) error {

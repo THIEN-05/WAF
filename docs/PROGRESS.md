@@ -1,5 +1,39 @@
 # Tiến độ
 
+## P8 — fingerprint TLS và bot challenge — 2026-11-23
+
+### Đã xác minh
+
+- WSL Ubuntu / Go 1.26.11: `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...` → `0 issues.`; `go vet ./...` → exit 0; `go build ./...` → exit 0; `go test -count=1 ./...` → PASS; `go test -race -count=1 ./...` → PASS. Các bài test loopback/TLS chạy trong WSL; Windows sandbox chặn kết nối localhost nên không dùng kết quả Windows cho chúng.
+- Thêm capture thụ động tối đa 16 KiB trên net.Conn trước TLS, chuyển nguồn fingerprint qua `http.Server.ConnContext`, gán JA3/JA4 vào `RequestCtx`. Parser bỏ GREASE, tạo JA3 MD5 tương thích chuẩn và JA4 theo định dạng FoxIO; lỗi/truncated/malformed để trống. Golden test cho fixture Go-like, curl-like, browser-fake; test junk/cắt ngắn; HTTPS loopback chứng minh fingerprint thực đến RequestCtx.
+- Bot score clamp 0–100, có tín hiệu UA thư viện/headless/rỗng và giả danh crawler, thiếu Accept/Accept-Language, interface reputation IP/ASN, interface fingerprint automation, tốc độ 10 giây, 404, đường dẫn số tuần tự, thiếu cookie đã ký và kết quả challenge trước đó; bảng map hành vi có trần 100.000 key. Verified bot dùng reverse DNS → suffix Google/Bing/DuckDuckGo → forward DNS equality, cache TTL/cap, hoặc prefix IP được operator cấp.
+- JS challenge tại `/__waf/verify`: PoW SHA-256 difficulty 1–24 (mặc định 18), ticket 5 phút dùng một lần trong replay cache giới hạn từng edge, cookie HMAC-SHA256 30 phút ràng buộc site/UA hash/IPv4 /24 hoặc IPv6 /64; key ID hỗ trợ key cũ khi xoay. Test false/expired/wrong-UA/wrong-/24 cookie, PoW sai, replay, old key, endpoint, cookie bypass, verified bot bypass và entitlement Free.
+- Keyring có interface `bot.KeyRing`; snapshot chỉ giữ `challenge_hmac_key_id` theo contract control-plane. Adapter env nhận `EDGE_CHALLENGE_HMAC_KEYS` với key base64 tối thiểu 32 byte, không log khóa; bật entitlement mà thiếu keyring thì process lỗi cấu hình rõ ràng. Turnstile có `CaptchaVerifier` interface/stub từ chối mặc định.
+- Mọi test loopback liên quan có tên `TestLoopback...`; sandbox Windows không cho kết nối tới địa chỉ loopback, vì vậy các test này chỉ chạy được ngoài sandbox Windows hoặc trong WSL/Linux.
+
+### Chưa xác minh — lệnh tự chạy lại
+
+- Chưa chạy Govulncheck (không thay đổi dependency); lệnh: `govulncheck ./...`.
+- Chưa có linter binary cài sẵn; lần xác minh dùng `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...`.
+- Chưa tích hợp nguồn uy tín ASN/Tor/vendor range sản xuất; interface có thể nối adapter. Thứ tự header không thể lấy từ `http.Request.Header` vì net/http chỉ cung cấp map đã parse.
+- Chưa có adapter phân phối/rotate keyring tự động qua mTLS CP↔edge; operator hiện phải provision env hoặc inject `bot.KeyRing`.
+
+### Nợ kỹ thuật
+
+- **TODO P8-1:** replay cache proof nằm trong bộ nhớ từng edge; muốn ngăn cùng proof dùng trên edge khác cần shared bounded replay store.
+- **TODO P8-2:** net/http không giữ thứ tự wire của header; bổ sung parser quan sát được thứ tự mà vẫn phòng request smuggling nếu cần dùng tín hiệu này.
+- **TODO P8-3:** nối `bot.KeyRing` với luồng phân phối bí mật qua mTLS; giữ key ID cũ ít nhất 30 phút sau khi ngừng ký.
+- **TODO P8-4:** adapter ASN/Tor/verified-bot prefix do operator/CP cung cấp và Turnstile thật chưa được triển khai. JS challenge chỉ làm bot đơn giản tốn chi phí hơn, không chặn bot chạy trình duyệt thật.
+
+### Lệnh tự chạy lại
+
+```sh
+golangci-lint run ./...
+go vet ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
+```
+
 ## P4d — giới hạn scan và coverage dev — 2026-11-23
 
 ### Đã xác minh

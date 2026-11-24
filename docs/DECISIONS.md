@@ -58,7 +58,7 @@ Ngày: 2026-11-20
 
 - Metrics được đưa sau interface `pipeline.Metrics`; bản đầu tự xuất Prometheus text format để tránh thêm dependency ngoài trong môi trường chưa có mạng. Histogram pha, counter chặn và `log_dropped` không dùng `site_id` làm label toàn cục. Khi dependency được phép tải, thay lớp xuất bằng `client_golang` mà giữ interface này.
 - PROXY protocol hiện chỉ hỗ trợ v1 và chỉ nhận từ CIDR tin cậy. TODO: thêm v2 để tương thích NLB.
-- JA3/JA4 hiện là `Fingerprinter` stub trả chuỗi rỗng. TODO: triển khai fingerprint ClientHello và kiểm thử tương thích.
+- P8 đã thay `Fingerprinter` stub bằng capture ClientHello có giới hạn 16 KiB và JA3/JA4; xem phần P8 ở cuối file. Capture hiện chỉ tính fingerprint cho ClientHello nằm trọn trong một TLS record; hello phân mảnh qua nhiều TLS records để trống an toàn.
 - Snapshot production luôn phải qua Ed25519 verify theo `kid`; unsigned local JSON/YAML chỉ được bật ngoài production với `EDGE_DEV_UNSIGNED=1`. Keyring nhận nhiều mục qua env hoặc file.
 - DNS origin được kiểm tra khi nạp cấu hình và resolve/recheck ngay trong dial để chống DNS rebinding. Chuẩn hóa domain hiện hỗ trợ lowercase, port/trailing dot và punycode cơ bản; TODO: UTS #46 đầy đủ nếu yêu cầu domain quốc tế hóa nâng cao.
 - Certificate mặc định tự ký chỉ để khởi tạo listener và hoàn tất TLS handshake; router vẫn từ chối Host không khớp SNI. Chứng chỉ production được nạp từ file; phân phối certificate qua kênh mTLS CP↔edge còn chờ phần tích hợp control plane.
@@ -71,6 +71,15 @@ Ngày: 2026-11-20
 - `fail_open` khi vượt ngân sách có rủi ro bỏ qua rule chưa kịp chạy; đó là lựa chọn mặc định cho Free để tránh từ chối nhầm, không phải bảo đảm WAF. Gói trả phí nên dùng `fail_mode=closed`; WAF mode `challenge` có thể dùng cho rule match bình thường, nhưng budget timeout vẫn áp dụng `fail_mode`. Cấu hình `site.fail_mode` tường minh luôn được tôn trọng.
 - Audit WAF đi qua queue bounded, enqueue không chặn request; queue đầy thì bỏ sự kiện và tăng counter. Hiện writer mặc định là in-memory để quan sát/test, không bền vững qua restart. TODO-2: P6a thay adapter này bằng telemetry bền vững và xác minh giao nhận/dropped metrics.
 - Corpus v2 đã bị xem khi tinh chỉnh nên được xem là dev, không phải held-out. Không dùng nó để chốt chất lượng; benchmark TPR/FPR trên thư mục corpus bên ngoài chỉ đánh giá file `attacks.tsv`/`clean.tsv` do người cung cấp, không nạp rules từ thư mục đó.
+
+## Quyết định P8 — bot management và bí mật challenge — 2026-11-23
+
+- Snapshot chỉ mang `challenge_hmac_key_id`; giá trị khóa HMAC thực tế không được đặt rõ trong snapshot. Đây là hợp đồng CP↔edge ở `docs/control-plane.md` §2.3 (bí mật truyền qua mTLS) và quy tắc snapshot ở §5.8. Edge nhận keyring qua interface `bot.KeyRing`; snapshot định danh khóa dùng cho challenge của site. Bản hiện tại có adapter env operator-provisioned (`EDGE_CHALLENGE_HMAC_KEYS`) để chạy/test; tích hợp nhận và xoay keyring tự động qua mTLS chưa có, là TODO P8-3. Khi xoay khóa, keyring phải giữ key ID cũ tối thiểu 30 phút sau khi ngừng ký cookie mới.
+- Free không có `bot_js_challenge`; khả năng được thể hiện bằng entitlement, còn `bot.mode` là policy. Challenge PoW mặc định 18 bit, cấu hình 1–24 bit; proof ticket sống 5 phút và cookie HMAC sống 30 phút, ràng buộc site, hash User-Agent, IPv4 /24 hoặc IPv6 /64.
+- PoW ticket được dùng một lần trong cache replay có giới hạn riêng từng edge. Đây không phải replay store phân tán; credential cookie vẫn dùng được ở edge khác trong TTL nhờ cùng keyring. TODO P8-1: chuyển ticket replay state sang telemetry/cache dùng chung nếu threat model yêu cầu chống replay xuyên edge.
+- Bot scoring chỉ nhận header có trong `net/http.Request`; Go không giữ thứ tự byte của header sau parse nên tín hiệu thứ tự header chưa được chấm. TODO P8-2: nếu cần, bổ sung parser HTTP có lưu thứ tự mà vẫn giữ an toàn request smuggling.
+- DNS xác minh bot có cache TTL/cap và timeout 300 ms; operator phải cấp suffix/dải IP chính thức cho từng nhà cung cấp. Không tin User-Agent đơn lẻ.
+- JS challenge chỉ làm tăng chi phí cho bot đơn giản; nó không ngăn bot nâng cao dùng trình duyệt thật. Turnstile hiện chỉ có interface/stub từ chối mặc định; chưa có API secret hoặc xác minh dịch vụ thật.
 
 ## Quyết định P3 — access và rate limiting
 

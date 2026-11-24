@@ -385,8 +385,8 @@ Loader YAML hỗ trợ `path`, `args`, `body`, `cookies`, `headers` và `protoco
 1. Khi điểm vượt ngưỡng, trả trang thử thách chứa đoạn JS nhỏ.  
 2. JS giải **proof-of-work** (tìm nonce để SHA-256 có tiền tố số 0, độ khó điều chỉnh được) và thu một số tín hiệu trình duyệt đơn giản.  
 3. Gửi kết quả tới đường dẫn dành riêng (ví dụ /\_\_waf/verify).  
-4. Edge kiểm tra PoW và tín hiệu, rồi đặt cookie đã ký: nội dung (site, hash User-Agent, có thể cả /24 của IP, hạn dùng) \+ **HMAC-SHA256** bằng khóa riêng của site (có xoay khóa).  
-5. Các request sau mang cookie; **bất kỳ edge nào cũng kiểm tra được** vì khóa nằm trong snapshot (không cần trạng thái dùng chung). Hiệu lực khoảng 30 phút.
+4. Edge kiểm tra PoW và tín hiệu, rồi đặt cookie đã ký: nội dung (site, hash User-Agent, /24 IPv4 hoặc /64 IPv6, hạn dùng) + **HMAC-SHA256** bằng khóa riêng của site (có xoay khóa).
+5. Các request sau mang cookie; **bất kỳ edge nào cũng kiểm tra được** nhờ cùng keyring. Snapshot chỉ mang `challenge_hmac_key_id`; khóa bí mật được chuyển riêng qua mTLS theo hợp đồng `docs/control-plane.md` §2.3, không đặt khóa rõ trong snapshot. Hiệu lực khoảng 30 phút; giữ key ID cũ tới khi cookie cuối cùng hết hạn.
 
 **Phân tầng theo gói**: Free không có; Pro có JS challenge; Business thêm CAPTCHA (dịch vụ bên thứ ba như Turnstile/hCaptcha, edge gọi API xác minh); Enterprise thêm mô hình tùy chỉnh.
 

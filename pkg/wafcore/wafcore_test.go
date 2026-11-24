@@ -180,6 +180,15 @@ func TestActionValidation(t *testing.T) {
 func validSnapshot() Snapshot {
 	return Snapshot{SchemaVersion: 1, Version: 2, GeneratedAt: time.Now().UTC(), Global: GlobalConfig{ManagedRuleset: "crs-lite"}, Sites: []Site{{ID: "s1", TenantID: "t1", Status: "active", Plan: "pro", Domains: []string{"example.com"}, Origins: []Origin{{URL: "https://origin.example", Weight: 1, TLSVerify: true}}, FailMode: "open", Rules: []Rule{{ID: "r1", Expression: "http.path == '/x'", Action: "block"}}}}}
 }
+func TestSnapshotRejectsBotChallengeEntitlementForFreePlan(t *testing.T) {
+	s := validSnapshot()
+	s.Sites[0].Plan = "free"
+	s.Sites[0].Entitlements.BotJSChallenge = true
+	s.Sites[0].Secrets.ChallengeHMACKeyID = "challenge-v1"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "Free plan") {
+		t.Fatalf("free challenge entitlement validation error=%v", err)
+	}
+}
 func TestSnapshotValidateAndSignVerify(t *testing.T) {
 	s := validSnapshot()
 	if err := s.Validate(); err != nil {

@@ -26,10 +26,13 @@ type GlobalConfig struct {
 }
 
 type Entitlements struct {
-	MaxRules       int `json:"max_rules" yaml:"max_rules"`
-	MaxBodyBytes   int `json:"max_body_bytes" yaml:"max_body_bytes"`
-	MaxRegexBytes  int `json:"max_regex_bytes" yaml:"max_regex_bytes"`
-	MaxCounterKeys int `json:"max_counter_keys" yaml:"max_counter_keys"`
+	MaxRules       int  `json:"max_rules" yaml:"max_rules"`
+	MaxBodyBytes   int  `json:"max_body_bytes" yaml:"max_body_bytes"`
+	MaxRegexBytes  int  `json:"max_regex_bytes" yaml:"max_regex_bytes"`
+	MaxCounterKeys int  `json:"max_counter_keys" yaml:"max_counter_keys"`
+	BotJSChallenge bool `json:"bot_js_challenge" yaml:"bot_js_challenge"`
+	BotCaptcha     bool `json:"bot_captcha" yaml:"bot_captcha"`
+	VerifiedBots   bool `json:"verified_bots" yaml:"verified_bots"`
 }
 
 type Site struct {
@@ -105,8 +108,9 @@ type Rule struct {
 }
 
 type BotConfig struct {
-	Mode      string `json:"mode" yaml:"mode"`
-	Threshold int    `json:"threshold" yaml:"threshold"`
+	Mode                string `json:"mode" yaml:"mode"`
+	Threshold           int    `json:"threshold" yaml:"threshold"`
+	ChallengeDifficulty int    `json:"challenge_difficulty,omitempty" yaml:"challenge_difficulty,omitempty"`
 }
 
 type CacheConfig struct {
@@ -180,6 +184,24 @@ func (s Snapshot) Validate() error {
 		}
 		if site.WAF.Mode != "" && site.WAF.Mode != "off" && site.WAF.Mode != "monitor" && site.WAF.Mode != "block" && site.WAF.Mode != "challenge" {
 			errs = append(errs, p+".waf.mode: must be off, monitor, block, or challenge")
+		}
+		if site.Bot.Mode != "" && site.Bot.Mode != "off" && site.Bot.Mode != "monitor" && site.Bot.Mode != "block" && site.Bot.Mode != "challenge" {
+			errs = append(errs, p+".bot.mode: must be off, monitor, block, or challenge")
+		}
+		if site.Bot.Threshold < 0 || site.Bot.Threshold > 100 {
+			errs = append(errs, p+".bot.threshold: must be between 0 and 100")
+		}
+		if site.Bot.ChallengeDifficulty < 0 || site.Bot.ChallengeDifficulty > 24 {
+			errs = append(errs, p+".bot.challenge_difficulty: must be between 0 and 24")
+		}
+		if site.Entitlements.BotJSChallenge && site.Secrets.ChallengeHMACKeyID == "" {
+			errs = append(errs, p+".secrets.challenge_hmac_key_id: required when bot JS challenge is entitled")
+		}
+		if strings.EqualFold(site.Plan, "free") && (site.Entitlements.BotJSChallenge || site.Entitlements.BotCaptcha) {
+			errs = append(errs, p+".entitlements: Free plan cannot enable bot JS challenge or CAPTCHA")
+		}
+		if len(site.Secrets.ChallengeHMACKeyID) > 64 || strings.ContainsAny(site.Secrets.ChallengeHMACKeyID, " /\\\t\r\n") {
+			errs = append(errs, p+".secrets.challenge_hmac_key_id: invalid key identifier")
 		}
 		if site.WAF.BodyLimitKB < 0 {
 			errs = append(errs, p+".waf.body_limit_kb: must not be negative")

@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/example/wafplatform/edge/internal/access"
+	"github.com/example/wafplatform/edge/internal/bot"
 	"github.com/example/wafplatform/edge/internal/configsync"
 	"github.com/example/wafplatform/edge/internal/edgecore"
 	"github.com/example/wafplatform/edge/internal/listener"
@@ -39,6 +42,24 @@ func run() error {
 	}
 	core := edgecore.New(&snapshot, "waf-edge")
 	defer core.Close()
+	core.SetVerifiedBotResolver(bot.NewVerifiedResolver(net.DefaultResolver, []string{"googlebot.com", "search.msn.com", "duckduckgo.com"}, nil, 10*time.Minute))
+	challengeKeys, err := loadChallengeKeyring()
+	if err != nil {
+		return fmt.Errorf("nạp keyring bot challenge: %w", err)
+	}
+	challengeEntitled := false
+	for _, site := range snapshot.Sites {
+		if site.Entitlements.BotJSChallenge {
+			challengeEntitled = true
+			break
+		}
+	}
+	if challengeEntitled && challengeKeys == nil {
+		return fmt.Errorf("bot JS challenge is entitled but EDGE_CHALLENGE_HMAC_KEYS is not configured")
+	}
+	if challengeKeys != nil {
+		core.SetBotChallengeKeys(challengeKeys)
+	}
 	if countryPath, asnPath := os.Getenv("EDGE_GEOIP_COUNTRY_MMDB"), os.Getenv("EDGE_GEOIP_ASN_MMDB"); countryPath != "" || asnPath != "" {
 		geo, err := access.OpenMMDB(countryPath, asnPath)
 		if err != nil {
@@ -106,6 +127,48 @@ func run() error {
 		}, core)
 	}
 	return serveHTTP(core, metrics, server.Env("EDGE_ADDR", ":8080"))
+}
+
+// loadChallengeKeyring reads externally provisioned secrets; key bytes never enter snapshots or logs.
+func loadChallengeKeyring() (bot.KeyRing, error) {
+	raw := strings.TrimSpace(os.Getenv("EDGE_CHALLENGE_HMAC_KEYS"))
+	if raw == "" {
+		return nil, nil
+	}
+	if len(raw) > 16<<10 {
+		return nil, fmt.Errorf("challenge keyring exceeds 16 KiB")
+	}
+	keys := map[string][]byte{}
+	for _, entry := range strings.Split(raw, ",") {
+		id, value, ok := strings.Cut(strings.TrimSpace(entry), "=")
+		if !ok || id == "" || len(id) > 64 || strings.ContainsAny(id, " /\\\t\r\n") || value == "" {
+			return nil, fmt.Errorf("expected comma-separated key_id=base64 values")
+		}
+		if len(keys) >= 16 {
+			return nil, fmt.Errorf("at most 16 challenge keys are allowed")
+		}
+		decoded, err := base64.RawStdEncoding.DecodeString(value)
+		if err != nil {
+			decoded, err = base64.StdEncoding.DecodeString(value)
+		}
+		if err != nil || len(decoded) < 32 {
+			return nil, fmt.Errorf("challenge key %q must be valid base64 with at least 32 decoded bytes", id)
+		}
+		if _, exists := keys[id]; exists {
+			return nil, fmt.Errorf("duplicate challenge key id %q", id)
+		}
+		keys[id] = decoded
+	}
+	active := strings.TrimSpace(os.Getenv("EDGE_CHALLENGE_HMAC_ACTIVE_KEY_ID"))
+	if active == "" && len(keys) == 1 {
+		for id := range keys {
+			active = id
+		}
+	}
+	if _, ok := keys[active]; !ok {
+		return nil, fmt.Errorf("EDGE_CHALLENGE_HMAC_ACTIVE_KEY_ID must name a configured key")
+	}
+	return bot.StaticKeyRing{Active: active, Keys: keys}, nil
 }
 
 func envBool(name string) bool {

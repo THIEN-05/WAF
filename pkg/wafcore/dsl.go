@@ -430,7 +430,7 @@ type callNode struct {
 func (n *callNode) position() Position { return n.pos }
 
 var fieldTypes = map[string]ValueKind{
-	"http.host": KindString, "http.method": KindString, "http.path": KindString, "http.query": KindString, "http.uri": KindString, "http.user_agent": KindString, "http.referer": KindString, "http.body": KindString, "req.size": KindNumber, "ip.src": KindIP, "ip.geo.country": KindString, "ip.geo.asn": KindNumber, "tls.ja3": KindString, "bot.score": KindNumber, "waf.score": KindNumber,
+	"http.host": KindString, "http.method": KindString, "http.path": KindString, "http.query": KindString, "http.uri": KindString, "http.user_agent": KindString, "http.referer": KindString, "http.body": KindString, "req.size": KindNumber, "ip.src": KindIP, "ip.geo.country": KindString, "ip.geo.asn": KindNumber, "tls.ja3": KindString, "tls.ja4": KindString, "bot.score": KindNumber, "waf.score": KindNumber,
 }
 
 // ExpressionUsesField reports whether an expression contains a field token,
