@@ -77,6 +77,8 @@ Windows 11 sandbox run, `GOMAXPROCS=2 go test -tags=perf -count=30 -v ./edge/int
 
 This Windows timer reported 0 for some worker mean p50 values; those p50 cells are below its measured resolution and are not a usable latency baseline. CPU affinity was not pinned; this is not the requested Linux `taskset` run.
 
+CPU-background extension, Windows sandbox, `GOMAXPROCS=2 go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'`: the dedicated GOMAXPROCS=1 / 200-worker case ran a CPU-burning goroutine concurrently. Across 30 repetitions: clean rejects **0/24,000**, in-scope attacks blocked **6,000/6,000**, fuse trips **0/30,000**. The background worker completed 26,361,856–121,405,440 iterations per run; worker-mean p99 was **754,940–2,050,280 ns**. This is Go scheduler CPU contention on Windows, not physical CPU pinning; Linux `taskset` validation remains open.
+
 Test loopback thật cho body chậm/treo/đứt giữa chừng PASS trong WSL Ubuntu; deadline đọc mặc định 1 giây làm handler kết thúc, paid fail-closed trả 403. `TestPerIPConnectionLimit` tiếp tục nằm trong suite listener và được xác minh cùng race suite. Test loopback chỉ chạy ngoài sandbox Windows.
 
 Các p99 singleton vượt 2 ms nhẹ trong phần lớn workload và body 8 KiB dạng lặp/multipart; phần vượt ngân sách phát tag budget và xử lý theo plan (Free open, paid close). Độ trễ 50 goroutine cao rõ rệt nhưng toàn bộ request vẫn fail-closed. Allocations tăng theo kích thước body, nhưng body buffer có cap theo plan; test heap sau warm-up 3.000 request vẫn giới hạn heap tăng dưới 4 MiB. Kết quả là phép đo một máy, không đảm bảo hiệu năng sản xuất.

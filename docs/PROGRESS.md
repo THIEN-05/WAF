@@ -151,10 +151,11 @@ go test -tags=perf -count=30 ./edge/internal/waf -run '^TestWAFParallel50GOMAXPR
 - Test logic dùng fake clock, fake slow body reader và fake regex delay; tách wall-clock matrix sang build tag `perf`. Log tier throttle toàn tiến trình ≥3 s, tổng thay đổi được đếm.
 - PASS cục bộ: `go test -count=1 ./edge/internal/waf` → `ok ... 2.592s`.
 - PASS perf-tag 30 lần trên Windows (không phải Linux/taskset; `GOMAXPROCS=2` ban đầu, host 12 CPUs): 240 cell GOMAXPROCS 1/2/4/12 × workers 50/200; **30/30 matrix passes**, 0 clean reject, 0 fuse trip, 100% payload bị chặn. Worker-mean p99 min–max theo cell **0.203–20.360 ms**; p50 timer có số 0 ở một số cell nên chưa phải baseline tin cậy. Bảng chi tiết và giới hạn ghi tại `docs/BENCHMARKS.md`.
+- CPU background: `TestWAFCleanFailClosedAtOnePWithCPUBackground` chạy thêm GOMAXPROCS=1, 200 goroutine và 1 CPU-burn goroutine. **30 lượt**: clean reject 0/24,000; attack block 6,000/6,000; fuse 0/30,000; worker-mean p99 0.755–2.050 ms; background loop 26.4–121.4 triệu iteration/lượt. Đây là contention trong Go scheduler trên Windows, không phải Linux CPU affinity.
 
 ### Chưa xác minh — lệnh chạy lại
 
-- Tái hiện đúng Linux/WSL yêu cầu: `taskset -c 0,1 go test -tags=perf -count=30 -v ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'`; chạy test logic mặc định với `go test -race -count=1 ./...` (không chạy perf wall-clock dưới race). Thử WSL trực tiếp nhưng nhận `Wsl/E_ACCESSDENIED`; chưa có taskset affinity.
+- Tái hiện đúng Linux/WSL yêu cầu: `taskset -c 0,1 go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'`; chạy test logic mặc định với `go test -race -count=1 ./...` (không chạy perf wall-clock dưới race). Thử WSL trực tiếp nhưng nhận `Wsl/E_ACCESSDENIED`; chưa có taskset affinity.
 - Sau thay đổi cuối: package WAF unit PASS; `golangci-lint run ./...` → `0 issues`; `go vet ./...` và `go build ./...` → exit 0; `govulncheck ./...` → `No vulnerabilities found.` Full `go test -count=1 ./...` vẫn đỏ do Windows sandbox chặn loopback ở bot/edgecore/listener/proxy. `go test -race` không chạy do CGO_ENABLED=0. CI/WSL vẫn phải xác minh race và full integration.
 - Job CI bắt buộc `perf` chạy `go test -tags=perf -count=30 ...`; chưa có kết quả GitHub Actions. Perf test in p50/p99 thật để hiệu chỉnh ngưỡng; chưa đặt giới hạn latency giả định.
 

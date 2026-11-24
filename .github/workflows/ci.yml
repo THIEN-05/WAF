@@ -45,7 +45,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: WAF load and latency regression (required, no race detector)
-        run: go test -tags=perf -count=30 -v ./edge/internal/waf -run '^TestWAFParallel50GOMAXPROCSMatrix$'
+        run: go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'
 
   govulncheck:
     runs-on: ubuntu-latest
