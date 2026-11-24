@@ -108,7 +108,48 @@ func (e *Edge) Apply(s *wafcore.Snapshot) error {
 	e.ready.Store(true)
 	return nil
 }
-func (e *Edge) SetReady(v bool)                                     { e.ready.Store(v) }
+func (e *Edge) SetReady(v bool) { e.ready.Store(v) }
+
+// SelfTest exercises site selection and every in-process request phase using
+// a synthetic benign request. Origin dialing remains covered by health checks.
+func (e *Edge) SelfTest() error {
+	state := e.runtime.Load()
+	if state == nil || state.snapshot == nil || state.pipeline == nil || state.router == nil {
+		return errors.New("edge has no compiled runtime snapshot")
+	}
+	for _, site := range state.snapshot.Sites {
+		if site.Status != "active" {
+			continue
+		}
+		for _, host := range site.Domains {
+			if host == "" || strings.Contains(host, "*") {
+				continue
+			}
+			r, err := http.NewRequest(http.MethodGet, "http://"+host+"/__waf/self-test", nil)
+			if err != nil {
+				continue
+			}
+			r.Host = host
+			r.Header.Set("Accept", "text/html,application/xhtml+xml")
+			r.Header.Set("Accept-Language", "en")
+			r.Header.Set("User-Agent", "WAF-Edge-SelfTest/1")
+			ctx := reqctx.New(r, state.snapshot, "edge-self-test", net.ParseIP("192.0.2.1"))
+			resolved, status := state.router.Resolve(ctx)
+			if status != 0 || resolved == nil {
+				reqctx.Release(ctx)
+				return fmt.Errorf("self-test site resolution failed: %s", host)
+			}
+			decision := state.pipeline.Run(ctx)
+			reqctx.Release(ctx)
+			if decision.Action != reqctx.ActionAllow && decision.Action != reqctx.ActionLogOnly {
+				return fmt.Errorf("self-test request denied by %s/%s", decision.Phase, decision.RuleID)
+			}
+			return nil
+		}
+	}
+	return errors.New("self-test requires an active site with a concrete domain")
+}
+
 func (e *Edge) SetSecurityHeaders(headers response.SecurityHeaders) { e.security = headers }
 func (e *Edge) SetGeoResolver(resolver access.GeoResolver) {
 	e.trafficMu.Lock()
@@ -198,6 +239,13 @@ func (e *Edge) Close() {
 	}
 }
 func (e *Edge) Metrics() http.Handler { return e.histogram }
+func (e *Edge) Snapshot() *wafcore.Snapshot {
+	state := e.runtime.Load()
+	if state == nil {
+		return nil
+	}
+	return state.snapshot
+}
 func (e *Edge) CanonicalHTTPHost(host string) (string, bool) {
 	state := e.runtime.Load()
 	if state == nil || state.router == nil {

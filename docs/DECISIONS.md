@@ -131,6 +131,21 @@ Các `//nolint` còn lại được giữ vì có ranh giới tin cậy rõ ràn
 | `edge/internal/proxy/proxy.go:257` | G706 | ID correlation được kiểm tra hex trước log, format `%q`; lỗi transport chỉ log kiểu lỗi, không nội dung attacker-controlled. | `TestProxyErrorDoesNotLogOrReflectUnsafeRequestID` |
 
 Vị trí cũ `edge/internal/proxy/proxy.go` G115 đã được gỡ: counter chuyển sang signed modular arithmetic có chuẩn hóa số âm; `TestWeightedOriginSelectionCounterNearInt64Maximum` kiểm tra wraparound. Host authority chỉ nhận port 1–65535, hostname/label theo trần DNS và IP IPv6 được biểu diễn dạng bracket để chuẩn hóa lặp lại ổn định. `FuzzNormalizeHost` kiểm tra các seed authority lỗi, quan hệ với `url.Parse`/`net.SplitHostPort` và tính idempotent; `TestHostAuthorityConsistentAcrossRedirectRoutingAndSNI` khóa kết quả listener redirect, router và SNI.
+
+## P6a — tích hợp edge với control plane (MVP interface) — 2026-11-24
+
+- `CPClient` là ranh giới API để dùng server giả; `HTTPClient` hiện triển khai HTTPS bootstrap `POST /v1/edges/register` với one-time bearer token + CSR, sau đó `/v1/snapshot?since=` (ETag/304), heartbeat, renewal và secrets chỉ qua TLS client certificate. Redirect HTTP bị tắt; endpoint phải là HTTPS. Contract test với CP/NATS thật thuộc P9.
+- Client ECDSA key/CSR và certificate identity chỉ ở RAM. Certificate chain phải khớp private key, verify với CA từ registration và có `clientAuth`; renewal tạo key/CSR mới trước hạn, cập nhật client mTLS và đóng idle connections dùng cert cũ. NATS được biểu diễn bằng `Notifier`/`EmergencyNotifier`; không thêm NATS SDK ở edge trong lượt interface này.
+- Snapshot signed được verify (nhiều `kid`), schema validate bởi `wafcore`, chuyển qua `SnapshotInstaller` để compile + atomic runtime swap rồi mới persist LKG bằng temp file, fsync và rename. Lỗi signature/compile giữ runtime cũ; LKG lỗi được báo riêng vì runtime đã swap. `Status`, `SnapshotStale`, `/configsync/metrics` và heartbeat expose version/age/error; CP/NATS outage không xóa snapshot đang chạy, long-poll vẫn chạy khi notifier lỗi.
+- CP secrets và cert website chỉ nằm trong `MemorySecrets`; secret entry tối đa 64 KiB, bundle 4 MiB, cert 10.000 entries và tối đa 16 MiB DER chain. `CertificateStore` cài cert theo SNI, ACME challenge có store atomic bounded 10.000 entry. Kênh khẩn có command Ed25519 domain-separated signature, expiry tối đa 5 phút, nonce replay cache RAM bounded 10.000 và dispatcher chỉ cho 5 action đã liệt kê.
+- Startup self-test tạo request GET benign, resolve một site active và chạy toàn bộ phase trong pipeline; `/readyz` chỉ mở sau self-test. Đây chưa gọi origin/ReverseProxy nên không xác nhận end-to-end origin.
+- **TODO-P6a-1:** private key identity hiện chỉ RAM; restart sau khi token dùng một lần cần cơ chế lưu/khôi phục identity mã hóa hoặc bootstrap identity khác. Chưa ghi private key dạng rõ ra đĩa.
+- **TODO-P6a-2:** adapter NATS thật (mTLS, reconnect, config.updated và signed emergency subject) chưa được nối do không có CP/NATS server contract chạy ở lượt này; interface/fake test có sẵn, contract test P9.
+- **TODO-P6a-3:** emergency actions còn cần wiring sang ban table, cache purge, Under Attack, ACME store và process drain; verifier/dispatcher không tự thay đổi runtime nếu không có handler.
+- **TODO-P6a-4:** heartbeat collector hiện cho phép inject metrics và gửi snapshot version/age/error/cert expiry/log-drop field; app hiện chỉ điền RAM usage, chưa có CPU/RPS/error rate/p99/log_dropped collector thực.
+- **TODO-P6a-5:** self-test mới chạy in-process phases; cần test origin tổng hợp qua ReverseProxy/TLS trước khi gọi là end-to-end startup validation.
+- **TODO-P6a-6:** chaos matrix full edge chưa xác minh trong WSL: CP/NATS outage, Redis outage/recovery thật, đồng hồ tiến/lùi và reload khi request đang mở. Các fake tests và test loopback từng phần không thay thế matrix tích hợp.
+- **TODO-G-1** còn mở: PROXY protocol v2.
 - Khi WAF/rules đọc body, `gzip` được giải nén chỉ trong scan cap của gói và giới hạn expansion tối đa 20× số byte nén (với sàn 1 KiB để đọc header nhỏ); phần vượt giới hạn đánh dấu truncated, không coi là sạch. Encoding không hỗ trợ cũng đánh dấu truncated. Origin vẫn nhận byte nén gốc và framing HTTP gốc.
 
 ## Quyết định P3 — access và rate limiting

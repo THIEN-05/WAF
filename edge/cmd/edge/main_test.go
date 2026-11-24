@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -58,6 +60,32 @@ func TestLoadSnapshotUnsignedJSONDevelopmentFallbackReadsConfiguredFile(t *testi
 	got, err := loadSnapshot()
 	if err != nil || got.Version != 91 {
 		t.Fatalf("loadSnapshot version=%d err=%v", got.Version, err)
+	}
+}
+
+func TestProductionLoadSnapshotUsesSignedLastKnownGoodForCP(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := wafcore.Snapshot{SchemaVersion: 1, Version: 42, GeneratedAt: time.Now().UTC(), Global: wafcore.GlobalConfig{ManagedRuleset: "test"}}
+	raw, err := wafcore.SignSnapshot(snapshot, "signing", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "last-good.snapshot")
+	if err = os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EDGE_ENV", "production")
+	t.Setenv("EDGE_CONTROL_PLANE_URL", "https://cp.example.test")
+	t.Setenv("EDGE_SNAPSHOT_FILE", "")
+	t.Setenv("EDGE_LAST_KNOWN_GOOD", path)
+	t.Setenv("EDGE_PUBLIC_KEYS", "signing="+base64.StdEncoding.EncodeToString(pub))
+	t.Setenv("EDGE_PUBLIC_KEYS_FILE", "")
+	got, err := loadSnapshot()
+	if err != nil || got.Version != 42 {
+		t.Fatalf("LKG version=%d err=%v", got.Version, err)
 	}
 }
 

@@ -1,5 +1,33 @@
 # Tiến độ
 
+## P6a — tích hợp edge/control plane (MVP interface) — 2026-11-24
+
+### Đã xác minh
+
+- `CPClient`/`Notifier`/`EmergencyNotifier`/`SnapshotInstaller`/`SecretSink`/`EmergencyActions` tách CP và NATS thành interface; test dùng fake client, không gọi CP thật. `HTTPClient` yêu cầu HTTPS, bootstrap gửi one-time bearer token + CSR, sau đó gọi snapshot/renewal/secrets/heartbeat bằng client certificate mTLS; redirect bị cấm, body response trần 32 MiB.
+- `Agent` giữ khóa CSR và identity trong RAM; kiểm tra client cert khớp khóa/CA, gia hạn trước hạn và thay client cert. Snapshot verify Ed25519 theo `kid` → validate wafcore → installer compile/swap → ghi last-good atomic; bad signature/compile giữ bản cũ. LKG production được nạp và xác minh; test outage CP giữ version đang chạy, NATS subscription lỗi vẫn long-poll, heartbeat tiếp tục.
+- Secrets/cert site ở `MemorySecrets`; có giới hạn kích thước, store cert theo SNI và token ACME atomic. Emergency command dùng Ed25519 domain-separated signature, expiry ≤5 phút, nonce replay cache có trần và dispatcher chỉ cho ban IP/purge/Under Attack/ACME/drain. `edgecore.SelfTest` chạy request thử qua router và mọi in-process phase; `/readyz` chỉ bật sau self-test. Snapshot age/version/stale xuất ở `/configsync/metrics` và heartbeat.
+- Test mới PASS: `go test -count=1 ./edge/internal/configsync` → `ok .../configsync 1.997s`; `go test -count=1 ./edge/cmd/edge` → `ok .../cmd/edge 1.572s`; `go test -count=1 -run TestStartupSelfTestControlsReadiness ./edge/internal/edgecore` → `ok .../edgecore 4.330s`.
+- **Đã xác minh trên Windows Go 1.26.11:** `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → exit 0, không có output; `go build ./...` → exit 0 (Go in cảnh báo stat-cache Windows `Access is denied`, nhưng exit code 0).
+
+### Chưa xác minh — lệnh chạy lại
+
+- `go test -count=1 ./...` → FAIL do sandbox Windows chặn loopback TCP (`connectex: An attempt was made to access a socket in a way forbidden by its access permissions`); fail ở các test loopback thuộc bot/edgecore/listener/proxy, gồm verify endpoint, self-test proxy/origin, TLS listener, SSE/WebSocket. `TestLoopbackReloadDoesNotInterruptInFlightRequest` không thể bắt đầu origin. Các package configsync, cmd/edge và các package không phụ thuộc loopback đều PASS; suite vẫn đỏ, chưa được đánh dấu hoàn tất.
+- `go test -race -count=1 ./...` → chưa chạy: `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`; Windows Go có `CGO_ENABLED=0` và không có gcc. `wsl.exe` tiếp tục bị `Wsl/ERROR_ACCESS_DENIED` trong sandbox.
+- Chạy ngoài sandbox trong WSL để xác nhận toàn bộ loopback/race: `golangci-lint run ./...`, `go vet ./...`, `go build ./...`, `go test -race -count=1 ./...`. P9 mới làm contract test với CP/NATS thật; chưa có log CI/CP thật để báo.
+- Chưa chạy Redis integration/chaos trên máy này vì WSL không truy cập được: `REDIS_ADDR=127.0.0.1:6379 go test -tags=integration -race -count=5 ./edge/internal/ratelimit`. Đây là lệnh xác minh Redis thật và outage/recovery trong WSL.
+
+### Nợ kỹ thuật P6a / Gate G
+
+- **TODO-P6a-1:** edge identity private key chỉ ở RAM; restart sau khi registration token dùng một lần cần encrypted identity store hoặc bootstrap identity khác. Không ghi private key rõ ra đĩa.
+- **TODO-P6a-2:** chưa có NATS adapter thực với mTLS/reconnect; interfaces và fake tests có rồi. Contract test CP/NATS thật thuộc P9.
+- **TODO-P6a-3:** emergency verifier/dispatcher có interface nhưng chưa nối vào runtime ban table/cache purge/Under Attack/ACME/drain; ACME token store hiện mới có API bộ nhớ.
+- **TODO-P6a-4:** heartbeat hỗ trợ CPU/RAM/RPS/error/p99/log_dropped; app mới điền RAM, các metric host/request cần collector thật.
+- **TODO-P6a-5:** self-test chạy router + pipeline phases, chưa chạy TLS và ReverseProxy tới origin.
+- **TODO-P6a-6:** chưa chạy chaos matrix end-to-end trong WSL: CP/NATS outage, snapshot sai chữ ký (fake test đã có), Redis outage/recovery thật, clock skew và reload khi có kết nối đang mở. Test reload loopback hiện có nhưng không chạy được trong sandbox Windows.
+- **TODO-G-1:** PROXY protocol v2 chưa triển khai.
+- Gate G vẫn **chờ xác nhận CI**; các nợ Gate G còn gồm TODO-P4f-1, docker compose pull/up, k6 và MMDB thật.
+
 ## Gate G — đóng nợ nền tảng P2–P5a — 2026-11-24
 
 ### Gate G-2 — trạng thái hiện tại

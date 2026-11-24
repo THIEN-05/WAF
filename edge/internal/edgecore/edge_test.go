@@ -46,6 +46,26 @@ func siteSnapshot(status, failMode, origin string, version uint64) *wafcore.Snap
 	return &wafcore.Snapshot{SchemaVersion: 1, Version: version, GeneratedAt: time.Now(), Global: wafcore.GlobalConfig{ManagedRuleset: "test"}, Sites: []wafcore.Site{{ID: "site", TenantID: "tenant", Status: status, Plan: "pro", Domains: []string{"site.test"}, Origins: []wafcore.Origin{{URL: origin, Weight: 1}}, FailMode: failMode}}}
 }
 
+func TestStartupSelfTestControlsReadiness(t *testing.T) {
+	e := New(siteSnapshot("active", "closed", "http://203.0.113.77:80", 1), "edge-test")
+	defer e.Close()
+	e.SetReady(false)
+	response := httptest.NewRecorder()
+	e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://edge/readyz", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("ready before self-test status=%d", response.Code)
+	}
+	if err := e.SelfTest(); err != nil {
+		t.Fatalf("pipeline self-test: %v", err)
+	}
+	e.SetReady(true)
+	response = httptest.NewRecorder()
+	e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://edge/readyz", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("ready after self-test status=%d", response.Code)
+	}
+}
+
 func TestBotChallengeVerifyEndpointRequiresEntitlementAndRejectsReplay(t *testing.T) {
 	snap := siteSnapshot("active", "closed", "http://127.0.0.1:8080", 1)
 	snap.Sites[0].Bot = wafcore.BotConfig{Mode: "challenge", Threshold: 30, ChallengeDifficulty: 8}
