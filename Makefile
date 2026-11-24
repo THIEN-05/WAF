@@ -13,7 +13,7 @@ test:
 	go test -race ./...
 
 test-integration:
-	go test -tags=integration -race -count=1 -v ./edge/internal/ratelimit ./edge/internal/telemetry
+	go test -tags=integration -race -count=1 -v ./controlplane/internal/integration ./edge/internal/ratelimit ./edge/internal/telemetry
 
 lint:
 	golangci-lint run ./...
@@ -25,10 +25,11 @@ bench:
 	go test -run '^$$' -bench=. ./...
 
 gen:
-	@echo "No generators are configured yet."
+	go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.9.0 -config controlplane/openapi/oapi-codegen.yaml controlplane/openapi/v1.yaml
+	go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate -f sqlc.yaml
 
 migrate:
-	@echo "No migrations are configured yet."
+	go run ./controlplane/cmd/migrate up
 
 dev-check:
 	@if command -v sh >/dev/null 2>&1; then ./scripts/dev-check.sh; else powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-check.ps1; fi

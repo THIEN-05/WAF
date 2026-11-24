@@ -55,7 +55,11 @@ func TestChallengeCookieBindingExpiryRotationAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = m.Verify(bad, "wrong", "site", "Mozilla/5.0", ip, now); err == nil {
+	badNonce := "bad-proof"
+	for validPoW(bad, badNonce, 8) {
+		badNonce += "x"
+	}
+	if _, err = m.Verify(bad, badNonce, "site", "Mozilla/5.0", ip, now); err == nil {
 		t.Fatal("bad proof accepted")
 	}
 	// Cookies signed by a retained old key stay valid after active-key rotation.

@@ -1,0 +1,159 @@
+openapi: 3.1.0
+info:
+  title: WAF Control Plane API
+  version: 1.0.0
+servers:
+  - url: /v1
+paths:
+  /auth/register:
+    post:
+      operationId: register
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Credentials'}}}
+      responses: {'202': {description: Registration accepted}, '400': {$ref: '#/components/responses/Problem'}}
+  /auth/verify-email:
+    post:
+      operationId: verifyEmail
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TokenRequest'}}}
+      responses: {'204': {description: Email verified}, '400': {$ref: '#/components/responses/Problem'}}
+  /auth/login:
+    post:
+      operationId: login
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Credentials'}}}
+      responses: {'200': {description: Authenticated}, '401': {$ref: '#/components/responses/Problem'}}
+  /auth/refresh:
+    post:
+      operationId: refresh
+      responses: {'200': {description: Rotated access token}, '401': {$ref: '#/components/responses/Problem'}}
+  /auth/logout:
+    post:
+      operationId: logout
+      responses: {'204': {description: Session revoked}}
+  /auth/password-reset:
+    post:
+      operationId: requestPasswordReset
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [email], properties: {email: {type: string, format: email}}}}}
+      responses: {'202': {description: Generic response, does not reveal account existence}}
+  /auth/password-reset/confirm:
+    post:
+      operationId: confirmPasswordReset
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PasswordReset'}}}
+      responses: {'204': {description: Password reset}, '400': {$ref: '#/components/responses/Problem'}}
+  /auth/sessions:
+    get:
+      operationId: listSessions
+      security: [{BearerAuth: []}]
+      responses: {'200': {description: Active and revoked sessions}}
+  /auth/sessions/{session_id}:
+    delete:
+      operationId: revokeSession
+      security: [{BearerAuth: []}]
+      parameters: [{in: path, name: session_id, required: true, schema: {type: string, format: uuid}}]
+      responses: {'204': {description: Session revoked}}
+  /auth/totp/setup:
+    post:
+      operationId: setupTOTP
+      security: [{BearerAuth: []}]
+      responses: {'200': {description: Secret and recovery codes, shown once}}
+  /auth/totp/enable:
+    post:
+      operationId: enableTOTP
+      security: [{BearerAuth: []}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [code], properties: {code: {type: string}}}}}
+      responses: {'204': {description: TOTP enabled}, '400': {$ref: '#/components/responses/Problem'}}
+  /invitations/accept:
+    post:
+      operationId: acceptInvitation
+      security: [{BearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+      responses: {'204': {description: Invitation accepted}, '400': {$ref: '#/components/responses/Problem'}}
+  /tenants/{tenant_id}/invitations:
+    post:
+      operationId: inviteMember
+      security: [{BearerAuth: []}]
+      parameters: [{in: path, name: tenant_id, required: true, schema: {type: string, format: uuid}}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [email, role], properties: {email: {type: string, format: email}, role: {type: string, enum: [admin, viewer]}}}}}
+      responses: {'201': {description: Invitation created}, '403': {$ref: '#/components/responses/Problem'}}
+  /tenants/{tenant_id}/members:
+    get:
+      operationId: listMembers
+      security: [{BearerAuth: []}]
+      parameters: [{in: path, name: tenant_id, required: true, schema: {type: string, format: uuid}}]
+      responses: {'200': {description: Members in the tenant}, '403': {$ref: '#/components/responses/Problem'}}
+  /tenants/{tenant_id}/members/{user_id}:
+    delete:
+      operationId: removeMember
+      security: [{BearerAuth: []}]
+      parameters:
+        - {in: path, name: tenant_id, required: true, schema: {type: string, format: uuid}}
+        - {in: path, name: user_id, required: true, schema: {type: string, format: uuid}}
+      responses: {'204': {description: Member removed}, '403': {$ref: '#/components/responses/Problem'}}
+  /tenants/{tenant_id}/api-keys:
+    post:
+      operationId: createAPIKey
+      security: [{BearerAuth: []}]
+      parameters: [{in: path, name: tenant_id, required: true, schema: {type: string, format: uuid}}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [name, scopes], properties: {name: {type: string}, scopes: {type: array, items: {type: string, enum: [sites:read, rules:write, analytics:read]}}}}}}
+      responses: {'201': {description: Secret shown once}, '403': {$ref: '#/components/responses/Problem'}}
+    get:
+      operationId: listAPIKeys
+      security: [{BearerAuth: []}]
+      parameters: [{in: path, name: tenant_id, required: true, schema: {type: string, format: uuid}}]
+      responses: {'200': {description: Metadata only; secret values are not returned}}
+  /tenants/{tenant_id}/api-keys/{key_id}:
+    delete:
+      operationId: revokeAPIKey
+      security: [{BearerAuth: []}]
+      parameters:
+        - {in: path, name: tenant_id, required: true, schema: {type: string, format: uuid}}
+        - {in: path, name: key_id, required: true, schema: {type: string, format: uuid}}
+      responses: {'204': {description: Key revoked}, '403': {$ref: '#/components/responses/Problem'}}
+  /tenants/{tenant_id}/entitlements:
+    get:
+      operationId: getEntitlements
+      security: [{BearerAuth: []}]
+      parameters: [{in: path, name: tenant_id, required: true, schema: {type: string, format: uuid}}]
+      responses: {'200': {description: Current plan and limits}, '403': {$ref: '#/components/responses/Problem'}}
+components:
+  securitySchemes:
+    BearerAuth: {type: http, scheme: bearer, bearerFormat: JWT}
+  schemas:
+    Credentials:
+      type: object
+      required: [email, password]
+      properties: {email: {type: string, format: email}, password: {type: string, minLength: 10}, totp_code: {type: string}, recovery_code: {type: string}}
+    TokenRequest:
+      type: object
+      required: [token]
+      properties: {token: {type: string}}
+    PasswordReset:
+      type: object
+      required: [token, password]
+      properties: {token: {type: string}, password: {type: string, minLength: 10}}
+    Problem:
+      type: object
+      properties: {type: {type: string}, title: {type: string}, status: {type: integer}, detail: {type: string}, request_id: {type: string}, code: {type: string}}
+  responses:
+    Problem:
+      description: RFC 9457 problem response
+      content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}

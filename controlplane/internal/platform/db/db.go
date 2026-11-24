@@ -1,0 +1,71 @@
+package db
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type Pool struct{ *pgxpool.Pool }
+
+func Open(ctx context.Context, databaseURL string) (*Pool, error) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse database config: %w", err)
+	}
+	cfg.MaxConns = 20
+	cfg.MinConns = 2
+	p, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if err := p.Ping(ctx); err != nil {
+		p.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	var superuser, bypass, apiMember bool
+	if err := p.QueryRow(ctx, `SELECT r.rolsuper,r.rolbypassrls,pg_has_role(current_user,'waf_api','member') FROM pg_roles r WHERE r.rolname=current_user`).Scan(&superuser, &bypass, &apiMember); err != nil {
+		p.Close()
+		return nil, fmt.Errorf("inspect database role: %w", err)
+	}
+	if superuser || bypass || !apiMember {
+		p.Close()
+		return nil, fmt.Errorf("DATABASE_URL must use a non-superuser login with the waf_api role (NOBYPASSRLS)")
+	}
+	return &Pool{Pool: p}, nil
+}
+
+func NewID() (uuid.UUID, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("generate UUIDv7: %w", err)
+	}
+	return id, nil
+}
+
+// WithTenantTx pins tenant context to the transaction so RLS protects queries even without tenant WHERE clauses.
+func WithTenantTx(ctx context.Context, pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+}, tenantID uuid.UUID, fn func(pgx.Tx) error) error {
+	if tenantID == uuid.Nil {
+		return fmt.Errorf("tenant ID is required")
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tenant transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL app.tenant_id = '%s'`, tenantID.String())); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit tenant transaction: %w", err)
+	}
+	return nil
+}

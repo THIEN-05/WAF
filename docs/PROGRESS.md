@@ -1,5 +1,41 @@
 # Tiến độ
 
+## Control Plane — schema, auth, tenant, entitlement — 2026-11-24
+
+### Đã triển khai
+
+- `controlplane/migrations/00001_core.sql`: các bảng ở control-plane.md §4.2 cùng bảng token email/reset/TOTP cần cho auth; UUID do app sinh bằng UUIDv7; site/rule có `deleted_at`; bảng tenant có `tenant_id`, `created_at`, `updated_at`, RLS `ENABLE` + `FORCE`. `waf_api` là `NOBYPASSRLS`; `waf_worker` là role hệ thống tách biệt. Quyền `audit_logs` chỉ INSERT. `WithTenantTx` đặt `SET LOCAL app.tenant_id`; `db.Open` từ chối superuser/BYPASSRLS và login không thuộc `waf_api`.
+- `sqlc.yaml`, query mẫu, `make gen` và migration Goose đã thêm. `controlplane/openapi/v1.yaml` có endpoint auth/session/TOTP, tenant member/invitation/API key/entitlement; models sinh bằng oapi-codegen và dùng `Credentials` trong handler.
+- Platform có config/env, pgx pool, Redis, NATS, JSON slog với request_id/trace_id, `SecretStore` interface, RFC 9457 problem+json, request ID/recover/CORS/CSRF và Redis API rate limit.
+- Auth có đăng ký user + personal org + owner membership + Free subscription + verification token + audit trong một DB transaction; token email/reset băm và hết hạn; Argon2id; lockout account qua Redis; TOTP RFC 6238 lệch ±1, secret AES-GCM mã hóa, 10 recovery code băm dùng một lần; JWT EdDSA 15 phút; refresh rotation/reuse revoke theo family; password reset và quản lý phiên. Login/reset trả lỗi không tiết lộ email tồn tại.
+- Tenant có RBAC qua `Can` với test phủ mọi action/role; invitation băm/hạn 7 ngày/accept một lần ràng buộc email; API key scope có metadata/list/revoke và chỉ lộ khóa lúc tạo. Entitlement seed theo quota `data-plane.md` §5.15, có service kiểm quota và usage counters. Mutations liên quan tenant ghi audit trong transaction.
+- Integration test gắn `integration`: Postgres RLS bằng login API thực (truy vấn sites không WHERE), IDOR, role grants và audit insert-only; đăng ký/email Mailhog, brute-force Redis, refresh reuse, TOTP ±1. CI integration job có Postgres, Redis, NATS và Mailhog service.
+
+### Đã xác minh
+
+- Kiểm tra cuối sau sửa tenant service và test PoW: `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → exit 0, không output; `go build ./...` → exit 0 (Go có in cảnh báo quyền ghi stat-cache Windows, nhưng lệnh kết thúc exit 0).
+- `go test -count=1 ./...` → PASS toàn repo, gồm Control Plane và Edge. Lần chạy đầu trong sandbox bị Windows chặn loopback; lần chạy lại ngoài sandbox hoàn tất exit 0, tất cả package có test đều `ok`.
+- `go test -tags=integration -run '^$' ./controlplane/internal/integration` → `ok ... [no tests to run]`, xác nhận integration test biên dịch.
+- `govulncheck ./...` → `No vulnerabilities found.`
+- `go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.9.0 -config controlplane/openapi/oapi-codegen.yaml controlplane/openapi/v1.yaml` → exit 0.
+- `go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate -f sqlc.yaml` → exit 0.
+- `go mod tidy`, `git diff --check` → exit 0. `govulncheck ./...` → `No vulnerabilities found.`
+
+### Chưa xác minh — lệnh chạy lại trong WSL/Linux
+
+- `go test -race -count=1 ./...` chưa chạy được trên Windows này: output `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1` (hiện `CGO_ENABLED=0`). Chạy lại trên WSL/CI Ubuntu.
+- Postgres/Redis/Mailhog integration chưa chạy thật tại môi trường này: Docker daemon không mở (`dockerDesktopLinuxEngine` pipe không tồn tại), cổng 5432/6379/1025 không nghe. Lần chạy `go test -tags=integration -count=1 -v ./controlplane/internal/integration` báo SKIP do thiếu `DATABASE_URL` và `REDIS_ADDR`; không tính là xác minh integration. CI job đã cấu hình services nhưng chưa quan sát được kết quả CI trong lượt này.
+- WSL local: `docker compose -f deploy/docker-compose.yml up -d --wait postgres redis mailhog`, rồi `DATABASE_URL='postgres://waf:change-me-local@127.0.0.1:5432/waf?sslmode=disable' REDIS_ADDR=127.0.0.1:6379 MAILHOG_ADDR=127.0.0.1:1025 MAILHOG_API_URL=http://127.0.0.1:8025/api/v2/messages go test -tags=integration -race -count=1 -v ./controlplane/internal/integration`. Sau đó chạy `go test -race -count=1 ./...`.
+
+### Nợ kỹ thuật
+
+- **TODO-CP-1:** tích hợp SMTP production có TLS, transactional outbox và retry. Mailhog là adapter dev; nếu SMTP lỗi sau khi commit, tài khoản/token đã lưu nhưng hiện chưa có luồng resend.
+- **TODO-CP-2:** provision thông tin đăng nhập riêng cho `waf_api`/`waf_worker` ở deploy/KMS; migration tạo group role NOLOGIN. API startup buộc dùng login không-superuser được grant `waf_api`.
+- **TODO-CP-3:** JWT `kid` hiện cố định `cp-1`; key rotation/JWKS, SecretStore production/KMS và cấp TOTP key ở runtime chưa nối.
+- **TODO-CP-4:** CI/WSL phải chạy integration thật + `-race` để xác nhận Goose migration, quyền API dưới role `waf_api`, Redis, Mailhog và race. Chưa đóng cho tới khi job đó xanh.
+- **TODO-CP-5:** API key issuance/list/revoke đã có; xác thực API key và thực thi scope trên tài nguyên API chưa có trong phạm vi schema/auth/tenant/entitlement lượt này.
+- **TODO-CP-6:** bảng tenant chính đã migrate; handlers của site/rule/cert/billing và back-office worker workflows thuộc các module control plane kế tiếp.
+
 ## P12 — logging và telemetry
 
 ### Đã xác minh
