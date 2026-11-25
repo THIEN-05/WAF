@@ -19,7 +19,7 @@ test-cp-integration:
 	go test -tags=integration -race -count=20 -v ./controlplane/internal/integration
 
 check-cp-sql:
-	./scripts/check-controlplane-sql.sh
+	bash scripts/check-controlplane-sql.sh
 
 lint:
 	golangci-lint run ./...
