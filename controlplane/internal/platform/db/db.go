@@ -58,7 +58,7 @@ func WithTenantTx(ctx context.Context, pool interface {
 		return fmt.Errorf("begin tenant transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL app.tenant_id = '%s'`, tenantID.String())); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('app.tenant_id',$1,true)`, tenantID.String()); err != nil {
 		return fmt.Errorf("set tenant context: %w", err)
 	}
 	if err := fn(tx); err != nil {
@@ -66,6 +66,54 @@ func WithTenantTx(ctx context.Context, pool interface {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit tenant transaction: %w", err)
+	}
+	return nil
+}
+
+// WithUserTx pins a user identity to a transaction for user-scoped RLS policies.
+func WithUserTx(ctx context.Context, pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+}, userID uuid.UUID, fn func(pgx.Tx) error) error {
+	if userID == uuid.Nil {
+		return fmt.Errorf("user ID is required")
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin user transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('app.user_id',$1,true)`, userID.String()); err != nil {
+		return fmt.Errorf("set user context: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit user transaction: %w", err)
+	}
+	return nil
+}
+
+// WithUserTenantTx sets both identities when a request is scoped to one user in one tenant.
+func WithUserTenantTx(ctx context.Context, pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+}, userID, tenantID uuid.UUID, fn func(pgx.Tx) error) error {
+	if userID == uuid.Nil || tenantID == uuid.Nil {
+		return fmt.Errorf("user and tenant IDs are required")
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin user tenant transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('app.tenant_id',$1,true), pg_catalog.set_config('app.user_id',$2,true)`, tenantID.String(), userID.String()); err != nil {
+		return fmt.Errorf("set user tenant context: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit user tenant transaction: %w", err)
 	}
 	return nil
 }

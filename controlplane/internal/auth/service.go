@@ -11,6 +11,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/mail"
@@ -37,6 +38,33 @@ type Mailer interface {
 	Send(context.Context, string, string, string) error
 }
 type SMTPMailer struct{ Addr, From string }
+
+type authMailDelivery struct {
+	mailer            Mailer
+	to, subject, body string
+}
+
+var authMailQueue = make(chan authMailDelivery, 256)
+
+func init() {
+	go func() {
+		for job := range authMailQueue {
+			_ = job.mailer.Send(context.Background(), job.to, job.subject, job.body)
+		}
+	}()
+}
+
+func enqueueAuthMail(m Mailer, to, subject, body string) bool {
+	if m == nil {
+		return true
+	}
+	select {
+	case authMailQueue <- authMailDelivery{mailer: m, to: to, subject: subject, body: body}:
+		return true
+	default:
+		return false
+	}
+}
 
 func (m SMTPMailer) Send(ctx context.Context, to, subject, body string) error {
 	if err := ctx.Err(); err != nil {
@@ -84,12 +112,21 @@ func (s Service) now() time.Time {
 	}
 	return time.Now()
 }
+
+func padAuthResponse(started time.Time) {
+	if remaining := 100*time.Millisecond - time.Since(started); remaining > 0 {
+		time.Sleep(remaining)
+	}
+}
+
 func (s Service) Register(ctx context.Context, email, password string) error {
 	email = strings.ToLower(strings.TrimSpace(email))
 	parsed, parseErr := mail.ParseAddress(email)
 	if parseErr != nil || parsed.Address != email || len(password) < 10 {
 		return ErrCredentials
 	}
+	started := time.Now()
+	defer padAuthResponse(started)
 	hash := hashPassword(password)
 	userID, e := uuid.NewV7()
 	if e != nil {
@@ -115,66 +152,31 @@ func (s Service) Register(ctx context.Context, email, password string) error {
 	if e != nil {
 		return e
 	}
+	auditID, e := uuid.NewV7()
+	if e != nil {
+		return e
+	}
 	tokenHash := sha256.Sum256([]byte(token))
-	var planID uuid.UUID
-	err := db.WithTenantTx(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO users(id,email,password_hash,status) VALUES($1,$2,$3,'pending')`, userID, email, hash); err != nil {
-			return err
-		}
-		if err := tx.QueryRow(ctx, `SELECT id FROM plans WHERE code='free'`).Scan(&planID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO organizations(id,tenant_id,name,owner_user_id,plan_id) VALUES($1,$1,$2,$3,$4)`, tenantID, "Personal", userID, planID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE users SET default_tenant_id=$1,updated_at=now() WHERE id=$2`, tenantID, userID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO memberships(id,tenant_id,user_id,role) VALUES($1,$2,$3,'owner')`, memberID, tenantID, userID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO subscriptions(id,tenant_id,plan_id,status,provider) VALUES($1,$2,$3,'active','free')`, subID, tenantID, planID); err != nil {
-			return err
-		}
-		auditID, auditErr := uuid.NewV7()
-		if auditErr != nil {
-			return auditErr
-		}
-		if _, auditErr = tx.Exec(ctx, `INSERT INTO audit_logs(id,tenant_id,actor_type,actor_id,action,entity,entity_id,diff) VALUES($1,$2,'user',$3,'organization.create','organization',$2,'{}'::jsonb)`, auditID, tenantID, userID); auditErr != nil {
-			return auditErr
-		}
-		_, err := tx.Exec(ctx, `INSERT INTO email_verification_tokens(id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4)`, tokenID, userID, tokenHash[:], s.now().Add(24*time.Hour))
-		return err
-	})
+	_, err := s.Pool.Exec(ctx, `SELECT public.auth_register_user($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, userID, email, hash, tenantID, memberID, subID, tokenID, auditID, tokenHash[:], s.now().Add(24*time.Hour))
 	if err != nil {
 		return err
 	}
-	if s.Mailer != nil {
-		if err := s.Mailer.Send(ctx, email, "Verify your email", "Verification token: "+token); err != nil {
-			return fmt.Errorf("send verification email: %w", err)
-		}
+	if !enqueueAuthMail(s.Mailer, email, "Verify your email", "Verification token: "+token) {
+		return fmt.Errorf("authentication mail queue full")
 	}
 	return nil
 }
 
 func (s Service) VerifyEmail(ctx context.Context, token string) error {
 	h := sha256.Sum256([]byte(token))
-	tx, err := s.Pool.Begin(ctx)
-	if err != nil {
+	var consumed bool
+	if err := s.Pool.QueryRow(ctx, `SELECT public.auth_consume_email_verification($1)`, h[:]).Scan(&consumed); err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	var id, userID uuid.UUID
-	if err = tx.QueryRow(ctx, `SELECT id,user_id FROM email_verification_tokens WHERE token_hash=$1 AND expires_at>now() AND used_at IS NULL FOR UPDATE`, h[:]).Scan(&id, &userID); err != nil {
+	if !consumed {
 		return ErrToken
 	}
-	if _, err = tx.Exec(ctx, `UPDATE users SET email_verified_at=now(),status='active',updated_at=now() WHERE id=$1`, userID); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, `UPDATE email_verification_tokens SET used_at=now(),updated_at=now() WHERE id=$1`, id); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (s Service) Login(ctx context.Context, email, password, ua, ip, totpCode, recoveryCode string) (Tokens, error) {
@@ -191,28 +193,27 @@ func (s Service) Login(ctx context.Context, email, password, ua, ip, totpCode, r
 		}
 	}
 	var userID, tenantID uuid.UUID
-	var stored, role, status string
-	err := s.Pool.QueryRow(ctx, `SELECT id,password_hash,status,default_tenant_id FROM users WHERE lower(email)=lower($1)`, email).Scan(&userID, &stored, &status, &tenantID)
-	if err != nil || status != "active" || !verifyPassword(stored, password) {
+	var stored, status string
+	var encrypted []byte
+	var totpEnabled *time.Time
+	err := s.Pool.QueryRow(ctx, `SELECT user_id,password_hash,status,default_tenant_id,totp_secret_enc,totp_enabled_at FROM public.auth_login_material($1)`, email).Scan(&userID, &stored, &status, &tenantID, &encrypted, &totpEnabled)
+	if err != nil {
+		_ = verifyPassword(dummyPasswordHash, password)
 		return Tokens{}, ErrCredentials
 	}
+	passwordValid := verifyPassword(stored, password)
+	if status != "active" || !passwordValid {
+		return Tokens{}, ErrCredentials
+	}
+	var role string
 	err = db.WithTenantTx(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `SELECT role FROM memberships WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID).Scan(&role)
 	})
 	if err != nil {
 		return Tokens{}, ErrCredentials
 	}
-	var encrypted []byte
-	var totpEnabled *time.Time
-	if err = s.Pool.QueryRow(ctx, `SELECT totp_secret_enc,totp_enabled_at FROM users WHERE id=$1`, userID).Scan(&encrypted, &totpEnabled); err != nil {
-		return Tokens{}, ErrCredentials
-	}
 	if totpEnabled != nil {
-		secret, e := s.decryptTOTP(encrypted)
-		valid := false
-		if e == nil && totpCode != "" {
-			valid, _ = totp.ValidateCustom(totpCode, string(secret), s.now(), totp.ValidateOpts{Period: 30, Skew: 1, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
-		}
+		valid := totpCode != "" && s.consumeTOTPCode(ctx, userID, encrypted, totpCode)
 		if !valid && recoveryCode != "" {
 			valid = s.ConsumeRecoveryCode(ctx, userID, recoveryCode)
 		}
@@ -240,7 +241,7 @@ func (s Service) Login(ctx context.Context, email, password, ua, ip, totpCode, r
 	if ip != "" {
 		parsedIP = ip
 	}
-	_, err = s.Pool.Exec(ctx, `INSERT INTO refresh_tokens(id,user_id,family_id,token_hash,user_agent,ip,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, id, userID, family, hash[:], ua, parsedIP, s.now().Add(30*24*time.Hour))
+	_, err = s.Pool.Exec(ctx, `SELECT public.auth_create_refresh($1,$2,$3,$4,$5,$6,$7)`, id, userID, family, hash[:], ua, parsedIP, s.now().Add(30*24*time.Hour))
 	if err != nil {
 		return Tokens{}, err
 	}
@@ -253,37 +254,6 @@ func (s Service) Login(ctx context.Context, email, password, ua, ip, totpCode, r
 
 func (s Service) Refresh(ctx context.Context, old string) (Tokens, error) {
 	oldHash := sha256.Sum256([]byte(old))
-	tx, err := s.Pool.Begin(ctx)
-	if err != nil {
-		return Tokens{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	var id, userID, family, tenantID uuid.UUID
-	var role string
-	var revoked *time.Time
-	var expires time.Time
-	err = tx.QueryRow(ctx, `SELECT default_tenant_id FROM users WHERE id=(SELECT user_id FROM refresh_tokens WHERE token_hash=$1)`, oldHash[:]).Scan(&tenantID)
-	if err != nil {
-		return Tokens{}, ErrToken
-	}
-	if _, err = tx.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true)`, tenantID.String()); err != nil {
-		return Tokens{}, err
-	}
-	err = tx.QueryRow(ctx, `SELECT rt.id,rt.user_id,rt.family_id,rt.revoked_at,rt.expires_at,m.tenant_id,m.role FROM refresh_tokens rt JOIN memberships m ON m.user_id=rt.user_id AND m.tenant_id=$2 WHERE rt.token_hash=$1 FOR UPDATE OF rt`, oldHash[:], tenantID).Scan(&id, &userID, &family, &revoked, &expires, &tenantID, &role)
-	if err != nil {
-		return Tokens{}, ErrToken
-	}
-	if revoked != nil {
-		_, _ = tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=now(),updated_at=now() WHERE family_id=$1 AND revoked_at IS NULL`, family)
-		_ = tx.Commit(ctx)
-		return Tokens{}, ErrToken
-	}
-	if !expires.After(s.now()) {
-		return Tokens{}, ErrToken
-	}
-	if _, err = tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=now(),updated_at=now() WHERE id=$1`, id); err != nil {
-		return Tokens{}, err
-	}
 	newToken, err := randomToken(48)
 	if err != nil {
 		return Tokens{}, err
@@ -293,11 +263,14 @@ func (s Service) Refresh(ctx context.Context, old string) (Tokens, error) {
 		return Tokens{}, err
 	}
 	newHash := sha256.Sum256([]byte(newToken))
-	if _, err = tx.Exec(ctx, `INSERT INTO refresh_tokens(id,user_id,family_id,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)`, newID, userID, family, newHash[:], s.now().Add(30*24*time.Hour)); err != nil {
+	var outcome, role string
+	var userID, tenantID uuid.UUID
+	err = s.Pool.QueryRow(ctx, `SELECT outcome,user_id,tenant_id,role FROM public.auth_rotate_refresh($1,$2,$3,$4)`, oldHash[:], newID, newHash[:], s.now().Add(30*24*time.Hour)).Scan(&outcome, &userID, &tenantID, &role)
+	if err != nil {
 		return Tokens{}, err
 	}
-	if err = tx.Commit(ctx); err != nil {
-		return Tokens{}, err
+	if outcome != "ok" {
+		return Tokens{}, ErrToken
 	}
 	access, err := s.issueAccess(userID, tenantID, role)
 	if err != nil {
@@ -308,37 +281,40 @@ func (s Service) Refresh(ctx context.Context, old string) (Tokens, error) {
 
 func (s Service) Logout(ctx context.Context, token string) error {
 	h := sha256.Sum256([]byte(token))
-	_, err := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=now(),updated_at=now() WHERE token_hash=$1 AND revoked_at IS NULL`, h[:])
+	_, err := s.Pool.Exec(ctx, `SELECT public.auth_logout_refresh($1)`, h[:])
 	return err
 }
 func (s Service) RevokeSession(ctx context.Context, userID, sessionID uuid.UUID) error {
-	_, err := s.Pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=now(),updated_at=now() WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL`, sessionID, userID)
-	return err
+	return db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=pg_catalog.now(),updated_at=pg_catalog.now() WHERE id=$1 AND revoked_at IS NULL`, sessionID)
+		return err
+	})
 }
 func (s Service) ListSessions(ctx context.Context, userID uuid.UUID) ([]Session, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id,user_agent,coalesce(ip::text,''),expires_at,revoked_at,created_at FROM refresh_tokens WHERE user_id=$1 ORDER BY created_at DESC`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	out := []Session{}
-	for rows.Next() {
-		var item Session
-		if err = rows.Scan(&item.ID, &item.UserAgent, &item.IP, &item.ExpiresAt, &item.RevokedAt, &item.CreatedAt); err != nil {
-			return nil, err
+	err := db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id,user_agent,coalesce(ip::text,''),expires_at,revoked_at,created_at FROM refresh_tokens ORDER BY created_at DESC`)
+		if err != nil {
+			return err
 		}
-		out = append(out, item)
-	}
-	return out, rows.Err()
+		defer rows.Close()
+		for rows.Next() {
+			var item Session
+			if err = rows.Scan(&item.ID, &item.UserAgent, &item.IP, &item.ExpiresAt, &item.RevokedAt, &item.CreatedAt); err != nil {
+				return err
+			}
+			out = append(out, item)
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 func (s Service) RequestPasswordReset(ctx context.Context, email string) error {
-	var uid uuid.UUID
-	var storedEmail string
-	err := s.Pool.QueryRow(ctx, `SELECT id,email FROM users WHERE lower(email)=lower($1)`, strings.TrimSpace(email)).Scan(&uid, &storedEmail)
-	if err != nil {
-		return nil
-	}
+	started := time.Now()
+	// Do the same password-hash work for present and absent accounts; the endpoint also
+	// returns one generic response and mail delivery is detached from request latency.
+	_ = verifyPassword(dummyPasswordHash, "password-reset-timing-pad")
 	token, e := randomToken(32)
 	if e != nil {
 		return e
@@ -348,12 +324,13 @@ func (s Service) RequestPasswordReset(ctx context.Context, email string) error {
 		return e
 	}
 	h := sha256.Sum256([]byte(token))
-	if _, e = s.Pool.Exec(ctx, `INSERT INTO password_reset_tokens(id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4)`, id, uid, h[:], s.now().Add(time.Hour)); e != nil {
+	_, e = s.Pool.Exec(ctx, `SELECT public.auth_password_reset_request($1,$2,$3,$4)`, strings.TrimSpace(email), id, h[:], s.now().Add(time.Hour))
+	if e != nil {
 		return e
 	}
-	if s.Mailer != nil {
-		_ = s.Mailer.Send(ctx, storedEmail, "Reset your password", "Password reset token: "+token)
-	}
+	// The same message goes to the supplied address whether or not an account exists.
+	_ = enqueueAuthMail(s.Mailer, strings.TrimSpace(email), "Reset your password", "If an account exists, use this reset token: "+token)
+	padAuthResponse(started)
 	return nil
 }
 func (s Service) ResetPassword(ctx context.Context, token, password string) error {
@@ -361,27 +338,14 @@ func (s Service) ResetPassword(ctx context.Context, token, password string) erro
 		return ErrCredentials
 	}
 	h := sha256.Sum256([]byte(token))
-	tx, e := s.Pool.Begin(ctx)
-	if e != nil {
+	var consumed bool
+	if e := s.Pool.QueryRow(ctx, `SELECT public.auth_complete_password_reset($1,$2)`, h[:], hashPassword(password)).Scan(&consumed); e != nil {
 		return e
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	var uid uuid.UUID
-	var id uuid.UUID
-	e = tx.QueryRow(ctx, `SELECT id,user_id FROM password_reset_tokens WHERE token_hash=$1 AND expires_at>now() AND used_at IS NULL FOR UPDATE`, h[:]).Scan(&id, &uid)
-	if e != nil {
+	if !consumed {
 		return ErrToken
 	}
-	if _, e = tx.Exec(ctx, `UPDATE users SET password_hash=$1,updated_at=now() WHERE id=$2`, hashPassword(password), uid); e != nil {
-		return e
-	}
-	if _, e = tx.Exec(ctx, `UPDATE password_reset_tokens SET used_at=now(),updated_at=now() WHERE id=$1`, id); e != nil {
-		return e
-	}
-	if _, e = tx.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=now(),updated_at=now() WHERE user_id=$1 AND revoked_at IS NULL`, uid); e != nil {
-		return e
-	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (s Service) CreateTOTP(ctx context.Context, userID uuid.UUID) (string, [10]string, error) {
@@ -409,23 +373,31 @@ func (s Service) CreateTOTP(ctx context.Context, userID uuid.UUID) (string, [10]
 			return "", recovery, e
 		}
 	}
-	tx, err := s.Pool.Begin(ctx)
+	codeRows := make([]struct {
+		ID   uuid.UUID `json:"id"`
+		Hash []byte    `json:"hash"`
+	}, len(ids))
+	for i := range ids {
+		codeRows[i] = struct {
+			ID   uuid.UUID `json:"id"`
+			Hash []byte    `json:"hash"`
+		}{ID: ids[i], Hash: hashes[i][:]}
+	}
+	codeJSON, err := json.Marshal(codeRows)
 	if err != nil {
 		return "", recovery, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err = tx.Exec(ctx, `UPDATE users SET totp_secret_enc=$1,totp_enabled_at=NULL,updated_at=now() WHERE id=$2`, enc, userID); err != nil {
-		return "", recovery, err
-	}
-	if _, err = tx.Exec(ctx, `DELETE FROM totp_recovery_codes WHERE user_id=$1`, userID); err != nil {
-		return "", recovery, err
-	}
-	for i := range ids {
-		if _, err = tx.Exec(ctx, `INSERT INTO totp_recovery_codes(id,user_id,code_hash) VALUES($1,$2,$3)`, ids[i], userID, hashes[i][:]); err != nil {
-			return "", recovery, err
+	err = db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error {
+		var configured bool
+		if e := tx.QueryRow(ctx, `SELECT public.auth_configure_totp($1,$2,$3::jsonb)`, userID, enc, string(codeJSON)).Scan(&configured); e != nil {
+			return e
 		}
-	}
-	if err = tx.Commit(ctx); err != nil {
+		if !configured {
+			return ErrToken
+		}
+		return nil
+	})
+	if err != nil {
 		return "", recovery, err
 	}
 	return plain, recovery, nil
@@ -434,25 +406,55 @@ func (s Service) EnableTOTP(ctx context.Context, userID uuid.UUID, code string) 
 	if !s.VerifyTOTP(ctx, userID, code) {
 		return false
 	}
-	tag, err := s.Pool.Exec(ctx, `UPDATE users SET totp_enabled_at=now(),updated_at=now() WHERE id=$1 AND totp_secret_enc IS NOT NULL`, userID)
-	return err == nil && tag.RowsAffected() == 1
+	var enabled bool
+	err := db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error { return tx.QueryRow(ctx, `SELECT public.auth_enable_totp()`).Scan(&enabled) })
+	return err == nil && enabled
 }
 func (s Service) VerifyTOTP(ctx context.Context, userID uuid.UUID, code string) bool {
 	var enc []byte
-	if err := s.Pool.QueryRow(ctx, `SELECT totp_secret_enc FROM users WHERE id=$1`, userID).Scan(&enc); err != nil {
-		return false
-	}
-	secret, err := s.decryptTOTP(enc)
-	if err != nil {
-		return false
-	}
-	valid, _ := totp.ValidateCustom(code, string(secret), s.now(), totp.ValidateOpts{Period: 30, Skew: 1, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
-	return valid
+	err := db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT secret FROM public.auth_totp_secret()`).Scan(&enc)
+	})
+	return err == nil && s.consumeTOTPCode(ctx, userID, enc, code)
 }
 func (s Service) ConsumeRecoveryCode(ctx context.Context, userID uuid.UUID, code string) bool {
 	h := sha256.Sum256([]byte(strings.ToUpper(code)))
-	tag, e := s.Pool.Exec(ctx, `UPDATE totp_recovery_codes SET used_at=now(),updated_at=now() WHERE user_id=$1 AND code_hash=$2 AND used_at IS NULL`, userID, h[:])
-	return e == nil && tag.RowsAffected() == 1
+	var consumed bool
+	e := db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT public.auth_consume_recovery_code($1)`, h[:]).Scan(&consumed)
+	})
+	return e == nil && consumed
+}
+
+func (s Service) consumeTOTPCode(ctx context.Context, userID uuid.UUID, encrypted []byte, code string) bool {
+	secret, err := s.decryptTOTP(encrypted)
+	if err != nil || code == "" {
+		return false
+	}
+	step, ok := matchingTOTPStep(string(secret), code, s.now())
+	if !ok {
+		return false
+	}
+	var consumed bool
+	err = db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT public.auth_consume_totp_step($1)`, step).Scan(&consumed)
+	})
+	return err == nil && consumed
+}
+
+func matchingTOTPStep(secret, code string, now time.Time) (int64, bool) {
+	current := now.Unix() / 30
+	matched := int64(-1)
+	for _, candidate := range []int64{current, current - 1, current + 1} {
+		if candidate < 0 {
+			continue
+		}
+		generated, err := totp.GenerateCodeCustom(secret, time.Unix(candidate*30, 0), totp.ValidateOpts{Period: 30, Skew: 0, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
+		if err == nil && subtle.ConstantTimeCompare([]byte(generated), []byte(code)) == 1 && matched < 0 {
+			matched = candidate
+		}
+	}
+	return matched, matched >= 0
 }
 
 func (s Service) issueAccess(user, tenant uuid.UUID, role string) (string, error) {
@@ -495,6 +497,13 @@ func verifyPassword(encoded, password string) bool {
 	got := argon2.IDKey([]byte(password), salt, uint32(t), uint32(m), uint8(p), 32)
 	return subtle.ConstantTimeCompare(got, expected) == 1
 }
+
+var dummyPasswordHash = func() string {
+	salt := make([]byte, 16)
+	sum := argon2.IDKey([]byte("never-a-real-password"), salt, 2, 19*1024, 1, 32)
+	return fmt.Sprintf("$argon2id$v=19$m=19456,t=2,p=1$%s$%s", base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(sum))
+}()
+
 func randomToken(n int) (string, error) {
 	b := make([]byte, n)
 	if _, e := rand.Read(b); e != nil {

@@ -343,6 +343,7 @@ type User struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	DefaultTenantID pgtype.UUID        `json:"default_tenant_id"`
+	TotpLastStep    int64              `json:"totp_last_step"`
 }
 
 type WafSetting struct {

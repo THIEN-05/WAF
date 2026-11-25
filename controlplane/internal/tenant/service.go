@@ -58,17 +58,18 @@ func (s Service) Invite(ctx context.Context, tenantID, actor uuid.UUID, email st
 	if err != nil {
 		return "", err
 	}
+	auditID, err := uuid.NewV7()
+	if err != nil {
+		return "", err
+	}
 	hash := sha256.Sum256(token)
-	err = db.WithTenantTx(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
+	err = db.WithUserTenantTx(ctx, s.Pool, actor, tenantID, func(tx pgx.Tx) error {
 		actorRole, e := roleFor(ctx, tx, tenantID, actor)
 		if e != nil || !Can(actorRole, ManageMembers, Resource{TenantID: tenantID.String()}) {
 			return ErrForbidden
 		}
-		_, e = tx.Exec(ctx, `INSERT INTO invitations(id,tenant_id,email,role,token_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6)`, id, tenantID, email, role, hash[:], time.Now().Add(7*24*time.Hour))
-		if e != nil {
-			return e
-		}
-		return appendAudit(ctx, tx, tenantID, actor, "member.invitation.create", "invitation", id, map[string]any{"email": email, "role": role})
+		_, e = tx.Exec(ctx, `SELECT public.tenant_create_invitation($1,$2,$3,$4,$5,$6,$7,$8)`, id, tenantID, email, role, hash[:], time.Now().Add(7*24*time.Hour-time.Minute), actor, auditID)
+		return e
 	})
 	return base64.RawURLEncoding.EncodeToString(token), err
 }
@@ -78,41 +79,25 @@ func (s Service) AcceptInvite(ctx context.Context, userID uuid.UUID, token strin
 		return ErrNotFound
 	}
 	hash := sha256.Sum256(raw)
-	var tenantID, id uuid.UUID
-	var role Role
-	var invitedEmail, userEmail string
-	if err = s.Pool.QueryRow(ctx, `SELECT email FROM users WHERE id=$1`, userID).Scan(&userEmail); err != nil {
-		return ErrNotFound
-	}
-	tx, err := s.Pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	err = tx.QueryRow(ctx, `SELECT tenant_id,invitation_id,invited_role,invited_email FROM lookup_invitation($1)`, hash[:]).Scan(&tenantID, &id, &role, &invitedEmail)
-	if err != nil {
-		return ErrNotFound
-	}
-	if !strings.EqualFold(strings.TrimSpace(userEmail), strings.TrimSpace(invitedEmail)) {
-		return ErrForbidden
-	}
-	if _, err = tx.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true)`, tenantID.String()); err != nil {
-		return err
-	}
 	memberID, err := uuid.NewV7()
 	if err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO memberships(id,tenant_id,user_id,role) VALUES($1,$2,$3,$4) ON CONFLICT(tenant_id,user_id) DO NOTHING`, memberID, tenantID, userID, role); err != nil {
+	auditID, err := uuid.NewV7()
+	if err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `DELETE FROM invitations WHERE id=$1`, id); err != nil {
+	var accepted bool
+	err = db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT public.tenant_accept_invitation($1,$2,$3,$4)`, hash[:], userID, memberID, auditID).Scan(&accepted)
+	})
+	if err != nil {
 		return err
 	}
-	if err = appendAudit(ctx, tx, tenantID, userID, "member.invitation.accept", "membership", memberID, map[string]any{"role": role}); err != nil {
-		return err
+	if !accepted {
+		return ErrNotFound
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 type APIKey struct {
@@ -136,16 +121,17 @@ func (s Service) CreateAPIKey(ctx context.Context, tenantID, actor uuid.UUID, na
 	if err != nil {
 		return APIKey{}, err
 	}
-	err = db.WithTenantTx(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
+	auditID, err := uuid.NewV7()
+	if err != nil {
+		return APIKey{}, err
+	}
+	err = db.WithUserTenantTx(ctx, s.Pool, actor, tenantID, func(tx pgx.Tx) error {
 		actorRole, e := roleFor(ctx, tx, tenantID, actor)
 		if e != nil || !Can(actorRole, ManageAPIKeys, Resource{TenantID: tenantID.String()}) {
 			return ErrForbidden
 		}
-		_, e = tx.Exec(ctx, `INSERT INTO api_keys(id,tenant_id,name,key_hash,scopes,created_by,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, id, tenantID, name, hash[:], scopes, actor, expiresAt)
-		if e != nil {
-			return e
-		}
-		return appendAudit(ctx, tx, tenantID, actor, "api_key.create", "api_key", id, map[string]any{"name": name, "scopes": scopes})
+		_, e = tx.Exec(ctx, `SELECT public.tenant_create_api_key($1,$2,$3,$4,$5,$6,$7,$8)`, id, tenantID, name, hash[:], scopes, actor, auditID, expiresAt)
+		return e
 	})
 	return APIKey{ID: id, Plaintext: plain}, err
 }
@@ -159,12 +145,12 @@ type Member struct {
 
 func (s Service) ListMembers(ctx context.Context, tenantID, actor uuid.UUID) ([]Member, error) {
 	var out []Member
-	err := db.WithTenantTx(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
+	err := db.WithUserTenantTx(ctx, s.Pool, actor, tenantID, func(tx pgx.Tx) error {
 		actorRole, e := roleFor(ctx, tx, tenantID, actor)
 		if e != nil || !Can(actorRole, ManageMembers, Resource{TenantID: tenantID.String()}) {
 			return ErrForbidden
 		}
-		rows, e := tx.Query(ctx, `SELECT m.user_id,u.email,m.role,m.created_at FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.tenant_id=$1 ORDER BY m.created_at`, tenantID)
+		rows, e := tx.Query(ctx, `SELECT user_id,email,role,created_at FROM public.tenant_list_members($1)`, tenantID)
 		if e != nil {
 			return e
 		}

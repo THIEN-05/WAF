@@ -36,6 +36,38 @@
 - **TODO-CP-5:** API key issuance/list/revoke đã có; xác thực API key và thực thi scope trên tài nguyên API chưa có trong phạm vi schema/auth/tenant/entitlement lượt này.
 - **TODO-CP-6:** bảng tenant chính đã migrate; handlers của site/rule/cert/billing và back-office worker workflows thuộc các module control plane kế tiếp.
 
+## P7-verify — hạn chế lộ dữ liệu xác thực — 2026-11-25
+
+### Đã triển khai
+
+- Migration mới `controlplane/migrations/00002_auth_user_rls.sql`; migration `00001` giữ nguyên. Bật `ENABLE` + `FORCE RLS` cho `users`, `refresh_tokens`, `totp_recovery_codes`, `password_reset_tokens`, `email_verification_tokens`; policy theo `app.user_id`, thiếu GUC trả tập rỗng. `WithTenantTx`, `WithUserTx`, `WithUserTenantTx` dùng `set_config(..., true)`.
+- `waf_api` không còn quyền bảng/cột đọc, chèn hoặc sửa password hash, secret TOTP, hash phiên/token, recovery code, API key, invitation hay domain verification. Metadata phiên bị giới hạn theo RLS. Danh sách thành viên trả qua `tenant_list_members`, chỉ gồm ID/email/role/thời điểm tạo.
+- Auth và tenant dùng các hàm `SECURITY DEFINER` giới hạn quyền, `search_path=pg_catalog, public`, quan hệ schema-qualified, owner `waf_worker` (NOLOGIN, BYPASSRLS, không phải superuser), và `EXECUTE` bị thu hồi khỏi PUBLIC. Có kiểm tra hash Argon2 giả cho login không tồn tại, timing floor cho reset/registration, hàng đợi email có trần; TOTP dùng step đơn dụng. Trigger ghi audit không kèm bí mật cho mutation của user/session/token/TOTP.
+- Integration test tách theo `t.Run`: RLS allowlist có lý do, quyền cột nhạy cảm, session chéo user, hàm definer/search_path, đăng ký/xác minh/reset/logout, API key/invitation, TOTP replay và refresh đồng thời. Job `cp-integration` dùng PostgreSQL 18 + Redis + Mailhog, chạy `-race -count=20`; `CP_INTEGRATION_REQUIRED=1` biến thiếu dịch vụ thành FAIL thay vì SKIP. CI chạy `make gen` rồi `git diff --exit-code`.
+
+### Đã xác minh
+
+- `go test ./controlplane/internal/api ./controlplane/internal/auth ./controlplane/internal/tenant` → PASS.
+- `go test -tags=integration -run '^$' ./controlplane/internal/integration` → PASS, code integration biên dịch.
+- Trên WSL Ubuntu, với PostgreSQL 18.6 và Redis 8.0.5 thật: Goose migration lên version 2 thành công; `go test -tags=integration -count=1 -v ./controlplane/internal/integration` → PASS, 3 test nhóm/đầy đủ subtest, không SKIP; `go test -tags=integration -race -count=20 ./controlplane/internal/integration` → `ok ... 55.040s` (0 exit). Cấu hình CI dùng cùng `CP_INTEGRATION_REQUIRED=1` để thiếu service là FAIL.
+- Trạng thái mới nhất trên Windows/Go 1.26.11: `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → exit 0, không output; `go build ./...` → exit 0 (có cảnh báo quyền ghi stat-cache vào module cache Windows, không ảnh hưởng kết quả).
+- `make gen` đã chạy thành công: oapi-codegen v2.9.0 và sqlc v1.30.0. Sinh thêm `TotpLastStep` trong `controlplane/internal/dbsqlc/models.go`, đúng với migration 00002.
+- `go test -count=1 ./...` trên Windows → FAIL chỉ ở các test loopback thuộc `edge/internal/bot`, `edge/internal/edgecore`, `edge/internal/listener`, `edge/internal/proxy`; output là `connectex ... forbidden by its access permissions`. Các package Control Plane gồm integration-independent tests PASS. Đây là giới hạn loopback của sandbox Windows; không tính là xanh toàn repo.
+
+### Chưa xác minh — lệnh chạy lại trong WSL/PostgreSQL 18
+
+- `go test -race -count=1 ./...` toàn repo chưa xác minh ở phiên cuối: Windows không bật CGO; lần thử WSL bị `Wsl/E_ACCESSDENIED`. Chạy lại trên WSL/CI Ubuntu: `go test -race -count=1 ./...`.
+- `go test -race -count=1 ./...` không xác minh được: Windows hiện `CGO_ENABLED=0`, lần gọi WSL bị `Wsl/E_ACCESSDENIED`. Chạy lại ngoài sandbox trên WSL/CI Ubuntu.
+- `govulncheck ./...` lần này FAIL trước scan vì DNS/mạng: `fetching vulnerabilities ... lookup vuln.go.dev: no such host`. Lần PASS trước đó là trước thay đổi này; chạy lại khi có mạng.
+- `git diff --exit-code` của generate chỉ có ý nghĩa sau khi commit các thay đổi mã nguồn/generated hiện tại.
+- **P7-verify chưa đóng:** kiểm chứng tích hợp thật đã xanh, nhưng chưa có GitHub Actions run xanh cho commit hiện tại; không có test nào được tính là đã chạy thật nếu bị SKIP.
+
+### Nợ kỹ thuật
+
+- **TODO-P7V-1:** CI PostgreSQL 18/Redis/Mailhog `cp-integration` phải xanh đủ 20 lượt; đặc biệt xác minh migration Goose, RLS, owner/search_path của SECURITY DEFINER và refresh cạnh tranh. Không đóng khi job lỗi hoặc báo SKIP.
+- **TODO-P7V-2:** provisioning production của migration principal có `CREATEROLE` và membership cần thiết để đổi owner sang `waf_worker`, không dùng superuser; credential `waf_api`/`waf_worker` vẫn chưa cấp trong deploy.
+- **TODO-P7V-3:** audit trigger ghi mutation của bảng auth nhưng không audit được SELECT tùy ý của một worker login trực tiếp; worker phải dùng entrypoint có audit hoặc triển khai pgAudit trước khi cấp credential.
+
 ## P12 — logging và telemetry
 
 ### Đã xác minh
