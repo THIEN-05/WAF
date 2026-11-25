@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"net"
+	"net/http"
+	"net/url"
 	"testing"
+	"time"
 )
 
 type fakeDNS struct {
@@ -18,13 +21,14 @@ func (f fakeDNS) LookupCNAME(context.Context, string) (string, error)        { r
 func (f fakeDNS) LookupIP(context.Context, string, string) ([]net.IP, error) { return f.ips, nil }
 
 func TestVerifyDNSOwnership(t *testing.T) {
-	if err := VerifyDNS(context.Background(), fakeDNS{txt: []string{"wrong", "token-123"}}, "Example.test.", "token-123"); err != nil {
+	hash := sha256.Sum256([]byte("token-123"))
+	if err := VerifyDNSHash(context.Background(), fakeDNS{txt: []string{"wrong", "token-123"}}, "Example.test.", hash[:], "verify.example.net"); err != nil {
 		t.Fatalf("TXT proof: %v", err)
 	}
-	if err := VerifyDNS(context.Background(), fakeDNS{cname: "verify.token-123.waf.invalid."}, "example.test", "token-123"); err != nil {
+	if err := VerifyDNSHash(context.Background(), fakeDNS{cname: CNAMEProofTarget(hash[:], "verify.example.net")}, "example.test", hash[:], "verify.example.net"); err != nil {
 		t.Fatalf("CNAME proof: %v", err)
 	}
-	if err := VerifyDNS(context.Background(), fakeDNS{}, "example.test", "token-123"); err == nil {
+	if err := VerifyDNSHash(context.Background(), fakeDNS{}, "example.test", hash[:], "verify.example.net"); err == nil {
 		t.Fatal("missing proof accepted")
 	}
 }
@@ -32,7 +36,7 @@ func TestVerifyDNSOwnership(t *testing.T) {
 func TestVerifyDNSHash(t *testing.T) {
 	proof := fakeDNS{txt: []string{"token-123"}}
 	hash := sha256.Sum256([]byte("token-123"))
-	if err := VerifyDNSHash(context.Background(), proof, "example.test", hash[:]); err != nil {
+	if err := VerifyDNSHash(context.Background(), proof, "example.test", hash[:], ""); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -52,5 +56,33 @@ func TestValidateOriginPolicy(t *testing.T) {
 	}
 	if _, err := ValidateOrigin(context.Background(), "http://127.0.0.1", resolver); err == nil {
 		t.Fatal("accepted literal loopback")
+	}
+	if _, err := ValidateOrigin(context.Background(), "http://[::1]", resolver); err == nil {
+		t.Fatal("accepted IPv6 loopback literal")
+	}
+	if _, err := ValidateOrigin(context.Background(), "http://origin.example/path#fragment", resolver); err == nil {
+		t.Fatal("accepted origin URL fragment")
+	}
+}
+
+func TestOriginProbeGuardsSelfAndDoesNotFollowRedirects(t *testing.T) {
+	public := net.ParseIP("203.0.113.14")
+	resolver := fakeDNS{ips: []net.IP{public}}
+	if err := ProbeOrigin(context.Background(), "https://origin.example", resolver, []net.IP{public}, time.Second); err == nil {
+		t.Fatal("probe allowed an origin resolving to this service")
+	}
+	client := originProbeClient(&http.Transport{}, time.Second)
+	redirect := &http.Request{URL: &url.URL{Scheme: "http", Host: "127.0.0.1"}}
+	if err := client.CheckRedirect(redirect, nil); err != http.ErrUseLastResponse {
+		t.Fatalf("redirect decision=%v, want ErrUseLastResponse", err)
+	}
+}
+
+func TestVerificationIntervalUsesAge(t *testing.T) {
+	if got := VerificationInterval(23*time.Hour + 59*time.Minute); got != time.Minute {
+		t.Fatalf("initial verification interval=%v", got)
+	}
+	if got := VerificationInterval(24 * time.Hour); got != 15*time.Minute {
+		t.Fatalf("slow verification interval=%v", got)
 	}
 }

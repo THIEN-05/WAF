@@ -5,9 +5,18 @@
 - Outbound origin resolution/dial phải đi qua `pkg/netguard`: reject toàn bộ DNS answer set nếu có IP không an toàn và resolve lại ngay trước khi dial numeric IP. Edge tắt `ProxyFromEnvironment`, vì forward proxy có thể tự resolve origin và bypass guard. `203.0.113.0/24` được coi là unicast trong unit tests, không phải production target; test dùng resolver/dialer giả.
 - Verification token domain chỉ trả cho người dùng khi tạo; DB chỉ giữ SHA-256. TXT `_waf-verify.<hostname>` mang token gốc; worker hash TXT rồi constant-time compare với digest DB. CNAME proof có dạng `verify.<token>.waf.invalid`. Hostname global uniqueness tiếp tục do unique constraint `domains.hostname` đảm bảo.
 - Tạo site lấy advisory transaction lock theo tenant rồi kiểm quota và insert trong cùng transaction để hai request đồng thời không vượt quota.
-- Domain activation ghi `config_change_outbox` cùng transaction để tránh mất intent; NATS publish hiện là best-effort sau commit cho đến khi dispatcher/retry worker hoàn thiện (**TODO-P7-OUTBOX-1**).
+- Lịch sử quyết định P7: domain activation ghi `config_change_outbox` cùng transaction. P8a làm rõ API chưa được nối NATS và chưa có dispatcher; xem TODO-P8A-OUTBOX-1, quyết định cũ về best-effort đã được thay thế.
 - Đợt này chỉ là lát MVP: validator DSL/CSV và FakeProvider/signature verification chưa thay thế rule CRUD/billing lifecycle. Không coi phần §5.4 hoặc §5.6 là đã hoàn tất.
 - Danh sách nợ được theo dõi trong `docs/PROGRESS.md`: TODO-P7-SITE-1 (probe cô lập + E2E), TODO-P7-RULES-1 (CRUD/quota/history/ETag/idempotency), TODO-P7-BILLING-1 (Stripe/webhook worker/subscription/invoices), TODO-P7-OUTBOX-1 (dispatcher bền vững), TODO-P7-TEST-1 (integration matrix).
+
+## P8a — role và bằng chứng site — 2026-11-25
+
+- `waf_api` chỉ có quyền INSERT theo cột trên `config_change_outbox`; không được SELECT/UPDATE/DELETE. `waf_worker` có quyền theo cột để đọc/claim/đánh dấu event và INSERT event phát sinh từ worker; RLS tenant `ENABLE` + `FORCE` vẫn là mặc định, nhưng `waf_worker` là BYPASSRLS nên mọi job bắt buộc dùng code path có tenant id/audit. Regression test kiểm các cột/quyền này.
+- `domains.verification_token_hash` không mở cho API role. `site_add_domain` SECURITY DEFINER là đường ghi duy nhất của API; nó ràng buộc `app.user_id`, `app.tenant_id`, owner/admin membership, kiểm tra site và ghi audit. Domain token hạn 24h; TXT hash compare hằng thời gian. CNAME proof dùng target dẫn xuất từ SHA-256 dưới zone cấu hình, không hardcode domain placeholder.
+- Quota site được kiểm trong cùng transaction sau advisory transaction lock theo tenant; unique index toàn cục trên `domains.hostname` xử lý race giữa tenants. API trả conflict generic để không tiết lộ tenant sở hữu hostname.
+- **Chưa chấp nhận exactly-once cho NATS outbox:** không thể đồng thời bảo đảm không mất event và không duplicate khi crash giữa publish/mark với core NATS thuần. Cần JetStream dedupe theo message ID/consumer idempotency hoặc protocol tương đương. Theo dõi TODO-P8A-OUTBOX-1.
+- `ProbeOrigin` tự nó không tạo sandbox mạng; production worker phải chạy trong network namespace/egress ACL chặn private/internal control-plane ranges. Theo dõi TODO-P8A-WORKER-1.
+- Các bằng chứng runtime Postgres, migration cycle, full race, SQL checker và govulncheck chưa có trong lượt này; xem trạng thái/commands trong `docs/PROGRESS.md`. Không đánh dấu P8a đóng đến khi TODO-P8A-DB-1, WORKER-1 và IDOR-1 được chứng minh; API/dispatcher requirements còn mở theo số TODO tương ứng.
 
 Ngày: 2026-11-20
 

@@ -11,7 +11,9 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	"github.com/example/wafplatform/controlplane/internal/entitlement"
 	"github.com/example/wafplatform/controlplane/internal/platform/audit"
 	"github.com/example/wafplatform/controlplane/internal/platform/db"
+	"github.com/example/wafplatform/controlplane/internal/site"
 	"github.com/example/wafplatform/controlplane/internal/tenant"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -105,6 +108,46 @@ func apiRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url str
 	}
 	if bypass || !member {
 		t.Fatalf("application login policy invalid: bypass=%v member=%v", bypass, member)
+	}
+	return p
+}
+
+func workerRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url string) *pgxpool.Pool {
+	t.Helper()
+	roleName := "waf_test_worker_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'test-worker-role-password'`, roleName)); err != nil {
+		t.Fatalf("create worker login: %v", err)
+	}
+	if _, err := admin.Exec(ctx, fmt.Sprintf(`GRANT waf_worker TO %s`, roleName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(context.Background(), fmt.Sprintf(`REVOKE waf_worker FROM %s`, roleName))
+		_, _ = admin.Exec(context.Background(), fmt.Sprintf(`DROP ROLE IF EXISTS %s`, roleName))
+	})
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.User, cfg.ConnConfig.Password = roleName, "test-worker-role-password"
+	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, e := conn.Exec(ctx, `SET ROLE waf_worker`)
+		return e
+	}
+	p, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	if err = p.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var bypass, member bool
+	if err = p.QueryRow(ctx, `SELECT r.rolsuper OR r.rolbypassrls,pg_has_role(current_user,'waf_worker','member') FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`).Scan(&bypass, &member); err != nil {
+		t.Fatal(err)
+	}
+	if !bypass || !member {
+		t.Fatalf("worker login must be a BYPASSRLS member: bypass=%v member=%v", bypass, member)
 	}
 	return p
 }
@@ -817,6 +860,7 @@ func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
 		"tenant_create_invitation":        "session tenant/user + owner/admin membership; cannot invite owner",
 		"tenant_accept_invitation":        "app.user_id + matching user email + invitation hash; inserts own membership",
 		"tenant_list_members":             "app.user_id membership in app.tenant_id; narrow member metadata",
+		"site_add_domain":                 "app.user_id and app.tenant_id plus owner/admin membership; writes token digest and audit",
 	}
 	rows, err := admin.Query(ctx, `SELECT p.proname::text,
       EXISTS (SELECT 1 FROM pg_catalog.unnest(p.proconfig) c WHERE c LIKE 'search_path=pg_catalog, public%'),
@@ -900,6 +944,27 @@ func TestPublicTableRLSAllowlist(t *testing.T) {
 		if !seen[name] {
 			t.Errorf("allowlisted table %q is missing: %s", name, reason)
 		}
+	}
+	var rls, forced bool
+	if err = pool.QueryRow(ctx, `SELECT relrowsecurity,relforcerowsecurity FROM pg_catalog.pg_class WHERE oid='public.config_change_outbox'::regclass`).Scan(&rls, &forced); err != nil {
+		t.Fatal(err)
+	}
+	if !rls || !forced {
+		t.Fatalf("config_change_outbox requires ENABLE and FORCE RLS; enabled=%v forced=%v", rls, forced)
+	}
+	var usingExpr, checkExpr string
+	if err = pool.QueryRow(ctx, `SELECT coalesce(qual,''),coalesce(with_check,'') FROM pg_catalog.pg_policies WHERE schemaname='public' AND tablename='config_change_outbox' AND policyname='tenant_isolation'`).Scan(&usingExpr, &checkExpr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(usingExpr, "app.tenant_id") || !strings.Contains(checkExpr, "app.tenant_id") {
+		t.Fatalf("outbox RLS policy is not tenant scoped: USING=%q WITH CHECK=%q", usingExpr, checkExpr)
+	}
+	var apiInsert, apiSelect, apiUpdate, apiDelete, workerRead, workerUpdate, workerPayloadUpdate, workerInsert, workerDelete bool
+	if err = pool.QueryRow(ctx, `SELECT has_column_privilege('waf_api','public.config_change_outbox','payload','INSERT'),has_column_privilege('waf_api','public.config_change_outbox','payload','SELECT'),has_column_privilege('waf_api','public.config_change_outbox','payload','UPDATE'),has_table_privilege('waf_api','public.config_change_outbox','DELETE'),has_column_privilege('waf_worker','public.config_change_outbox','payload','SELECT'),has_column_privilege('waf_worker','public.config_change_outbox','published_at','UPDATE'),has_column_privilege('waf_worker','public.config_change_outbox','payload','UPDATE'),has_column_privilege('waf_worker','public.config_change_outbox','payload','INSERT'),has_table_privilege('waf_worker','public.config_change_outbox','DELETE')`).Scan(&apiInsert, &apiSelect, &apiUpdate, &apiDelete, &workerRead, &workerUpdate, &workerPayloadUpdate, &workerInsert, &workerDelete); err != nil {
+		t.Fatal(err)
+	}
+	if !apiInsert || apiSelect || apiUpdate || apiDelete || !workerRead || !workerUpdate || workerPayloadUpdate || !workerInsert || workerDelete {
+		t.Fatalf("unexpected outbox grants: API insert/select/update/delete=%v/%v/%v/%v worker payload-read/published-update/payload-update/insert/delete=%v/%v/%v/%v/%v", apiInsert, apiSelect, apiUpdate, apiDelete, workerRead, workerUpdate, workerPayloadUpdate, workerInsert, workerDelete)
 	}
 }
 
@@ -993,6 +1058,191 @@ func TestAuthFlowsAndConcurrentRefreshRotation(t *testing.T) {
 		}
 		if ok != 1 {
 			t.Fatalf("same refresh token had %d successful rotations, want exactly 1", ok)
+		}
+	})
+}
+
+type siteFakeDNS struct {
+	records []string
+	cname   string
+	ips     []net.IP
+}
+
+func (d siteFakeDNS) LookupTXT(context.Context, string) ([]string, error)        { return d.records, nil }
+func (d siteFakeDNS) LookupCNAME(context.Context, string) (string, error)        { return d.cname, nil }
+func (d siteFakeDNS) LookupIP(context.Context, string, string) ([]net.IP, error) { return d.ips, nil }
+
+func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
+	ctx, admin, redisClient := integrationDeps(t)
+	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
+	worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
+	mailer := &captureMailer{messages: make(chan capturedMail, 16)}
+	authSvc := newAuthService(t, app, redisClient, mailer)
+	register := func(label string) (uuid.UUID, uuid.UUID) {
+		t.Helper()
+		email := label + "-" + uuid.NewString() + "@example.test"
+		if err := authSvc.Register(ctx, email, "a correct horse battery staple"); err != nil {
+			t.Fatal(err)
+		}
+		if err := authSvc.VerifyEmail(ctx, receivedToken(t, mailer, "Verification token: ")); err != nil {
+			t.Fatal(err)
+		}
+		var userID, tenantID uuid.UUID
+		if err := admin.QueryRow(ctx, `SELECT id,default_tenant_id FROM public.users WHERE email=$1`, email).Scan(&userID, &tenantID); err != nil {
+			t.Fatal(err)
+		}
+		return userID, tenantID
+	}
+	userA, tenantA := register("site-race-a")
+	userB, tenantB := register("site-race-b")
+	service := site.Service{Pool: app}
+	t.Run("free_site_quota_serializes_concurrent_creates", func(t *testing.T) {
+		start := make(chan struct{})
+		type result struct {
+			site site.Site
+			err  error
+		}
+		results := make(chan result, 2)
+		var wg sync.WaitGroup
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				s, e := service.Create(ctx, tenantA, userA, "race-site")
+				results <- result{s, e}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		success, quota := 0, 0
+		for r := range results {
+			if r.err == nil {
+				success++
+			} else if errors.Is(r.err, entitlement.ErrQuotaExceeded) {
+				quota++
+			} else {
+				t.Errorf("unexpected concurrent site creation result: %v", r.err)
+			}
+		}
+		if success != 1 || quota != 1 {
+			t.Fatalf("site create successes=%d quota rejects=%d; want one each", success, quota)
+		}
+	})
+	siteA, err := service.Create(ctx, tenantB, userB, "tenant-b-site")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var siteAID uuid.UUID
+	if err = admin.QueryRow(ctx, `SELECT id FROM public.sites WHERE tenant_id=$1 AND name='race-site'`, tenantA).Scan(&siteAID); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("same_hostname_race_and_non_disclosing_conflict", func(t *testing.T) {
+		start := make(chan struct{})
+		type result struct {
+			proof site.DomainProof
+			err   error
+		}
+		results := make(chan result, 2)
+		var wg sync.WaitGroup
+		for _, input := range []struct{ tenant, user, sid uuid.UUID }{{tenantA, userA, siteAID}, {tenantB, userB, siteA.ID}} {
+			wg.Add(1)
+			go func(v struct{ tenant, user, sid uuid.UUID }) {
+				defer wg.Done()
+				<-start
+				p, e := service.AddDomain(ctx, v.tenant, v.user, v.sid, "Shared.Example.Test.")
+				results <- result{p, e}
+			}(input)
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		var winner site.DomainProof
+		success, conflict := 0, 0
+		for r := range results {
+			if r.err == nil {
+				success++
+				winner = r.proof
+			} else if errors.Is(r.err, site.ErrHostnameUnavailable) {
+				conflict++
+			} else {
+				t.Errorf("unexpected domain result: %v", r.err)
+			}
+		}
+		if success != 1 || conflict != 1 {
+			t.Fatalf("domain creates successes=%d conflicts=%d; want one each", success, conflict)
+		}
+		if strings.Contains(winner.Hostname, tenantA.String()) || strings.Contains(winner.Hostname, tenantB.String()) {
+			t.Fatal("hostname conflict response exposed tenant identity")
+		}
+		if _, err := service.AddDomain(ctx, tenantA, userA, siteA.ID, "cross-tenant.example.test"); !errors.Is(err, site.ErrSiteNotFound) {
+			t.Fatalf("cross-tenant site reference err=%v, want not found", err)
+		}
+		if _, err := service.AddOrigin(ctx, tenantA, userA, siteA.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); !errors.Is(err, site.ErrSiteNotFound) {
+			t.Fatalf("cross-tenant origin reference err=%v, want not found", err)
+		}
+		hash := sha256.Sum256([]byte(winner.Token))
+		var stored []byte
+		if err := admin.QueryRow(ctx, `SELECT verification_token_hash FROM public.domains WHERE id=$1`, winner.ID).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(hash[:], stored) {
+			t.Fatal("domain verification token was not stored as SHA-256")
+		}
+		if _, err := app.Exec(ctx, `SELECT verification_token_hash FROM public.domains WHERE id=$1`, winner.ID); err == nil {
+			t.Fatal("waf_api read domain verification token hash")
+		}
+		workerService := site.Service{Pool: worker, VerificationCNAMEZone: "verify.example.net"}
+		if _, err := admin.Exec(ctx, `UPDATE public.domains SET next_verification_at=now()-interval '1 second' WHERE id=$1`, winner.ID); err != nil {
+			t.Fatal(err)
+		}
+		badDNS := siteFakeDNS{records: []string{"not-the-token"}}
+		if count, err := workerService.VerifyDueDomains(ctx, badDNS, time.Now(), 10); err != nil || count != 0 {
+			t.Fatalf("invalid DNS proof batch count=%d err=%v", count, err)
+		}
+		if _, err := admin.Exec(ctx, `UPDATE public.domains SET next_verification_at=now()-interval '1 second' WHERE id=$1`, winner.ID); err != nil {
+			t.Fatal(err)
+		}
+		dns := siteFakeDNS{records: []string{"not-the-token", winner.Token}}
+		if count, err := workerService.VerifyDueDomains(ctx, dns, time.Now(), 10); err != nil || count != 1 {
+			t.Fatalf("valid DNS proof batch count=%d err=%v", count, err)
+		}
+		var verified bool
+		if err := admin.QueryRow(ctx, `SELECT verification_status='active' FROM public.domains WHERE id=$1`, winner.ID).Scan(&verified); err != nil || !verified {
+			t.Fatalf("domain verification status active=%v err=%v", verified, err)
+		}
+		var status string
+		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&status); err != nil || status != "active" {
+			t.Fatalf("site status=%q err=%v", status, err)
+		}
+		expiredProof, err := service.AddDomain(ctx, tenantA, userA, siteAID, "expired-proof.example.test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = admin.Exec(ctx, `UPDATE public.domains SET verification_expires_at=now()-interval '1 second' WHERE id=$1`, expiredProof.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err = workerService.VerifyDomain(ctx, tenantA, expiredProof.ID, siteFakeDNS{records: []string{expiredProof.Token}}); !errors.Is(err, site.ErrVerificationExpired) {
+			t.Fatalf("expired proof result=%v, want ErrVerificationExpired", err)
+		}
+		var expiredStatus string
+		if err = admin.QueryRow(ctx, `SELECT verification_status FROM public.domains WHERE id=$1`, expiredProof.ID).Scan(&expiredStatus); err != nil || expiredStatus != "failed" {
+			t.Fatalf("expired domain status=%q err=%v", expiredStatus, err)
+		}
+	})
+	t.Run("site_status_machine_rejects_invalid_transitions", func(t *testing.T) {
+		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='suspended' WHERE id=$1`, siteA.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='active' WHERE id=$1`, siteA.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='deleted' WHERE id=$1`, siteA.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='active' WHERE id=$1`, siteA.ID); err == nil {
+			t.Fatal("deleted site transitioned back to active")
 		}
 	})
 }

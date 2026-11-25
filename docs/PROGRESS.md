@@ -1,5 +1,34 @@
 # Tiến độ
 
+## P8a — hardening site/domain/origin (chưa đóng) — 2026-11-25
+
+### Đã xác minh cục bộ
+
+- Migration `00004` mở rộng domain verification (method/status/hash expiry/next check), trạng thái site có CHECK + trigger cho chuyển hợp lệ; bảng `config_change_outbox` có `ENABLE` + `FORCE RLS` và policy `USING`/`WITH CHECK` theo `app.tenant_id`.
+- Outbox grants: `waf_api` chỉ INSERT cột `id,tenant_id,site_id,payload`; `waf_worker` chỉ đọc các cột cần dispatch, INSERT payload cho event do worker tạo, và UPDATE `published_at,attempts,updated_at`. Regression integration test xác nhận RLS/force/policy/grants và allowlist các bảng không RLS; `config_change_outbox` không thuộc allowlist.
+- `site_add_domain` là SECURITY DEFINER hẹp, owner `waf_worker`, fixed search_path, chỉ `waf_api` EXECUTE; buộc session tenant/user trùng tham số, membership owner/admin, site còn tồn tại, token digest SHA-256 và hạn tối đa 24 giờ; ghi audit trong cùng transaction. API không đọc/ghi cột hash trực tiếp. Conflict hostname được đổi thành lỗi chung `hostname is unavailable`.
+- `netguard` nhận diện IPv4-mapped, CGNAT, link-local/metadata, ULA/loopback/unspecified và IPv4 inet_aton decimal/octal/hex/short forms; reject DNS answer set pha private/public; dial IP số đã kiểm tra. Edge và CP dùng package chung, không dùng environment proxy. `ProbeOrigin` có timeout/body cap, ngăn redirect và từ chối IP self-address; network isolation vẫn cần policy triển khai worker.
+- Thêm worker batch API `VerifyDueDomains`: claim bounded bằng `FOR UPDATE SKIP LOCKED`, nhịp 1 phút trong 24 giờ rồi 15 phút, token compare constant-time, verification expiry, chuyển site/domain và enqueue outbox transactionally. Thêm integration tests PostgreSQL cho Free quota race, hostname race giữa tenants, hash privilege, worker verification, cross-tenant IDOR, outbox privilege, và state transitions.
+- Unit tests: `go test ./pkg/netguard ./controlplane/internal/site ./controlplane/internal/api` → PASS; proxy security tests chọn lọc (`TestIsBlocked`, encoded IP/rebinding/dial pinning, no environment proxy) → PASS. `go test -tags=integration -run '^$' ./controlplane/internal/integration` → PASS biên dịch, `[no tests to run]`.
+- `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → exit 0, không output; `go build ./...` → exit 0, nhưng Go báo Windows stat-cache `Access is denied`.
+- `go test -count=1 ./...` → FAIL chỉ tại các test loopback Edge (`bot.TestLoopbackChallengeVerifyBodyReadDeadline`, `edgecore.TestLoopback*`, `listener.TestLoopback*`, `proxy.TestLoopback*`): Windows sandbox trả `connectex ... forbidden`; tất cả package CP và các package unit không cần loopback đều PASS. Không tính full suite là xanh.
+
+### Chưa xác minh — không được coi là đóng phase
+
+- Máy không nghe Postgres/Redis (`5432`/`6379` không có listener). Migration `00004` chưa được chạy trên DB trống theo up → down → up; integration tests không chạy trên PostgreSQL thật.
+- Lệnh yêu cầu `CP_INTEGRATION_REQUIRED=1 go test -tags=integration -race -count=20 ./controlplane/internal/integration` thực tế dừng ở `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1` (CGO_ENABLED=0). Cần chạy trong WSL/Linux với Postgres 18, Redis, quyền CREATEROLE và các service integration.
+- `govulncheck ./...` không lấy được DB advisory: `lookup vuln.go.dev: no such host`; chưa xác minh vulnerability scan lượt này.
+- `bash scripts/check-controlplane-sql.sh` bị Windows chặn tạo process: `Bash/E_ACCESSDENIED`; chưa xác minh SQL checker.
+- Chạy lại trên WSL: `CP_INTEGRATION_REQUIRED=1 go test -tags=integration -race -count=20 ./controlplane/internal/integration`; `go test -race -count=1 ./...`; `govulncheck ./...`; `bash scripts/check-controlplane-sql.sh`. Với migration-cycle, dùng một database test rỗng riêng: `goose -dir controlplane/migrations postgres "$CP_MIGRATION_TEST_DATABASE_URL" up`, `down`, `up` (không dùng database có dữ liệu).
+
+### Nợ kỹ thuật P8a
+
+1. **TODO-P8A-DB-1:** chạy migration up/down/up và integration race trên Postgres/Redis thật; hiện mới biên dịch test, chưa có bằng chứng runtime.
+2. **TODO-P8A-WORKER-1:** `VerifyDueDomains` có bounded claim/retry interval nhưng chưa được nối vào process `cmd/worker`; `ProbeOrigin` chưa được gọi bởi worker và chưa có network namespace/egress policy thực tế.
+3. **TODO-P8A-OUTBOX-1:** chưa có dispatcher/retry/dead-letter; crash sau publish nhưng trước đánh dấu có thể tạo duplicate, do vậy chưa chứng minh exactly-once/no duplicate hai dispatcher.
+4. **TODO-P8A-API-1:** POST site/domain/origin chưa có Idempotency-Key lưu bền vững; chưa có PATCH/ETag/If-Match. Endpoint mới có create operations, nên chưa có optimistic update flow.
+5. **TODO-P8A-IDOR-1:** service integration assertions đã thêm nhưng chưa thực thi trên DB thật; route-level 404/role behavior cần WSL integration.
+
 ## P7 — site/origin, rules và billing (MVP một phần) — 2026-11-25
 
 ### Đã xác minh
@@ -21,7 +50,7 @@
 1. **TODO-P7-SITE-1:** hoàn thiện origin connection probe trong worker cô lập mạng; hiện có validate + rebinding-safe dial package, nhưng handler chưa enqueue/đợi kết quả probe. Thêm E2E Postgres + fake DNS và kiểm thử transition/retry/tranh chấp hostname.
 2. **TODO-P7-RULES-1:** custom rule CRUD đầy đủ, rate-limit/access-list/WAF/bot/cache persistence, quota transactionally enforced, conflict/log simulation, history/rollback, ETag/If-Match 409 và Idempotency-Key chưa triển khai; hiện chỉ có validator DSL/CSV.
 3. **TODO-P7-BILLING-1:** StripeProvider thật, checkout/portal routes, subscription state machine, webhook persistence/dedup/background worker/reconcile/invoice numbering chưa triển khai; hiện chỉ có interface, fake và verifier.
-4. **TODO-P7-OUTBOX-1:** bảng outbox được ghi cùng domain verification, nhưng publisher hiện gọi best-effort và chưa có dispatcher worker marking/retry; đảm bảo phát bền vững `config.changed` chưa xác minh.
+4. **TODO-P7-OUTBOX-1 (được tách thành TODO-P8A-OUTBOX-1):** outbox được ghi cùng domain verification; API chưa nối NATS và chưa có dispatcher worker marking/retry.
 5. **TODO-P7-TEST-1:** chưa có test integration cho webhook trùng/muộn/sai thứ tự, quota vượt gói, concurrent If-Match và E2E Postgres site/domain/origin.
 
 ### Kiểm thử lần này

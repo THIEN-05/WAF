@@ -3,6 +3,7 @@ package netguard
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -13,13 +14,38 @@ func (f resolverFunc) LookupIP(ctx context.Context, network, host string) ([]net
 }
 
 func TestIsBlocked(t *testing.T) {
-	for _, value := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "100.64.0.1", "168.63.129.16", "::1", "::ffff:127.0.0.1", "fd00::1"} {
+	for _, value := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "100.64.0.1", "168.63.129.16", "::1", "::ffff:127.0.0.1", "fd00::1", "fc00::1", "0.0.0.0"} {
 		if !IsBlocked(net.ParseIP(value)) {
 			t.Errorf("%s was allowed", value)
 		}
 	}
 	if IsBlocked(net.ParseIP("8.8.8.8")) {
 		t.Fatal("public address was blocked")
+	}
+}
+
+func TestResolvePublicRejectsLegacyPrivateIPLiterals(t *testing.T) {
+	lookups := 0
+	g := New(resolverFunc(func(context.Context, string, string) ([]net.IP, error) {
+		lookups++
+		return []net.IP{net.ParseIP("8.8.8.8")}, nil
+	}), nil)
+	for _, host := range []string{"2130706433", "0x7f000001", "017700000001", "0177.0.0.1", "0x7f.1"} {
+		if _, err := g.ResolvePublic(context.Background(), host); err == nil {
+			t.Errorf("accepted encoded loopback %q", host)
+		}
+	}
+	if lookups != 0 {
+		t.Fatalf("legacy IP literals reached DNS resolver %d times", lookups)
+	}
+}
+
+func TestResolvePublicRejectsIPv6LiteralAndCGNAT(t *testing.T) {
+	g := New(resolverFunc(func(context.Context, string, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.8")}, nil }), nil)
+	for _, host := range []string{"[::1]", "100.64.0.1", "[fd00::1]"} {
+		if _, err := g.ResolvePublic(context.Background(), strings.Trim(host, "[]")); err == nil {
+			t.Errorf("accepted unsafe literal %q", host)
+		}
 	}
 }
 

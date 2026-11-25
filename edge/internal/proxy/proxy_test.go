@@ -46,6 +46,9 @@ func TestOriginTransportDoesNotUseEnvironmentProxy(t *testing.T) {
 	if transport.Proxy != nil {
 		t.Fatal("environment proxy could bypass netguard origin resolution")
 	}
+	if err := p.client.CheckRedirect(nil, nil); err != http.ErrUseLastResponse {
+		t.Fatalf("redirect response handling=%v, want ErrUseLastResponse", err)
+	}
 }
 func TestValidateOriginsResolvesDNSAndRejectsPrivateTargets(t *testing.T) {
 	p := NewOriginPool([]wafcore.Origin{{URL: "https://rebinding.test", Weight: 1}}, "edge")

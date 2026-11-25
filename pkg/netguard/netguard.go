@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -68,6 +69,12 @@ func (g Guard) ResolvePublic(ctx context.Context, host string) ([]net.IP, error)
 		}
 		return []net.IP{ip}, nil
 	}
+	if ip, ok := parseLegacyIPv4(host); ok {
+		if IsBlocked(ip) {
+			return nil, fmt.Errorf("prohibited destination address %s", ip)
+		}
+		return []net.IP{ip}, nil
+	}
 	ips, err := g.Resolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve destination: %w", err)
@@ -81,6 +88,51 @@ func (g Guard) ResolvePublic(ctx context.Context, host string) ([]net.IP, error)
 		}
 	}
 	return ips, nil
+}
+
+// parseLegacyIPv4 recognizes inet_aton-style decimal, octal, hexadecimal and shortened IPv4 forms.
+// Browsers and some resolver stacks interpret these as IP literals instead of DNS names.
+func parseLegacyIPv4(host string) (net.IP, bool) {
+	parts := strings.Split(host, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return nil, false
+	}
+	values := make([]uint64, len(parts))
+	for i, part := range parts {
+		if part == "" {
+			return nil, false
+		}
+		base, digits := 10, part
+		if len(part) > 2 && (strings.HasPrefix(part, "0x") || strings.HasPrefix(part, "0X")) {
+			base, digits = 16, part[2:]
+		} else if len(part) > 1 && part[0] == '0' {
+			base, digits = 8, part[1:]
+		}
+		if digits == "" {
+			digits = "0"
+		}
+		value, err := strconv.ParseUint(digits, base, 32)
+		if err != nil {
+			return nil, false
+		}
+		values[i] = value
+	}
+	for i := 0; i < len(values)-1; i++ {
+		if values[i] > 255 {
+			return nil, false
+		}
+	}
+	remainingBits := uint(8 * (5 - len(values)))
+	if values[len(values)-1] >= uint64(1)<<remainingBits {
+		return nil, false
+	}
+	var address uint64
+	for i := 0; i < len(values)-1; i++ {
+		address |= values[i] << (24 - 8*i)
+	}
+	address |= values[len(values)-1]
+	ip := net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", (address>>24)&255, (address>>16)&255, (address>>8)&255, address&255))
+	return ip, ip != nil
 }
 
 // DialContext resolves again at connection time, validates every answer, then dials numeric IPs only.
