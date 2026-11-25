@@ -648,6 +648,21 @@ func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 		if e = tenantService.AcceptInvite(ctx, userB, invitation); e != nil {
 			t.Fatalf("accept invitation through API role: %v", e)
 		}
+		if _, e = tenantService.CreateAPIKey(ctx, sessionA.TenantID, userB, "viewer-forbidden", []string{"sites:read"}, nil); e == nil {
+			t.Fatal("viewer unexpectedly created API key")
+		}
+		if _, e = tenantService.Invite(ctx, sessionA.TenantID, userB, emailA, tenant.Viewer); e == nil {
+			t.Fatal("viewer unexpectedly created invitation")
+		}
+		if _, e = tenantService.CreateAPIKey(ctx, sessionA.TenantID, userA, "bad-scope", []string{"users:admin"}, nil); e == nil {
+			t.Fatal("scope outside explicit allowlist was accepted")
+		}
+		if _, e = admin.Exec(ctx, `UPDATE public.memberships SET role='admin' WHERE tenant_id=$1 AND user_id=$2`, sessionA.TenantID, userB); e != nil {
+			t.Fatal(e)
+		}
+		if _, e = tenantService.Invite(ctx, sessionA.TenantID, userB, emailA, tenant.Owner); e == nil {
+			t.Fatal("admin unexpectedly invited owner role")
+		}
 		members, e := tenantService.ListMembers(ctx, sessionA.TenantID, userA)
 		if e != nil {
 			t.Fatal(e)
@@ -656,6 +671,193 @@ func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 			t.Fatalf("narrow member directory returned %d rows, want 2", len(members))
 		}
 	})
+}
+
+func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
+	ctx, admin, rc := integrationDeps(t)
+	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
+	mail := &captureMailer{messages: make(chan capturedMail, 8)}
+	svc := newAuthService(t, app, rc, mail)
+	registerAndVerify := func(email, password string) uuid.UUID {
+		t.Helper()
+		if err := svc.Register(ctx, email, password); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.VerifyEmail(ctx, receivedToken(t, mail, "Verification token: ")); err != nil {
+			t.Fatal(err)
+		}
+		var id uuid.UUID
+		if err := admin.QueryRow(ctx, `SELECT id FROM public.users WHERE email=$1`, email).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	userA := registerAndVerify("bind-a-"+uuid.NewString()+"@example.test", "a correct horse battery staple")
+	userB := registerAndVerify("bind-b-"+uuid.NewString()+"@example.test", "another correct horse battery staple")
+	var tenantA, tenantB uuid.UUID
+	if err := admin.QueryRow(ctx, `SELECT default_tenant_id FROM public.users WHERE id=$1`, userA).Scan(&tenantA); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.QueryRow(ctx, `SELECT default_tenant_id FROM public.users WHERE id=$1`, userB).Scan(&tenantB); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("identity_arguments_require_matching_session_or_return_empty", func(t *testing.T) {
+		var totpConfigured bool
+		if err := db.WithUserTx(ctx, app, userA, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT public.auth_configure_totp($1,$2,'[]'::jsonb)`, userB, []byte("not-used")).Scan(&totpConfigured)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if totpConfigured {
+			t.Fatal("auth_configure_totp accepted user B from user A context")
+		}
+		if err := app.QueryRow(ctx, `SELECT public.auth_configure_totp($1,$2,'[]'::jsonb)`, userB, []byte("not-used")).Scan(&totpConfigured); err != nil || totpConfigured {
+			t.Fatalf("auth_configure_totp without context configured=%v err=%v", totpConfigured, err)
+		}
+		var visible int
+		if err := db.WithUserTenantTx(ctx, app, userA, tenantA, func(tx pgx.Tx) error {
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM public.tenant_list_members($1)`, tenantB).Scan(&visible); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `SAVEPOINT expect_denial`); err != nil {
+				return err
+			}
+			_, keyErr := tx.Exec(ctx, `SELECT public.tenant_create_api_key($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), tenantB, "cross", []byte("hash"), []string{"sites:read"}, userB, uuid.New(), time.Now().Add(time.Hour))
+			if keyErr == nil {
+				return fmt.Errorf("tenant_create_api_key accepted tenant B from tenant A context")
+			}
+			if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT expect_denial`); err != nil {
+				return err
+			}
+			_, inviteErr := tx.Exec(ctx, `SELECT public.tenant_create_invitation($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), tenantB, "x@example.test", "viewer", []byte("hash"), time.Now().Add(time.Hour), userB, uuid.New())
+			if inviteErr == nil {
+				return fmt.Errorf("tenant_create_invitation accepted tenant B from tenant A context")
+			}
+			if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT expect_denial`); err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if visible != 0 {
+			t.Fatalf("tenant_list_members exposed %d rows across tenant context", visible)
+		}
+		if _, err := app.Exec(ctx, `SELECT public.tenant_create_api_key($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), tenantB, "no-context", []byte("hash"), []string{"sites:read"}, userB, uuid.New(), time.Now().Add(time.Hour)); err == nil {
+			t.Fatal("tenant_create_api_key accepted missing session context")
+		}
+	})
+
+	before := func() int {
+		var n int
+		if err := admin.QueryRow(ctx, `SELECT count(*) FROM public.refresh_tokens WHERE user_id=$1`, userB).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	initial := before()
+	callCreate := func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `SELECT public.auth_create_refresh($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), userB, uuid.New(), hashForTest("forged-refresh"), "test", "192.0.2.99", time.Now().Add(time.Hour))
+		return err
+	}
+	if err := db.WithUserTx(ctx, app, userA, callCreate); err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("cross-user refresh creation err=%v, want forbidden", err)
+	}
+	noContextTx, err := app.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noContextErr := callCreate(noContextTx)
+	_ = noContextTx.Rollback(ctx)
+	if noContextErr == nil || !strings.Contains(noContextErr.Error(), "forbidden") {
+		t.Fatalf("refresh creation without app.user_id err=%v, want forbidden", noContextErr)
+	}
+	if got := before(); got != initial {
+		t.Fatalf("rejected call changed user B refresh rows: before=%d after=%d", initial, got)
+	}
+
+	login, err := svc.Login(ctx, "bind-a-not-used@example.test", "wrong password", "", "", "", "")
+	if err == nil || login.RefreshToken != "" {
+		t.Fatal("invalid login unexpectedly created a session")
+	}
+	// A successful login proves the application now binds the verified identity before
+	// invoking auth_create_refresh; the migration audit records the personal tenant.
+	var emailA string
+	if err = admin.QueryRow(ctx, `SELECT email FROM public.users WHERE id=$1`, userA).Scan(&emailA); err != nil {
+		t.Fatal(err)
+	}
+	login, err = svc.Login(ctx, emailA, "a correct horse battery staple", "test", "192.0.2.11", "", "")
+	if err != nil {
+		t.Fatalf("valid login with identity-bound session failed: %v", err)
+	}
+	var auditCount int
+	if err = admin.QueryRow(ctx, `SELECT count(*) FROM public.audit_logs WHERE actor_id=$1 AND action='auth.session.create'`, userA).Scan(&auditCount); err != nil || auditCount != 1 {
+		t.Fatalf("session creation audit count=%d err=%v, want 1", auditCount, err)
+	}
+
+	// Every definer function must be explicitly reviewed here; the description records
+	// where the identity comes from and what the function may return or mutate.
+	allow := map[string]string{
+		"lookup_invitation":               "token hash possession; locked invitation metadata only",
+		"auth_register_user":              "new UUIDs supplied by registration; inserts one personal tenant only",
+		"auth_login_material":             "email lookup; minimal password/TOTP material, equal-cost dummy hash in Go when absent",
+		"auth_consume_email_verification": "verification token hash possession; consumes one token",
+		"auth_create_refresh":             "app.user_id must equal p_user_id and active user row; creates own session + audit",
+		"auth_rotate_refresh":             "refresh token hash possession; atomically rotates/revokes family",
+		"auth_logout_refresh":             "refresh token hash possession; revokes matching session",
+		"auth_password_reset_request":     "email-triggered generic reset; stores token only for matching account",
+		"auth_complete_password_reset":    "reset token hash possession; changes password and revokes sessions",
+		"auth_configure_totp":             "app.user_id must equal p_user_id; sets own encrypted secret and code hashes",
+		"auth_totp_secret":                "app.user_id; returns own encrypted TOTP material only",
+		"auth_consume_totp_step":          "app.user_id; consumes own current step",
+		"auth_enable_totp":                "app.user_id; enables own configured TOTP",
+		"auth_consume_recovery_code":      "app.user_id + recovery hash; consumes own code",
+		"audit_auth_mutation":             "trigger-only; derives subject from changed row and emits secret-free audit",
+		"tenant_create_api_key":           "session tenant/user + owner/admin membership; allowlisted scopes only",
+		"tenant_create_invitation":        "session tenant/user + owner/admin membership; cannot invite owner",
+		"tenant_accept_invitation":        "app.user_id + matching user email + invitation hash; inserts own membership",
+		"tenant_list_members":             "app.user_id membership in app.tenant_id; narrow member metadata",
+	}
+	rows, err := admin.Query(ctx, `SELECT p.proname::text,
+      EXISTS (SELECT 1 FROM pg_catalog.unnest(p.proconfig) c WHERE c LIKE 'search_path=pg_catalog, public%'),
+      r.rolname, r.rolsuper,
+      (SELECT count(*) FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) a
+       WHERE a.grantee NOT IN (p.proowner,(SELECT oid FROM pg_catalog.pg_roles WHERE rolname='waf_api'))),
+      EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) a
+       WHERE a.grantee=0 AND a.privilege_type='EXECUTE')
+    FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+    JOIN pg_catalog.pg_roles r ON r.oid=p.proowner WHERE n.nspname='public' AND p.prosecdef`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var signature, owner string
+		var fixedPath, superuser, publicExec bool
+		var unexpectedGrants int
+		if err = rows.Scan(&signature, &fixedPath, &owner, &superuser, &unexpectedGrants, &publicExec); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := allow[signature]; !ok {
+			t.Errorf("unreviewed SECURITY DEFINER function %s", signature)
+		}
+		seen[signature] = true
+		if !fixedPath || owner != "waf_worker" || superuser || unexpectedGrants != 0 {
+			t.Errorf("unsafe SECURITY DEFINER %s: search_path=%v owner=%s superuser=%v unexpected_grants=%d", signature, fixedPath, owner, superuser, unexpectedGrants)
+		}
+		if publicExec {
+			t.Errorf("PUBLIC can EXECUTE %s", signature)
+		}
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for signature, reason := range allow {
+		if !seen[signature] {
+			t.Errorf("allowlisted SECURITY DEFINER missing %s: %s", signature, reason)
+		}
+	}
 }
 
 func TestPublicTableRLSAllowlist(t *testing.T) {

@@ -68,6 +68,25 @@
 - **TODO-P7V-2:** provisioning production của migration principal có `CREATEROLE` và membership cần thiết để đổi owner sang `waf_worker`, không dùng superuser; credential `waf_api`/`waf_worker` vẫn chưa cấp trong deploy.
 - **TODO-P7V-3:** audit trigger ghi mutation của bảng auth nhưng không audit được SELECT tùy ý của một worker login trực tiếp; worker phải dùng entrypoint có audit hoặc triển khai pgAudit trước khi cấp credential.
 
+## P7-close — ràng buộc danh tính tạo refresh — 2026-11-25
+
+### Đã xác minh
+
+- Migration bổ sung `00003_refresh_identity_guard.sql` đã được Goose áp dụng trên PostgreSQL 18.6. `auth_create_refresh` yêu cầu `app.user_id` trùng `p_user_id`, khóa đọc hàng user và chỉ nhận status `active`; tạo session đồng thời ghi `auth.session.create` với tenant lấy từ org cá nhân/default tenant (NULL nếu user chưa có tenant).
+- Login chỉ gọi tạo session sau khi lấy login material, xác minh password và TOTP/recovery; thao tác gọi qua `WithUserTx` với ID đã xác minh. Test thực chứng minh user A gọi hàm cho user B và gọi khi thiếu user context đều bị `forbidden`, không thay đổi số session; cấu hình TOTP chéo user trả false; list thành viên tenant B rỗng; ghi key/invitation chéo tenant bị từ chối.
+- Test tích hợp kiểm role viewer không tạo key/invitation, admin không mời role owner, scope ngoài allowlist bị từ chối; login hợp lệ tiếp tục tạo refresh và audit. Inventory `SECURITY DEFINER` phải khớp allowlist; test kiểm toàn bộ có `search_path` cố định, owner `waf_worker` không superuser, không EXECUTE cho PUBLIC hay role khác ngoài owner/`waf_api`.
+- Output WSL thật, Postgres 18.6 + Redis 8.0.5, `CP_INTEGRATION_REQUIRED=1`: `go test -tags=integration -race -count=20 ./controlplane/internal/integration` → `ok github.com/example/wafplatform/controlplane/internal/integration 64.448s` (exit 0, không SKIP). Lượt verbose đơn cũng PASS: `PASS; ok ... 4.288s`.
+- `./scripts/check-controlplane-sql.sh` → `controlplane SQL concatenation check passed`; được thêm vào `make check-cp-sql` và bước CI. Loại bỏ SQL động trong entitlement, thay bằng câu SQL tĩnh theo allowlist quota.
+
+### Chưa xác minh
+
+- GitHub Actions cho commit hiện tại chưa chạy/xanh. `go test -race -count=1 ./...` toàn repo và govulncheck cần chạy lại trên CI/WSL có mạng; lượt trước Windows chặn loopback tests, WSL race toàn repo bị từ chối quyền, govulncheck không resolve `vuln.go.dev`.
+
+### Nợ kỹ thuật
+
+- **TODO-P7C-1:** app session GUC không chống được SQL tùy ý đã thực thi dưới `waf_api`, vì câu SQL đó có thể tự gán `app.user_id`; kiểm tra CI cấm SQL nối chuỗi/dynamic SQL, giữ truy vấn tham số hóa/sqlc, theo dõi audit tạo session và rate-limit/giám sát bất thường. Nâng cấp có chữ ký cho DB identity context là hướng sau này.
+- Giữ TODO-P7V-2 (provision migration/API/worker roles production) và TODO-P7V-3 (audit SELECT worker); chưa đánh dấu P7-verify hoàn tất cho tới khi CI `cp-integration` xanh, không SKIP.
+
 ## P12 — logging và telemetry
 
 ### Đã xác minh

@@ -72,21 +72,33 @@ func (s Service) CheckLimit(ctx context.Context, tenantID uuid.UUID, key string,
 	var current int64
 	switch key {
 	case "sites", "custom_rules", "rate_limit_policies":
-		table := map[string]string{"sites": "sites", "custom_rules": "rules", "rate_limit_policies": "rate_limit_policies"}[key]
-		where := ""
-		if key == "sites" || key == "custom_rules" {
-			where = " AND deleted_at IS NULL"
+		query := ""
+		switch key {
+		case "sites":
+			query = `SELECT count(*) FROM sites WHERE tenant_id=$1 AND deleted_at IS NULL`
+		case "custom_rules":
+			query = `SELECT count(*) FROM rules WHERE tenant_id=$1 AND deleted_at IS NULL`
+		case "rate_limit_policies":
+			query = `SELECT count(*) FROM rate_limit_policies WHERE tenant_id=$1`
 		}
 		err = db.WithTenantTx(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
-			return tx.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s WHERE tenant_id=$1%s`, table, where), tenantID).Scan(&current)
+			return tx.QueryRow(ctx, query, tenantID).Scan(&current)
 		})
 		if err != nil {
 			return err
 		}
 	case "requests", "bytes_out", "rules_count":
-		column := map[string]string{"requests": "requests", "bytes_out": "bytes_out", "rules_count": "rules_count"}[key]
+		query := ""
+		switch key {
+		case "requests":
+			query = `SELECT coalesce(sum(requests),0) FROM usage_counters WHERE tenant_id=$1 AND period=date_trunc('month',current_date)::date`
+		case "bytes_out":
+			query = `SELECT coalesce(sum(bytes_out),0) FROM usage_counters WHERE tenant_id=$1 AND period=date_trunc('month',current_date)::date`
+		case "rules_count":
+			query = `SELECT coalesce(sum(rules_count),0) FROM usage_counters WHERE tenant_id=$1 AND period=date_trunc('month',current_date)::date`
+		}
 		err = db.WithTenantTx(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
-			return tx.QueryRow(ctx, fmt.Sprintf(`SELECT coalesce(sum(%s),0) FROM usage_counters WHERE tenant_id=$1 AND period=date_trunc('month',current_date)::date`, column), tenantID).Scan(&current)
+			return tx.QueryRow(ctx, query, tenantID).Scan(&current)
 		})
 		if err != nil {
 			return err

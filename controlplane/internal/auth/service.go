@@ -241,7 +241,10 @@ func (s Service) Login(ctx context.Context, email, password, ua, ip, totpCode, r
 	if ip != "" {
 		parsedIP = ip
 	}
-	_, err = s.Pool.Exec(ctx, `SELECT public.auth_create_refresh($1,$2,$3,$4,$5,$6,$7)`, id, userID, family, hash[:], ua, parsedIP, s.now().Add(30*24*time.Hour))
+	err = db.WithUserTx(ctx, s.Pool, userID, func(tx pgx.Tx) error {
+		_, e := tx.Exec(ctx, `SELECT public.auth_create_refresh($1,$2,$3,$4,$5,$6,$7)`, id, userID, family, hash[:], ua, parsedIP, s.now().Add(30*24*time.Hour))
+		return e
+	})
 	if err != nil {
 		return Tokens{}, err
 	}

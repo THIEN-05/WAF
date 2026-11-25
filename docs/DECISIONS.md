@@ -210,4 +210,30 @@ Vị trí cũ `edge/internal/proxy/proxy.go` G115 đã được gỡ: counter ch
 - TOTP lưu `totp_last_step`; hàm consume chỉ nhận bước trong cửa sổ hiện tại ±1 và chỉ tăng step, nên một mã không thể dùng lại trong cùng tài khoản.
 - Migration `00002` bổ sung quyền mà không sửa `00001`. PostgreSQL 18 được yêu cầu cho UUIDv7 trong audit trigger. Test schema so sánh mọi bảng `public` không RLS với allowlist rõ lý do: `plans`, `config_snapshots`, `edges`, `webhook_events`, `goose_db_version`.
 - **TODO-CP-2:** provisioning riêng login `waf_api`/`waf_worker` và migration role có `CREATEROLE` (không superuser) + membership `waf_worker` để đổi owner; migration CI hiện chạy bằng superuser của PostgreSQL service. Không bật login worker trước khi có audit policy cho truy vấn trực tiếp.
-- **TODO-P7V-1:** chỉ đánh dấu P7-verify hoàn tất sau khi CI `cp-integration` trên PostgreSQL 18 chạy `-race -count=20`, không SKIP, và xanh. Trong lượt này chưa có kết quả dịch vụ thật.
+- **TODO-P7V-1:** chỉ đánh dấu P7-verify hoàn tất sau khi CI `cp-integration` trên PostgreSQL 18 chạy `-race -count=20`, không SKIP, và xanh. WSL/PostgreSQL 18.6/Redis 8.0.5 integration đã chạy xanh cục bộ; GitHub Actions cho commit mới chưa được quan sát.
+
+## P7-close — binding danh tính khi tạo refresh session
+
+- Migration `00003_refresh_identity_guard.sql` thay thân `auth_create_refresh` mà không sửa migration đã phát hành. Hàm yêu cầu `app.user_id = p_user_id`, khóa đọc user đang `active`, rồi mới INSERT refresh token. Session mới luôn tạo audit `auth.session.create`, actor là user; `tenant_id` lấy từ `users.default_tenant_id` (org cá nhân), NULL chỉ khi schema cho phép user chưa gắn org. Refresh session không được tạo cho user inactive hoặc không có session identity.
+- Login theo thứ tự lấy `auth_login_material(email)` → verify Argon2 → kiểm tra TOTP/recovery → `WithUserTx(user_id đã xác minh)` → `auth_create_refresh`. Không dùng user ID từ request. Registration hiện không phát session; mọi đường tạo refresh session đều qua hàm trên. Mã kiểm thử xác nhận gọi chéo ID và thiếu session bị từ chối, không thêm row; đăng nhập hợp lệ tiếp tục tạo session và audit.
+- **Giới hạn session GUC:** `app.user_id`/`app.tenant_id` chống lỗi logic ứng dụng (IDOR, thiếu WHERE, handler truyền nhầm ID), nhưng không chống SQL tùy ý chạy dưới login `waf_api`, vì SQL đó có thể tự `SET LOCAL app.user_id`. Dùng truy vấn tham số hóa/sqlc; CI kiểm tra tĩnh cấm nối chuỗi SQL và dynamic SQL trong controlplane; audit mọi session creation, rate-limit login/session, giám sát bất thường. **TODO-P7C-1:** ngữ cảnh DB có chữ ký (ứng dụng ký user ID + expiry, hàm DB xác minh) trước khi cần phòng thủ trước SQL injection đã thực thi.
+- `auth_register_user` chỉ nhận ID mới do registration sinh và tạo một user + org cá nhân + membership owner + subscription; uniqueness/FK làm ID trùng lỗi, hàm không tham gia org hiện hữu. `auth_login_material` trả material tối thiểu theo email; trường hợp không có user được Go xử lý bằng Argon2 dummy hash cùng cost.
+
+| Hàm `SECURITY DEFINER` | Nguồn danh tính / kiểm tra | Dữ liệu trả về hoặc tác động |
+|---|---|---|
+| `auth_register_user` | UUID mới của luồng đăng ký; insert-only, ID/email conflict lỗi | Tạo user và org cá nhân cùng token xác minh; không join org có sẵn |
+| `auth_login_material` | Email tra cứu; Go xác minh password, TOTP sau đó | User ID, hash password, status, tenant, TOTP material cần thiết |
+| `auth_create_refresh` | `app.user_id` phải bằng ID; user tồn tại và active | Tạo session của chính user và audit event |
+| `auth_rotate_refresh`, `auth_logout_refresh` | Khả năng sở hữu refresh-token hash; rotate khóa hàng và thu hồi family | Outcome/user metadata hoặc thu hồi đúng session/family |
+| `auth_consume_email_verification`, `auth_complete_password_reset` | Token hash bí mật + hạn + unused | Boolean; tiêu thụ token, cập nhật trạng thái/password, thu hồi sessions |
+| `auth_password_reset_request` | Email yêu cầu; không trả tồn tại hay không | Tạo token chỉ khi user khớp; HTTP/service luôn generic |
+| `auth_configure_totp` | `app.user_id` phải bằng tham số user | Chỉ cập nhật secret/recovery code của user hiện tại |
+| `auth_totp_secret`, `auth_consume_totp_step`, `auth_enable_totp`, `auth_consume_recovery_code` | `app.user_id`; consume kiểm step/hash của user hiện tại | Chỉ material mã hóa của user hiện tại hoặc boolean |
+| `tenant_create_api_key` | `app.tenant_id` + `app.user_id` khớp tham số; membership owner/admin; scopes allowlist | Ghi key hash và audit; không trả plaintext key |
+| `tenant_create_invitation` | Session tenant/user khớp; owner/admin; role chỉ admin/viewer | Ghi invitation hash và audit |
+| `tenant_accept_invitation` | `app.user_id` khớp user; email user khớp invitation + token hash | Chấp nhận invitation một lần, tạo membership user hiện tại |
+| `tenant_list_members` | User từ `app.user_id`, tenant từ `app.tenant_id`, membership tồn tại | Metadata directory giới hạn (ID/email/role/created_at) |
+| `lookup_invitation` | Token hash possession; row khóa; output metadata hẹp | Chỉ ID/tenant/email/role để kiểm tra token; không mutation |
+| `audit_auth_mutation` | Trigger lấy actor/tenant từ row đã đổi; không callable nghiệp vụ | Ghi operation/entity ID, không ghi secret/hash |
+
+Integration test đối chiếu mọi hàm `SECURITY DEFINER` với allowlist này bằng inventory trong test, kiểm `search_path`, owner `waf_worker` không-superuser, không có EXECUTE cho PUBLIC hay role ngoài owner/`waf_api`. Mọi hàm mới không được thêm allowlist sẽ làm test fail.

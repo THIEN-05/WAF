@@ -20,6 +20,7 @@ jobs:
         run: |
           gofmt -w $(git ls-files '*.go')
           go mod tidy
+          make check-cp-sql
           make gen
           git diff --exit-code
       - uses: golangci/golangci-lint-action@v8

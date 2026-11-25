@@ -1,4 +1,4 @@
-.PHONY: up up-wait down test test-integration test-cp-integration lint build bench gen migrate dev-check
+.PHONY: up up-wait down test test-integration test-cp-integration lint build bench gen migrate dev-check check-cp-sql
 
 up:
 	docker compose -f deploy/docker-compose.yml up -d
@@ -17,6 +17,9 @@ test-integration:
 
 test-cp-integration:
 	go test -tags=integration -race -count=20 -v ./controlplane/internal/integration
+
+check-cp-sql:
+	./scripts/check-controlplane-sql.sh
 
 lint:
 	golangci-lint run ./...
