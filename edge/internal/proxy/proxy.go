@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/example/wafplatform/edge/internal/reqctx"
+	"github.com/example/wafplatform/pkg/netguard"
 	"github.com/example/wafplatform/pkg/wafcore"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
@@ -80,7 +81,9 @@ func NewOriginPool(origins []wafcore.Origin, via string) *OriginPool {
 	for i := range p.healthy {
 		p.healthy[i].Store(true)
 	}
-	p.client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: p.dial, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: p.timeout, IdleConnTimeout: 90 * time.Second, MaxIdleConnsPerHost: 100, ForceAttemptHTTP2: true}, Timeout: 0, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	// Direct dialing is required: an environment proxy could resolve the origin itself
+	// and bypass netguard's address validation.
+	p.client = &http.Client{Transport: &http.Transport{DialContext: p.dial, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: p.timeout, IdleConnTimeout: 90 * time.Second, MaxIdleConnsPerHost: 100, ForceAttemptHTTP2: true}, Timeout: 0, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return p
 }
 
@@ -162,51 +165,20 @@ func (p *OriginPool) Select() (wafcore.Origin, int, error) {
 	return wafcore.Origin{}, -1, errors.New("no healthy origins")
 }
 func (p *OriginPool) dial(ctx context.Context, network, address string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
-	}
-	ips, err := p.resolve(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("origin host resolved to no addresses")
-	}
-	for _, ip := range ips {
-		if blockedIP(ip) {
-			return nil, fmt.Errorf("origin address %s is prohibited", ip)
-		}
-	}
-	var last error
-	for _, ip := range ips {
-		conn, e := p.dialIP(ctx, network, net.JoinHostPort(ip.String(), port))
-		if e == nil {
-			return conn, nil
-		}
-		last = e
-	}
-	return nil, last
+	guard := netguard.New(proxyResolver{lookup: p.resolve}, p.dialIP)
+	return guard.DialContext(ctx, network, address)
 }
+
+type proxyResolver struct {
+	lookup func(context.Context, string) ([]net.IP, error)
+}
+
+func (r proxyResolver) LookupIP(ctx context.Context, _, host string) ([]net.IP, error) {
+	return r.lookup(ctx, host)
+}
+
 func blockedIP(ip net.IP) bool {
-	if ip == nil {
-		return true
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
-		return true
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		if ip4[0] == 169 && ip4[1] == 254 {
-			return true
-		}
-		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-			return true
-		}
-		if ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0 {
-			return true
-		}
-	}
-	return false
+	return netguard.IsBlocked(ip)
 }
 func (p *OriginPool) Serve(w http.ResponseWriter, c *reqctx.RequestCtx) {
 	origin, index, err := p.Select()
@@ -264,7 +236,8 @@ func (p *OriginPool) Serve(w http.ResponseWriter, c *reqctx.RequestCtx) {
 			log.Printf("origin request_id=%q transport_error=%T", safeRequestID(c.RequestID), e)
 			p.recordFailure(index)
 			status := http.StatusBadGateway
-			if ne, ok := e.(net.Error); ok && ne.Timeout() {
+			var ne net.Error
+			if errors.As(e, &ne) && ne.Timeout() {
 				status = http.StatusGatewayTimeout
 			}
 			writeProxyError(rw, c, status, e.Error())

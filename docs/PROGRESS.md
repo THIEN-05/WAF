@@ -1,5 +1,37 @@
 # Tiến độ
 
+## P7 — site/origin, rules và billing (MVP một phần) — 2026-11-25
+
+### Đã xác minh
+
+- Đã đọc `docs/control-plane.md` §5.4–§5.6. Thêm `pkg/netguard`: kiểm tra toàn bộ DNS answer set, từ chối loopback/private/link-local/shared-address/metadata và kiểm tra lại DNS tại thời điểm dial; kết nối bằng IP số đã xác minh để chặn rebinding. Edge `OriginPool.dial` dùng package này, giữ resolver/dialer injection hiện có; tắt `ProxyFromEnvironment` để forward proxy không thể resolve origin hộ và bypass guard. Có unit test public/mixed answer, IPv4-mapped IPv6, giả lập rebinding và assertion transport không dùng env proxy.
+- Thêm validator origin (scheme http/https, cổng 80/443/8080/8443, không userinfo, resolve qua `netguard`) và interface DNS với kiểm tra TXT/CNAME theo token hash. Có handler tạo site/thêm domain/thêm origin; service kiểm RBAC/quota, hostname chuẩn hóa + unique constraint hiện hữu, audit trong transaction; migration `00004` thêm trạng thái verification và outbox cấu hình RLS.
+- Thêm bước validate DSL bằng `wafcore.Compile`, kiểm tra action/mode, nhập CSV access-list và parse/chuẩn hóa CIDR.
+- Thêm interface `PaymentProvider`, `FakeProvider`, và xác minh chữ ký Stripe HMAC/timestamp; không lưu dữ liệu thẻ.
+- Lệnh package tests: `go test ./pkg/netguard ./controlplane/internal/site ./controlplane/internal/rules ./controlplane/internal/billing` → PASS. Edge proxy test cục bộ có cả test loopback bị Windows sandbox chặn; xem “Chưa xác minh”.
+
+### Chưa xác minh — lệnh tự chạy lại
+
+- `go test ./edge/internal/proxy -count=1` và `go test -race -count=1 ./...`: lượt này bị Windows sandbox từ chối mở loopback (`connectex ... forbidden`) trong test HTTP/SSE/WebSocket; cần chạy WSL/Linux.
+- Migration `00004` và handler DB-backed chưa chạy trên PostgreSQL thật; chạy `DATABASE_URL=... go test -tags=integration -race -count=1 ./controlplane/internal/integration` sau khi thêm integration coverage bên dưới.
+- Chưa có Stripe sandbox account/network credentials; chỉ FakeProvider và pure signature verifier đã được test.
+
+### Nợ kỹ thuật (chưa hoàn tất phase)
+
+1. **TODO-P7-SITE-1:** hoàn thiện origin connection probe trong worker cô lập mạng; hiện có validate + rebinding-safe dial package, nhưng handler chưa enqueue/đợi kết quả probe. Thêm E2E Postgres + fake DNS và kiểm thử transition/retry/tranh chấp hostname.
+2. **TODO-P7-RULES-1:** custom rule CRUD đầy đủ, rate-limit/access-list/WAF/bot/cache persistence, quota transactionally enforced, conflict/log simulation, history/rollback, ETag/If-Match 409 và Idempotency-Key chưa triển khai; hiện chỉ có validator DSL/CSV.
+3. **TODO-P7-BILLING-1:** StripeProvider thật, checkout/portal routes, subscription state machine, webhook persistence/dedup/background worker/reconcile/invoice numbering chưa triển khai; hiện chỉ có interface, fake và verifier.
+4. **TODO-P7-OUTBOX-1:** bảng outbox được ghi cùng domain verification, nhưng publisher hiện gọi best-effort và chưa có dispatcher worker marking/retry; đảm bảo phát bền vững `config.changed` chưa xác minh.
+5. **TODO-P7-TEST-1:** chưa có test integration cho webhook trùng/muộn/sai thứ tự, quota vượt gói, concurrent If-Match và E2E Postgres site/domain/origin.
+
+### Kiểm thử lần này
+
+- `golangci-lint run ./...` → `0 issues.`; `go vet ./...` → exit 0, không output; `go build ./...` → exit 0, kèm cảnh báo Windows `go: writing stat cache ... Access is denied`.
+- `go test ./pkg/netguard ./controlplane/internal/site ./controlplane/internal/rules ./controlplane/internal/billing ./controlplane/internal/api` → PASS; sau chỉnh service, `go test ./controlplane/internal/site ./controlplane/internal/api` cũng PASS. Các test proxy `TestDialUsesResolvedIP`, `TestDialRebindingBlocked`, `TestProxyErrorsCarryRequestIDAndDoNotReflectUnsafeRequestID`, `TestProxyErrorDoesNotLogOrReflectUnsafeRequestID` → PASS.
+- `go test -count=1 ./...` → FAIL do môi trường Windows từ chối loopback: `TestLoopbackChallengeVerifyBodyReadDeadline`, nhiều `TestLoopback*` trong `edge/internal/edgecore`, `edge/internal/listener`, `edge/internal/proxy` (`connectex ... forbidden`); các unit package khác gồm netguard, site, rules, billing đều PASS. Không coi full suite là xanh; cần lệnh tự chạy lại bên dưới.
+- `go test -race -count=1 ./...` → không chạy được: `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1` (máy này không cấu hình CGO).
+- Lệnh xác minh trên WSL: `golangci-lint run ./...`; `go vet ./...`; `go build ./...`; `go test -race -count=1 ./...`; `go test -count=1 ./...`; rồi chạy Postgres integration sau khi bổ sung TODO-P7-TEST-1.
+
 ## Control Plane — schema, auth, tenant, entitlement — 2026-11-24
 
 ### Đã triển khai

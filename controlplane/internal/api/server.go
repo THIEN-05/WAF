@@ -104,6 +104,9 @@ func (s *Server) Router() http.Handler {
 		v.With(s.requireAuth).Get("/tenants/{tenant_id}/api-keys", s.listAPIKeys)
 		v.With(s.requireAuth).Delete("/tenants/{tenant_id}/api-keys/{key_id}", s.revokeAPIKey)
 		v.With(s.requireAuth).Get("/tenants/{tenant_id}/entitlements", s.getEntitlements)
+		v.With(s.requireAuth).Post("/tenants/{tenant_id}/sites", s.createSite)
+		v.With(s.requireAuth).Post("/tenants/{tenant_id}/sites/{site_id}/domains", s.addDomain)
+		v.With(s.requireAuth).Post("/tenants/{tenant_id}/sites/{site_id}/origins", s.addOrigin)
 	})
 	return r
 }

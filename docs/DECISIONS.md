@@ -1,5 +1,14 @@
 # Quyết định kiến trúc P0
 
+## P7 site/origin/rules/billing — 2026-11-25
+
+- Outbound origin resolution/dial phải đi qua `pkg/netguard`: reject toàn bộ DNS answer set nếu có IP không an toàn và resolve lại ngay trước khi dial numeric IP. Edge tắt `ProxyFromEnvironment`, vì forward proxy có thể tự resolve origin và bypass guard. `203.0.113.0/24` được coi là unicast trong unit tests, không phải production target; test dùng resolver/dialer giả.
+- Verification token domain chỉ trả cho người dùng khi tạo; DB chỉ giữ SHA-256. TXT `_waf-verify.<hostname>` mang token gốc; worker hash TXT rồi constant-time compare với digest DB. CNAME proof có dạng `verify.<token>.waf.invalid`. Hostname global uniqueness tiếp tục do unique constraint `domains.hostname` đảm bảo.
+- Tạo site lấy advisory transaction lock theo tenant rồi kiểm quota và insert trong cùng transaction để hai request đồng thời không vượt quota.
+- Domain activation ghi `config_change_outbox` cùng transaction để tránh mất intent; NATS publish hiện là best-effort sau commit cho đến khi dispatcher/retry worker hoàn thiện (**TODO-P7-OUTBOX-1**).
+- Đợt này chỉ là lát MVP: validator DSL/CSV và FakeProvider/signature verification chưa thay thế rule CRUD/billing lifecycle. Không coi phần §5.4 hoặc §5.6 là đã hoàn tất.
+- Danh sách nợ được theo dõi trong `docs/PROGRESS.md`: TODO-P7-SITE-1 (probe cô lập + E2E), TODO-P7-RULES-1 (CRUD/quota/history/ETag/idempotency), TODO-P7-BILLING-1 (Stripe/webhook worker/subscription/invoices), TODO-P7-OUTBOX-1 (dispatcher bền vững), TODO-P7-TEST-1 (integration matrix).
+
 Ngày: 2026-11-20
 
 ## Quyết định đã chốt

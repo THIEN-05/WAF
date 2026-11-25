@@ -36,6 +36,17 @@ func TestDialRebindingBlocked(t *testing.T) {
 		t.Fatal("dial accepted rebound metadata IP")
 	}
 }
+
+func TestOriginTransportDoesNotUseEnvironmentProxy(t *testing.T) {
+	p := NewOriginPool(nil, "edge")
+	transport, ok := p.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type %T", p.client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("environment proxy could bypass netguard origin resolution")
+	}
+}
 func TestValidateOriginsResolvesDNSAndRejectsPrivateTargets(t *testing.T) {
 	p := NewOriginPool([]wafcore.Origin{{URL: "https://rebinding.test", Weight: 1}}, "edge")
 	p.SetResolver(func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("10.0.0.2")}, nil })
