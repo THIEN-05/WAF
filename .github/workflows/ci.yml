@@ -11,8 +11,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -31,8 +31,8 @@ jobs:
   test-race:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -41,19 +41,29 @@ jobs:
   perf:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
       - name: WAF load and latency regression (required, no race detector)
-        run: go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'
+        run: |
+          export WAF_PERF_NPROC="$(nproc)"
+          go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'
+        env:
+          WAF_PERF_RUNNER: ${{ runner.name }}
+          WAF_PERF_RESULTS: ${{ runner.temp }}/waf-perf-results.json
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: waf-perf-results
+          path: ${{ runner.temp }}/waf-perf-results.json
 
   govulncheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -63,8 +73,8 @@ jobs:
   compose:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -109,8 +119,8 @@ jobs:
           - 1025:1025
           - 8025:8025
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -154,8 +164,8 @@ jobs:
           - 1025:1025
           - 8025:8025
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true

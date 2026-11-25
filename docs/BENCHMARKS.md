@@ -56,9 +56,9 @@ These are broad scenario ranges, not a service-level guarantee. High-concurrency
 
 Work-cap cases are marked incomplete and follow the configured fail mode; benchmark mode is monitor, so work-cap percentage does not itself mean those requests were blocked. Free defaults fail-open; closed paid plans may reject incomplete scans. The older measurements show scheduler delay can exceed a short wall fuse, so those results do not validate the current policy.
 
-### P4f-fix — required perf job
+### P4f-fix — required perf job (superseded p99 gate)
 
-`TestWAFParallel50GOMAXPROCSMatrix` and `TestWAFCleanFailClosedAtOnePWithCPUBackground` are tagged `perf`; CI runs both in a required, non-race job with `-count=30`. The matrix covers GOMAXPROCS 1/2/4/N and 50/200 goroutines; the background case uses GOMAXPROCS=1, 200 goroutines and a CPU-burning worker. Assertions require zero clean fail-closed rejects, 100% in-scope attack blocks, zero fuse trips, and request-start p99 below the wide regression gate. Deterministic fuse/work-cap policy tests (fake clock, fake body reader, fake regex delay, priority-target retention) remain in the normal race suite.
+`TestWAFParallel50GOMAXPROCSMatrix` and `TestWAFCleanFailClosedAtOnePWithCPUBackground` are tagged `perf`; CI runs both in a required, non-race job with `-count=30`. The matrix covers GOMAXPROCS 1/2/4/N and 50/200 goroutines; the background case uses GOMAXPROCS=1, 200 goroutines and a CPU-burning worker. Correctness remains asserted on every repetition: zero clean fail-closed rejects, 100% in-scope attack blocks, and zero fuse trips. The old 69 ms wall-clock gate described below is retired because it was scheduler-sensitive. Deterministic fuse/work-cap policy tests remain in the normal race suite.
 
 ## WSL/Linux results supplied by the user
 
@@ -73,9 +73,33 @@ The user supplied this `taskset` run summary (30 repetitions; Linux, 2 CPUs pinn
 | WSL/Linux | 2 | 4 | 50 | 30 | ~135 µs | included in aggregate 0.16–23 ms | 0 | 100% | 0 |
 | WSL/Linux | 2 | 4 | 200 | 30 | ~135 µs | included in aggregate 0.16–23 ms | 0 | 100% | 0 |
 
-The worst reported p99 was 23 ms (200 goroutines, GOMAXPROCS=4 on 2 pinned CPUs). CI uses a common per-cell gate of **69 ms = 3 × 23 ms**. The threshold is intentionally broad and catches a roughly 3× regression; a per-cell threshold can replace it when exact per-cell baselines are provided. The test logs OS, `runtime.NumCPU()`, GOMAXPROCS, goroutines, request-start p50/p99, and the gate.
+The historic p99 ceiling of **69 ms = 3 × 23 ms** has been removed. GitHub runner logs later showed a GOMAXPROCS=4/200-goroutine p99 varying from about 38–48 ms on passes to 69.88–73.07 ms on three failures, while clean rejects stayed 0/800, attacks were blocked 200/200 and fuse stayed 0/1000. These are request-start wall times from a shared 4-CPU runner and are diagnostics, not a required threshold.
 
-Latency starts immediately before `Phase.Handle` after the test goroutine is scheduled and the request/context are built. It includes WAF phase execution but excludes time waiting for that goroutine to become runnable. It is request-start latency, not end-to-end listener latency.
+Request wall latency starts immediately before `Phase.Handle` after the test goroutine is scheduled and the request/context are built. It includes WAF phase execution and any preemption during it, but excludes time waiting for the goroutine to become runnable. It is not end-to-end listener latency.
+
+### P4f-fix stabilization — CPU work timing and repeated summaries
+
+- The required deterministic CI gate is evaluated on every execution of every matrix cell: clean rejects must be 0, in-scope attacks must be 100% blocked, and fuse trips must be 0. These assertions are not retried or averaged away.
+- Linux measures each `Phase.Handle` interval using the locked OS thread's `getrusage(RUSAGE_THREAD)` CPU time. The metric excludes time when the thread is descheduled; wall time is retained only for reporting. A serial scan baseline is measured on the same runner and GOMAXPROCS for each repetition. The high-percentile scan CPU gate is **10 × the median serial p99**, evaluated against the median loaded p99 across the 30 repetitions.
+- The only wall p99 failure gate applies when goroutine count is no greater than `runtime.NumCPU()`: median p99 over the 30 repetitions must be no more than 5 × the same-runner serial p99. This matrix currently uses 50 and 200 workers, so its wall p99 values do not fail CI. For overloaded cells, wall p99 is recorded and compared with historical baselines as a warning only; the supplied same-runner 4-CPU baselines are 30 ms for GOMAXPROCS=2/200 and 48 ms for GOMAXPROCS=4/200, with warning at >2×. No retry is used; latency aggregation uses the median of 30 runs, and correctness is checked each run.
+- Each run logs runner name, Linux OS, `nproc`, Go CPU count, GOMAXPROCS, goroutines, p50/p99 wall latency, p50/p99 thread CPU time, serial baseline, and correctness counters. `TestMain` writes all repetitions to JSON and a median-per-cell table to `$GITHUB_STEP_SUMMARY`; CI uploads JSON as `waf-perf-results` even when the job fails.
+- Baseline source: user-supplied GitHub runner measurements (Linux, 4 CPUs) in the P4f-fix request. CPU-time thresholds are recalibrated from serial scans on the same runner per run; the wall p99 warning baselines use the observed passing maxima above. The warning never fails CI.
+
+WSL/Linux final local run used the exact CI test command with `-count=30` (12 CPUs; `nproc=12`, not the GitHub 4-CPU runner). It passed in 25.824 s. Every matrix cell and the background case had zero clean rejects, 100% attacks blocked, and zero fuse trips. Table values are medians of each run's p50/p99 over 30 repetitions; totals aggregate all requests across repetitions. This WSL `RUSAGE_THREAD` implementation has microsecond resolution, so many CPU p50 values display as zero.
+
+| Cell | OS | CPUs/nproc | GOMAXPROCS | Goroutines | Runs | request p50 | request p99 | scan CPU p50 | scan CPU p99 | Clean rejects | Attacks blocked | Fuse |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| matrix | Linux/WSL | 12/12 | 1 | 50 | 30 | 138.203 µs | 226.103 µs | 0 | 4.003 ms | 0/6,000 | 1,500/1,500 | 0/7,500 |
+| matrix | Linux/WSL | 12/12 | 1 | 200 | 30 | 139.508 µs | 226.049 µs | 0 | 4.003 ms | 0/24,000 | 6,000/6,000 | 0/30,000 |
+| matrix | Linux/WSL | 12/12 | 2 | 50 | 30 | 123.984 µs | 8.680 ms | 0 | 3.182 ms | 0/6,000 | 1,500/1,500 | 0/7,500 |
+| matrix | Linux/WSL | 12/12 | 2 | 200 | 30 | 120.705 µs | 18.141 ms | 0 | 3.587 ms | 0/24,000 | 6,000/6,000 | 0/30,000 |
+| matrix | Linux/WSL | 12/12 | 4 | 50 | 30 | 131.473 µs | 7.704 ms | 0 | 2.126 ms | 0/6,000 | 1,500/1,500 | 0/7,500 |
+| matrix | Linux/WSL | 12/12 | 4 | 200 | 30 | 125.203 µs | 22.224 ms | 0 | 2.515 ms | 0/24,000 | 6,000/6,000 | 0/30,000 |
+| matrix | Linux/WSL | 12/12 | 12 | 50 | 30 | 252.494 µs | 10.653 ms | 118 µs | 1.047 ms | 0/6,000 | 1,500/1,500 | 0/7,500 |
+| matrix | Linux/WSL | 12/12 | 12 | 200 | 30 | 223.597 µs | 32.104 ms | 0 | 1.145 ms | 0/24,000 | 6,000/6,000 | 0/30,000 |
+| CPU background | Linux/WSL | 12/12 | 1 | 200 + 1 burner | 30 | 141.105 µs | 229.508 µs | 0 | 4.003 ms | 0/24,000 | 6,000/6,000 | 0/30,000 |
+
+The CI job writes the same per-cell table to the workflow summary and uploads JSON containing all 30 raw repetitions. Local WSL values are diagnostic only and are not used as the GitHub runner baseline.
 
 For the one-core CPU-background test, the user's Linux summary reports 30 runs and `clean_rejected=0/800`; p99/attack/fuse counts for that specific Linux run were not supplied. The required perf test independently checks 200 goroutines + one CPU burner and reports all counters.
 

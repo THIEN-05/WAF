@@ -238,8 +238,8 @@ go test -tags=perf -count=30 ./edge/internal/waf -run '^TestWAFParallel50GOMAXPR
 - Test logic dùng fake clock, fake slow body reader và fake regex delay; tách wall-clock matrix sang build tag `perf`. Log tier throttle toàn tiến trình ≥3 s, tổng thay đổi được đếm.
 - PASS cục bộ: `go test -count=1 ./edge/internal/waf` → `ok ... 2.592s`.
 - Xác minh Linux/WSL do người dùng cung cấp: `taskset` ma trận GOMAXPROCS 1/2/4 × 50/200 goroutine, 30 lượt/ô; mọi ô clean reject 0, attack bị chặn 100%, fuse 0; p50/request ~135 µs, p99 tổng 0.16–23 ms. Ô xấu nhất 200 goroutine, GOMAXPROCS=4 trên 2 CPU. Tải nền một lõi, 30 lượt: user báo clean reject 0/800.
-- Perf job nay đo latency từ ngay trước `Phase.Handle` (sau lúc goroutine được schedule, không gồm scheduler queue), log OS/CPU/GOMAXPROCS/goroutine và kiểm tra p99 <69 ms = 3 × 23 ms cao nhất đã đo. Số liệu cũ của Windows có worker-mean khác định nghĩa, chỉ giữ làm lịch sử.
-- Trên Windows sandbox, `go test -count=1 ./edge/internal/waf` PASS; perf-tag combined `-count=30` PASS, mọi cell GOMAXPROCS 1/2/4/12 × 50/200 qua gate 69 ms. 1P/200 goroutine + burner: clean 0/24,000, attacks 6,000/6,000, fuse 0/30,000; p99 1.545–7.431 ms. Ma trận cao nhất p99 62.784 ms ở GOMAXPROCS=2/200 workers; p50 thường 0 theo timer Windows. Đây không thay thế số Linux do người dùng cung cấp.
+- Perf job lịch sử đo latency ngay trước `Phase.Handle`; cổng 69 ms sau đó bị loại vì các run GitHub trên 4 CPU cho thấy request-start p99 quá tải dao động dù correctness giữ nguyên. Cơ chế mới được ghi ở mục P4f perf stabilization bên dưới.
+- Số đo Windows lịch sử với cổng 69 ms (đã retire): `go test -count=1 ./edge/internal/waf` PASS; perf-tag `-count=30` cũng PASS. 1P/200 goroutine + burner: clean 0/24,000, attacks 6,000/6,000, fuse 0/30,000; p99 1.545–7.431 ms. Ma trận cao nhất p99 62.784 ms ở GOMAXPROCS=2/200 workers; p50 thường 0 theo timer Windows. Đây không thay thế số Linux do người dùng cung cấp.
 - Thêm test dưới `-race` cho fuse hết hạn sau URI/query/header/cookie: mỗi loại payload giữ điểm, phần body chưa đọc đánh dấu scan-truncated; test work cap cho 200 params, repeated Aho keywords và JSON lồng sâu chứng minh fail-closed block không gắn wall-fuse tag.
 
 ### Chưa xác minh — lệnh chạy lại
@@ -250,8 +250,30 @@ go test -tags=perf -count=30 ./edge/internal/waf -run '^TestWAFParallel50GOMAXPR
 
 ### Nợ kỹ thuật
 
-- **TODO-P4f-1: ĐÓNG** theo số đo Linux/WSL do người dùng cung cấp: 30 lượt mỗi ô GOMAXPROCS1/2/4 × 50/200, zero clean rejects, 100% attacks caught, zero fuse; CPU background one-core 30 lượt zero clean rejects. CI perf regression gate đặt 69 ms (3× observed worst p99 23 ms); exact p99 per-cell vẫn chưa có nên gate dùng chung.
+- **TODO-P4f-1: ĐÓNG về correctness**: bất biến kiểm tra mọi lượt, không phụ thuộc latency wall-clock quá tải. Cổng 69 ms là lịch sử và đã bỏ; xem P4f perf stabilization.
 - **TODO-P4f-2:** fuse là cooperative checkpoint, không thể ngắt một regex RE2 hoặc `Reader.Read` đang bị treo giữa lời gọi; body socket có deadline riêng, regex chuẩn Go bị giới hạn kích thước đầu vào/RE2. Fake delay test chứng minh policy sau checkpoint, không chứng minh interrupt bất đồng bộ.
+
+## P4f perf stabilization — 2026-11-25
+
+### Đã xác minh
+
+- Nguyên nhân CI chập chờn đã được xác nhận từ log runner 4 CPU cung cấp: cổng wall p99 69 ms đỏ ở 69.88–73.07 ms trong GOMAXPROCS=4/200, trong khi correctness ở các run đó vẫn clean 0/800, attack 200/200, fuse 0/1000. Cổng này đo scheduler/preemption trong ô quá tải; cổng tuyệt đối wall p99 đã bị bỏ ở các ô overload.
+- Harness Linux đo thời gian CPU thread cho `Phase.Handle` bằng `getrusage(RUSAGE_THREAD)` trên goroutine ghim OS thread; gate CPU p99 là 10× serial p99 đo ngay trên runner. Ô không quá tải áp median wall p99 ≤5× serial p99. Với ma trận 50/200 goroutine trên runner 4 CPU, wall p99 chỉ ghi nhận/cảnh báo >2× baseline. Tất cả correctness checks vẫn fail ở bất kỳ lượt vi phạm nào; latency được tổng hợp median 30 lượt, không retry.
+- Summary gồm p50/p99 mọi ô, runner/OS/nproc/CPU/GOMAXPROCS/goroutine, CPU scan, counters; JSON artifact upload ngay cả khi job đỏ. GitHub actions checkout/setup-go/artifact được nâng lên Node 24.
+- Linux/WSL hiện tại (12 CPU/nproc, không phải GitHub 4 CPU), đúng lệnh CI `go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'` → PASS trong 25.824s. Tất cả 8 ô matrix và case background đều 0 clean reject, 100% attacks, 0 fuse. Summary median p50/p99 và raw JSON 30 lượt được ghi ở `docs/BENCHMARKS.md` và `/tmp/waf-perf-results-final.json` trong WSL.
+- Đã xác minh trên WSL: `go vet ./...` exit 0; `go build ./...` exit 0; `go test -race -count=1 ./...` PASS toàn repo. `golangci-lint run ./...` → `0 issues.`.
+- `govulncheck ./...` chưa scan được: binary không có trong PATH WSL; thử Windows cũng dừng trước scan do DNS `lookup vuln.go.dev: no such host`. Cần chạy lại khi có mạng.
+- Chưa có GitHub Actions run với test harness mới; không đánh dấu job perf runner 4 CPU đã xanh. Lượt user cung cấp trước đó là baseline nguyên nhân, không phải xác minh thay đổi.
+
+### Chưa xác minh — tự chạy trong WSL/Linux
+
+- `go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'`
+- `golangci-lint run ./...`; `go vet ./...`; `go build ./...`; `go test -race -count=1 ./...`; `govulncheck ./...`.
+- GitHub perf runner 4 CPU p50/p99 median và uploaded artifact sau thay đổi. WSL không thay được cùng-runner GitHub baseline.
+
+### Nợ kỹ thuật
+
+- TODO-P4f-1 đóng cho đúng correctness và chống scheduler false positive. TODO-P4f-2 vẫn còn: cooperative fuse không thể interrupt giữa lần gọi regex/read; không đổi phạm vi này.
 
 ## P4f — ngân sách WAF theo work và suy giảm quá tải — 2026-11-24 (kết quả trước P4f-fix)
 
