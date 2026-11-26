@@ -99,6 +99,17 @@ type Certificate struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ConfigChangeOutbox struct {
+	ID          pgtype.UUID        `json:"id"`
+	TenantID    pgtype.UUID        `json:"tenant_id"`
+	SiteID      pgtype.UUID        `json:"site_id"`
+	Payload     []byte             `json:"payload"`
+	PublishedAt pgtype.Timestamptz `json:"published_at"`
+	Attempts    int32              `json:"attempts"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ConfigSnapshot struct {
 	ID           pgtype.UUID        `json:"id"`
 	Scope        string             `json:"scope"`
@@ -120,6 +131,10 @@ type Domain struct {
 	VerifiedAt            pgtype.Timestamptz `json:"verified_at"`
 	CreatedAt             pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	VerificationStatus    string             `json:"verification_status"`
+	VerificationMethod    string             `json:"verification_method"`
+	VerificationExpiresAt pgtype.Timestamptz `json:"verification_expires_at"`
+	NextVerificationAt    pgtype.Timestamptz `json:"next_verification_at"`
 }
 
 type Edge struct {
