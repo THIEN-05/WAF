@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/net/idna"
 )
 
 type Publisher interface {
@@ -112,8 +113,9 @@ var ErrSiteNotFound = errors.New("site not found")
 var ErrVerificationExpired = errors.New("domain verification expired")
 
 func (s Service) AddDomain(ctx context.Context, tenantID, actor, siteID uuid.UUID, hostname string) (DomainProof, error) {
-	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
-	if !validHostname(hostname) {
+	var err error
+	hostname, err = NormalizeHostname(hostname)
+	if err != nil {
 		return DomainProof{}, errors.New("invalid hostname")
 	}
 	id, err := db.NewID()
@@ -149,14 +151,13 @@ func (s Service) AddDomain(ctx context.Context, tenantID, actor, siteID uuid.UUI
 		}
 		_, e = tx.Exec(ctx, `SELECT public.site_add_domain($1,$2,$3,$4,$5,$6,$7,$8)`, id, tenantID, siteID, hostname, sum[:], expiresAt, actor, auditID)
 		if e != nil {
+			e = mapDomainInsertError(e)
+			if errors.Is(e, ErrHostnameUnavailable) {
+				return e
+			}
 			var pgErr *pgconn.PgError
-			if errors.As(e, &pgErr) {
-				if pgErr.Code == "23505" && pgErr.ConstraintName == "domains_hostname_key" {
-					return ErrHostnameUnavailable
-				}
-				if pgErr.Code == "P0002" {
-					return ErrSiteNotFound
-				}
+			if errors.As(e, &pgErr) && pgErr.Code == "P0002" {
+				return ErrSiteNotFound
 			}
 			return e
 		}
@@ -173,6 +174,31 @@ func (s Service) AddDomain(ctx context.Context, tenantID, actor, siteID uuid.UUI
 		proof.CNAMEValue = CNAMEProofTarget(sum[:], s.VerificationCNAMEZone)
 	}
 	return proof, nil
+}
+
+// NormalizeHostname maps equivalent DNS names, including U-labels, to one ASCII key.
+func NormalizeHostname(hostname string) (string, error) {
+	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	if hostname == "" {
+		return "", errors.New("invalid hostname")
+	}
+	ascii, err := idna.Lookup.ToASCII(hostname)
+	if err != nil {
+		return "", err
+	}
+	ascii = strings.ToLower(ascii)
+	if !validHostname(ascii) {
+		return "", errors.New("invalid hostname")
+	}
+	return ascii, nil
+}
+
+func mapDomainInsertError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "domains_hostname_key" {
+		return ErrHostnameUnavailable
+	}
+	return err
 }
 
 func (s Service) VerifyDomain(ctx context.Context, tenantID, domainID uuid.UUID, dns DNS) error {

@@ -178,3 +178,10 @@ jobs:
           MAILHOG_ADDR: 127.0.0.1:1025
           MAILHOG_API_URL: http://127.0.0.1:8025/api/v2/messages
           CP_INTEGRATION_REQUIRED: "1"
+      - name: Global hostname conflict race (required, 100 runs)
+        run: go test -tags=integration -race -run '^TestSiteQuotaHostnameOwnershipAndStateIntegration/same_hostname_race_and_non_disclosing_conflict$' -count=100 ./controlplane/internal/integration
+        env:
+          DATABASE_URL: postgres://waf:waf-test-password@127.0.0.1:5432/waf_test?sslmode=disable
+          REDIS_ADDR: 127.0.0.1:6379
+          REDIS_PASSWORD: ""
+          CP_INTEGRATION_REQUIRED: "1"

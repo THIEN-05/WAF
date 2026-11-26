@@ -22,7 +22,7 @@ import (
 )
 
 func TestValidateOriginsBlocksLocalAddresses(t *testing.T) {
-	for _, host := range []string{"127.0.0.1", "10.1.2.3", "169.254.1.1", "169.254.169.254", "::1", "192.168.1.2"} {
+	for _, host := range []string{"127.0.0.1", "10.1.2.3", "169.254.1.1", "169.254.169.254", "::1", "192.168.1.2", "100.64.0.1", "fd00::1"} {
 		p := NewOriginPool([]wafcore.Origin{{URL: "http://" + net.JoinHostPort(host, "80"), Weight: 1}}, "edge")
 		if err := p.ValidateOrigins(); err == nil {
 			t.Errorf("accepted prohibited origin %s", host)
@@ -267,17 +267,27 @@ func TestLoopbackProxyHTTP1HTTP2SSEAndWebSocket(t *testing.T) {
 				}))
 			}
 			defer origin.Close()
-			originURL = origin.URL
+			actualOriginURL := origin.URL
+			originHost, originPort, err := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(actualOriginURL, "http://"), "https://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			originURL = strings.Replace(actualOriginURL, "127.0.0.1", "origin.test", 1)
 			p := NewOriginPool([]wafcore.Origin{{URL: originURL, Weight: 1}}, "edge-test")
-			originHost, originPort, _ := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(originURL, "http://"), "https://"))
 			p.resolve = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.4")}, nil }
 			p.dialIP = func(ctx context.Context, network, address string) (net.Conn, error) {
-				_, port, _ := net.SplitHostPort(address)
-				d := net.Dialer{}
-				if originHost != "" {
-					port = originPort
+				resolvedIP, _, splitErr := net.SplitHostPort(address)
+				if splitErr != nil {
+					return nil, splitErr
 				}
-				return d.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
+				if resolvedIP != "203.0.113.4" {
+					return nil, fmt.Errorf("unexpected verified dial address %q", resolvedIP)
+				}
+				d := net.Dialer{}
+				if originHost == "" {
+					return nil, errors.New("httptest origin address had no host")
+				}
+				return d.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", originPort))
 			}
 			if proto == "http2" {
 				tr := p.client.Transport.(*http.Transport)

@@ -6,8 +6,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type fakeDNS struct {
@@ -84,5 +87,44 @@ func TestVerificationIntervalUsesAge(t *testing.T) {
 	}
 	if got := VerificationInterval(24 * time.Hour); got != 15*time.Minute {
 		t.Fatalf("slow verification interval=%v", got)
+	}
+}
+
+func TestNormalizeHostnameUsesCanonicalIDNAKey(t *testing.T) {
+	got, err := NormalizeHostname("  BÜCHER.Example.TEST. ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "xn--bcher-kva.example.test" {
+		t.Fatalf("normalized hostname %q", got)
+	}
+	punycode, err := NormalizeHostname("XN--BCHER-KVA.EXAMPLE.TEST")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if punycode != got {
+		t.Fatalf("equivalent names differ: %q vs %q", got, punycode)
+	}
+	for _, invalid := range []string{"", "bad/name.test", "a..test", "-bad.test", strings.Repeat("a", 64) + ".test"} {
+		if _, err := NormalizeHostname(invalid); err == nil {
+			t.Errorf("accepted invalid hostname %q", invalid)
+		}
+	}
+}
+
+func TestMapDomainInsertErrorRequiresDomainConstraint(t *testing.T) {
+	domainDuplicate := &pgconn.PgError{Code: "23505", ConstraintName: "domains_hostname_key"}
+	if got := mapDomainInsertError(domainDuplicate); got != ErrHostnameUnavailable {
+		t.Fatalf("domain unique violation mapped to %v", got)
+	}
+	for _, err := range []error{
+		&pgconn.PgError{Code: "23505", ConstraintName: "audit_logs_pkey"},
+		&pgconn.PgError{Code: "23505", ConstraintName: "domains_pkey"},
+		&pgconn.PgError{Code: "23503", ConstraintName: "domains_hostname_key"},
+		context.DeadlineExceeded,
+	} {
+		if got := mapDomainInsertError(err); got == ErrHostnameUnavailable {
+			t.Errorf("unrelated error %v mapped to hostname conflict", err)
+		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,101 @@ func integrationDeps(t *testing.T) (context.Context, *pgxpool.Pool, *redis.Clien
 		t.Fatal(err)
 	}
 	return ctx, pool, rc
+}
+
+// integrationCleanup removes only rows whose identities were created by this test.
+// It deliberately operates on the shared database after assertions finish, so -count
+// reruns exercise the same database without relying on it being empty.
+type integrationCleanup struct {
+	t       *testing.T
+	admin   *pgxpool.Pool
+	redis   *redis.Client
+	emails  []string
+	tenants []uuid.UUID
+}
+
+func cleanupForTest(t *testing.T, admin *pgxpool.Pool, clients ...*redis.Client) *integrationCleanup {
+	t.Helper()
+	c := &integrationCleanup{t: t, admin: admin}
+	if len(clients) > 0 {
+		c.redis = clients[0]
+	}
+	t.Cleanup(c.run)
+	return c
+}
+func (c *integrationCleanup) email(email string)  { c.emails = append(c.emails, email) }
+func (c *integrationCleanup) tenant(id uuid.UUID) { c.tenants = append(c.tenants, id) }
+func (c *integrationCleanup) run() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if c.redis != nil {
+		for _, email := range c.emails {
+			digest := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email))))
+			if err := c.redis.Del(ctx, "cp:auth:lock:"+hex.EncodeToString(digest[:])).Err(); err != nil {
+				c.t.Errorf("integration Redis fixture cleanup: %v", err)
+			}
+		}
+	}
+	users := make([]uuid.UUID, 0, len(c.emails))
+	tenants := append([]uuid.UUID(nil), c.tenants...)
+	for _, email := range c.emails {
+		var userID, tenantID uuid.UUID
+		err := c.admin.QueryRow(ctx, `SELECT id,default_tenant_id FROM public.users WHERE email=$1`, email).Scan(&userID, &tenantID)
+		if err == nil {
+			users = append(users, userID)
+			if tenantID != uuid.Nil {
+				tenants = append(tenants, tenantID)
+			}
+		}
+	}
+	if len(users) == 0 && len(tenants) == 0 {
+		return
+	}
+	// UUID arrays are passed separately to keep all statements parameterized.
+	for _, query := range []string{
+		`DELETE FROM public.config_change_outbox WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.certificates WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.domains WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.origins WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.waf_settings WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.rules WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.rate_limit_policies WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.access_lists WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.bot_settings WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.cache_settings WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.rule_history WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.alert_rules WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.notification_channels WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.alerts WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.usage_counters WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.api_keys WHERE tenant_id=ANY($1::uuid[]) OR created_by=ANY($2::uuid[])`,
+		`DELETE FROM public.invitations WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.subscriptions WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.invoices WHERE tenant_id=ANY($1::uuid[])`,
+		`DELETE FROM public.audit_logs WHERE tenant_id=ANY($1::uuid[]) OR actor_id=ANY($2::uuid[])`,
+		`DELETE FROM public.memberships WHERE tenant_id=ANY($1::uuid[]) OR user_id=ANY($2::uuid[])`,
+		`DELETE FROM public.refresh_tokens WHERE user_id=ANY($2::uuid[])`,
+		`DELETE FROM public.email_verification_tokens WHERE user_id=ANY($2::uuid[])`,
+		`DELETE FROM public.password_reset_tokens WHERE user_id=ANY($2::uuid[])`,
+		`DELETE FROM public.totp_recovery_codes WHERE user_id=ANY($2::uuid[])`,
+		`DELETE FROM public.sites WHERE tenant_id=ANY($1::uuid[])`,
+	} {
+		if _, err := c.admin.Exec(ctx, query, tenants, users); err != nil {
+			c.t.Errorf("integration fixture cleanup: %v", err)
+			return
+		}
+	}
+	if _, err := c.admin.Exec(ctx, `UPDATE public.users SET default_tenant_id=NULL WHERE id=ANY($1::uuid[])`, users); err != nil {
+		c.t.Errorf("integration fixture cleanup: %v", err)
+		return
+	}
+	if _, err := c.admin.Exec(ctx, `DELETE FROM public.organizations WHERE tenant_id=ANY($1::uuid[])`, tenants); err != nil {
+		c.t.Errorf("integration fixture cleanup: %v", err)
+		return
+	}
+	if _, err := c.admin.Exec(ctx, `DELETE FROM public.users WHERE id=ANY($1::uuid[])`, users); err != nil {
+		c.t.Errorf("integration fixture cleanup: %v", err)
+	}
 }
 
 func apiRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url string) *pgxpool.Pool {
@@ -154,6 +250,7 @@ func workerRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url 
 
 func TestPostgresRLSAndAuthRedisIntegration(t *testing.T) {
 	ctx, pool, rc := integrationDeps(t)
+	cleanup := cleanupForTest(t, pool, rc)
 	appPool := apiRolePool(t, ctx, pool, os.Getenv("DATABASE_URL"))
 	var apiBypass, workerBypass bool
 	if err := pool.QueryRow(ctx, `SELECT (SELECT rolbypassrls FROM pg_roles WHERE rolname='waf_api'),(SELECT rolbypassrls FROM pg_roles WHERE rolname='waf_worker')`).Scan(&apiBypass, &workerBypass); err != nil {
@@ -186,14 +283,17 @@ func TestPostgresRLSAndAuthRedisIntegration(t *testing.T) {
 		if _, err = pool.Exec(ctx, `INSERT INTO users(id,email,password_hash,status) VALUES($1,$2,'test','active')`, ownerID, tenantID.String()+"@example.test"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err = pool.Exec(ctx, `INSERT INTO organizations(id,tenant_id,name,owner_user_id,plan_id) VALUES($1,$1,'test',$2,$3)`, tenantID, ownerID, planID); err != nil {
+		orgName := "test-" + uuid.NewString()
+		if _, err = pool.Exec(ctx, `INSERT INTO organizations(id,tenant_id,name,owner_user_id,plan_id) VALUES($1,$1,$2,$3,$4)`, tenantID, orgName, ownerID, planID); err != nil {
 			t.Fatal(err)
 		}
+		cleanup.tenant(tenantID)
+		cleanup.email(tenantID.String() + "@example.test")
 		siteID, err := uuid.NewV7()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = pool.Exec(ctx, `INSERT INTO sites(id,tenant_id,name,status) VALUES($1,$2,'private','active')`, siteID, tenantID); err != nil {
+		if _, err = pool.Exec(ctx, `INSERT INTO sites(id,tenant_id,name,status) VALUES($1,$2,$3,'active')`, siteID, tenantID, "private-"+uuid.NewString()); err != nil {
 			t.Fatal(err)
 		}
 		return tenantID
@@ -315,6 +415,7 @@ func TestPostgresRLSAndAuthRedisIntegration(t *testing.T) {
 	}
 	svc := auth.Service{Pool: appPool, Redis: rc, JWTPrivate: private, JWTKeyID: "integration", TOTPEncryptionKey: make([]byte, 32)}
 	email := "integration-" + uuid.NewString() + "@example.test"
+	cleanup.email(email)
 	if addr := os.Getenv("MAILHOG_ADDR"); addr != "" {
 		svc.Mailer = auth.SMTPMailer{Addr: addr, From: "noreply@example.test"}
 	}
@@ -412,6 +513,7 @@ func TestPostgresRLSAndAuthRedisIntegration(t *testing.T) {
 		t.Fatal("TOTP replay accepted")
 	}
 	missingEmail := "absent-" + uuid.NewString() + "@example.test"
+	cleanup.email(missingEmail)
 	for i := 0; i < 11; i++ {
 		_, loginErr := svc.Login(ctx, missingEmail, "bad", "integration", "127.0.0.1", "", "")
 		if loginErr == nil {
@@ -484,10 +586,13 @@ func receivedToken(t *testing.T, m *captureMailer, marker string) string {
 
 func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 	ctx, admin, rc := integrationDeps(t)
+	cleanup := cleanupForTest(t, admin, rc)
 	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
 	mail := &captureMailer{messages: make(chan capturedMail, 16)}
 	svc := newAuthService(t, app, rc, mail)
 	emailA, emailB := "security-a-"+uuid.NewString()+"@example.test", "security-b-"+uuid.NewString()+"@example.test"
+	cleanup.email(emailA)
+	cleanup.email(emailB)
 	if err := svc.Register(ctx, emailA, "correct horse battery staple"); err != nil {
 		t.Fatal(err)
 	}
@@ -718,11 +823,13 @@ func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 
 func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
 	ctx, admin, rc := integrationDeps(t)
+	cleanup := cleanupForTest(t, admin, rc)
 	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
 	mail := &captureMailer{messages: make(chan capturedMail, 8)}
 	svc := newAuthService(t, app, rc, mail)
 	registerAndVerify := func(email, password string) uuid.UUID {
 		t.Helper()
+		cleanup.email(email)
 		if err := svc.Register(ctx, email, password); err != nil {
 			t.Fatal(err)
 		}
@@ -772,7 +879,7 @@ func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
 			if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT expect_denial`); err != nil {
 				return err
 			}
-			_, inviteErr := tx.Exec(ctx, `SELECT public.tenant_create_invitation($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), tenantB, "x@example.test", "viewer", []byte("hash"), time.Now().Add(time.Hour), userB, uuid.New())
+			_, inviteErr := tx.Exec(ctx, `SELECT public.tenant_create_invitation($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), tenantB, "invite-"+uuid.NewString()+"@example.test", "viewer", []byte("hash"), time.Now().Add(time.Hour), userB, uuid.New())
 			if inviteErr == nil {
 				return fmt.Errorf("tenant_create_invitation accepted tenant B from tenant A context")
 			}
@@ -819,7 +926,9 @@ func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
 		t.Fatalf("rejected call changed user B refresh rows: before=%d after=%d", initial, got)
 	}
 
-	login, err := svc.Login(ctx, "bind-a-not-used@example.test", "wrong password", "", "", "", "")
+	missingLoginEmail := "bind-a-not-used-" + uuid.NewString() + "@example.test"
+	cleanup.email(missingLoginEmail)
+	login, err := svc.Login(ctx, missingLoginEmail, "wrong password", "", "", "", "")
 	if err == nil || login.RefreshToken != "" {
 		t.Fatal("invalid login unexpectedly created a session")
 	}
@@ -906,6 +1015,7 @@ func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
 
 func TestPublicTableRLSAllowlist(t *testing.T) {
 	ctx, pool, _ := integrationDeps(t)
+	_ = cleanupForTest(t, pool)
 	allow := map[string]string{
 		"plans":            "globally readable product catalog; contains no tenant data",
 		"config_snapshots": "control-plane signed snapshot metadata, restricted by deployment grants",
@@ -970,10 +1080,12 @@ func TestPublicTableRLSAllowlist(t *testing.T) {
 
 func TestAuthFlowsAndConcurrentRefreshRotation(t *testing.T) {
 	ctx, admin, rc := integrationDeps(t)
+	cleanup := cleanupForTest(t, admin, rc)
 	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
 	mail := &captureMailer{messages: make(chan capturedMail, 16)}
 	svc := newAuthService(t, app, rc, mail)
 	email := "flow-" + uuid.NewString() + "@example.test"
+	cleanup.email(email)
 	t.Run("registration_verification_generic_login_reset_logout", func(t *testing.T) {
 		if err := svc.Register(ctx, email, "correct horse battery staple"); err != nil {
 			t.Fatal(err)
@@ -985,8 +1097,10 @@ func TestAuthFlowsAndConcurrentRefreshRotation(t *testing.T) {
 		if err := svc.VerifyEmail(ctx, verifyToken); err == nil {
 			t.Fatal("verification token was reusable")
 		}
+		unknownLoginEmail := "absent-" + uuid.NewString() + "@example.test"
+		cleanup.email(unknownLoginEmail)
 		missingErr := func() error {
-			_, e := svc.Login(ctx, "absent-"+uuid.NewString()+"@example.test", "wrong password", "", "", "", "")
+			_, e := svc.Login(ctx, unknownLoginEmail, "wrong password", "", "", "", "")
 			return e
 		}()
 		wrongErr := func() error { _, e := svc.Login(ctx, email, "wrong password", "", "", "", ""); return e }()
@@ -1029,6 +1143,7 @@ func TestAuthFlowsAndConcurrentRefreshRotation(t *testing.T) {
 	})
 	t.Run("only_one_concurrent_refresh_wins", func(t *testing.T) {
 		freshEmail := "rotate-" + uuid.NewString() + "@example.test"
+		cleanup.email(freshEmail)
 		if err := svc.Register(ctx, freshEmail, "correct horse battery staple"); err != nil {
 			t.Fatal(err)
 		}
@@ -1074,6 +1189,7 @@ func (d siteFakeDNS) LookupIP(context.Context, string, string) ([]net.IP, error)
 
 func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 	ctx, admin, redisClient := integrationDeps(t)
+	cleanup := cleanupForTest(t, admin, redisClient)
 	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
 	worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
 	mailer := &captureMailer{messages: make(chan capturedMail, 16)}
@@ -1081,6 +1197,7 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 	register := func(label string) (uuid.UUID, uuid.UUID) {
 		t.Helper()
 		email := label + "-" + uuid.NewString() + "@example.test"
+		cleanup.email(email)
 		if err := authSvc.Register(ctx, email, "a correct horse battery staple"); err != nil {
 			t.Fatal(err)
 		}
@@ -1095,6 +1212,11 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 	}
 	userA, tenantA := register("site-race-a")
 	userB, tenantB := register("site-race-b")
+	cleanup.tenant(tenantA)
+	cleanup.tenant(tenantB)
+	siteNameSuffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	raceSiteName := "race-site-" + siteNameSuffix
+	tenantBSiteName := "tenant-b-site-" + siteNameSuffix
 	service := site.Service{Pool: app}
 	t.Run("free_site_quota_serializes_concurrent_creates", func(t *testing.T) {
 		start := make(chan struct{})
@@ -1109,7 +1231,7 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				<-start
-				s, e := service.Create(ctx, tenantA, userA, "race-site")
+				s, e := service.Create(ctx, tenantA, userA, raceSiteName)
 				results <- result{s, e}
 			}()
 		}
@@ -1130,15 +1252,25 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 			t.Fatalf("site create successes=%d quota rejects=%d; want one each", success, quota)
 		}
 	})
-	siteA, err := service.Create(ctx, tenantB, userB, "tenant-b-site")
+	siteA, err := service.Create(ctx, tenantB, userB, tenantBSiteName)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var siteAID uuid.UUID
-	if err = admin.QueryRow(ctx, `SELECT id FROM public.sites WHERE tenant_id=$1 AND name='race-site'`, tenantA).Scan(&siteAID); err != nil {
+	if err = admin.QueryRow(ctx, `SELECT id FROM public.sites WHERE tenant_id=$1 AND name=$2`, tenantA, raceSiteName).Scan(&siteAID); err != nil {
 		t.Fatal(err)
 	}
 	t.Run("same_hostname_race_and_non_disclosing_conflict", func(t *testing.T) {
+		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+		unicodeHost := "BÜCHER-" + suffix + ".EXAMPLE.TEST."
+		canonicalHost, err := site.NormalizeHostname(unicodeHost)
+		if err != nil {
+			t.Fatal(err)
+		}
+		punycodeHost, err := site.NormalizeHostname(canonicalHost)
+		if err != nil {
+			t.Fatal(err)
+		}
 		start := make(chan struct{})
 		type result struct {
 			proof site.DomainProof
@@ -1146,19 +1278,20 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		}
 		results := make(chan result, 2)
 		var wg sync.WaitGroup
-		for _, input := range []struct{ tenant, user, sid uuid.UUID }{{tenantA, userA, siteAID}, {tenantB, userB, siteA.ID}} {
+		for i, input := range []struct{ tenant, user, sid uuid.UUID }{{tenantA, userA, siteAID}, {tenantB, userB, siteA.ID}} {
 			wg.Add(1)
-			go func(v struct{ tenant, user, sid uuid.UUID }) {
+			go func(v struct{ tenant, user, sid uuid.UUID }, hostname string) {
 				defer wg.Done()
 				<-start
-				p, e := service.AddDomain(ctx, v.tenant, v.user, v.sid, "Shared.Example.Test.")
+				p, e := service.AddDomain(ctx, v.tenant, v.user, v.sid, hostname)
 				results <- result{p, e}
-			}(input)
+			}(input, []string{unicodeHost, punycodeHost}[i])
 		}
 		close(start)
 		wg.Wait()
 		close(results)
 		var winner site.DomainProof
+		var conflictErr error
 		success, conflict := 0, 0
 		for r := range results {
 			if r.err == nil {
@@ -1166,6 +1299,7 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 				winner = r.proof
 			} else if errors.Is(r.err, site.ErrHostnameUnavailable) {
 				conflict++
+				conflictErr = r.err
 			} else {
 				t.Errorf("unexpected domain result: %v", r.err)
 			}
@@ -1173,10 +1307,13 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if success != 1 || conflict != 1 {
 			t.Fatalf("domain creates successes=%d conflicts=%d; want one each", success, conflict)
 		}
+		if winner.Hostname != canonicalHost || conflictErr == nil || strings.Contains(conflictErr.Error(), tenantA.String()) || strings.Contains(conflictErr.Error(), tenantB.String()) {
+			t.Fatalf("hostname normalization/conflict disclosure mismatch: winner=%q err=%v", winner.Hostname, conflictErr)
+		}
 		if strings.Contains(winner.Hostname, tenantA.String()) || strings.Contains(winner.Hostname, tenantB.String()) {
 			t.Fatal("hostname conflict response exposed tenant identity")
 		}
-		if _, err := service.AddDomain(ctx, tenantA, userA, siteA.ID, "cross-tenant.example.test"); !errors.Is(err, site.ErrSiteNotFound) {
+		if _, err := service.AddDomain(ctx, tenantA, userA, siteA.ID, "cross-tenant-"+suffix+".example.test"); !errors.Is(err, site.ErrSiteNotFound) {
 			t.Fatalf("cross-tenant site reference err=%v, want not found", err)
 		}
 		if _, err := service.AddOrigin(ctx, tenantA, userA, siteA.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); !errors.Is(err, site.ErrSiteNotFound) {
@@ -1216,7 +1353,7 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&status); err != nil || status != "active" {
 			t.Fatalf("site status=%q err=%v", status, err)
 		}
-		expiredProof, err := service.AddDomain(ctx, tenantA, userA, siteAID, "expired-proof.example.test")
+		expiredProof, err := service.AddDomain(ctx, tenantA, userA, siteAID, "expired-"+suffix+".example.test")
 		if err != nil {
 			t.Fatal(err)
 		}

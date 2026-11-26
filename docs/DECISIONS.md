@@ -263,3 +263,11 @@ Vị trí cũ `edge/internal/proxy/proxy.go` G115 đã được gỡ: counter ch
 | `audit_auth_mutation` | Trigger lấy actor/tenant từ row đã đổi; không callable nghiệp vụ | Ghi operation/entity ID, không ghi secret/hash |
 
 Integration test đối chiếu mọi hàm `SECURITY DEFINER` với allowlist này bằng inventory trong test, kiểm `search_path`, owner `waf_worker` không-superuser, không có EXECUTE cho PUBLIC hay role ngoài owner/`waf_api`. Mọi hàm mới không được thêm allowlist sẽ làm test fail.
+
+## P8a-fix — test chạy lặp lại và hostname chuẩn hóa
+
+- Hostname domain được chuẩn hóa bằng IDNA Lookup profile sang lowercase ASCII trước insert. U-label, punycode, khác biệt hoa/thường và dấu chấm cuối cùng vì vậy tranh chấp cùng một khóa toàn cục.
+- Chỉ lỗi PostgreSQL `23505` trên constraint `domains_hostname_key` được ánh xạ sang phản hồi generic `hostname is unavailable`; lỗi unique khác được giữ nguyên.
+- Tích hợp CP dùng UUID/email/hostname riêng cho mỗi lượt và dọn tenant/user, row phụ thuộc cùng Redis login throttle key bằng cleanup. CI giữ `-count=20` trên cùng service database để phát hiện phụ thuộc vào DB rỗng.
+- Proxy loopback test dùng DNS giả trả một IP tài liệu công khai và dialer riêng của test ánh xạ IP đã được netguard xác minh sang httptest origin. Cấu hình/env/snapshot production không có tùy chọn tắt guard; kiểm tra mặc định vẫn từ chối loopback, private, metadata, CGNAT và ULA.
+- **Chưa xác minh trên Linux:** sandbox hiện tại là Windows; `wsl.exe` và Docker daemon đều bị từ chối/không khả dụng, nên các test loopback và integration thật cần chạy lại trong WSL/CI.

@@ -691,3 +691,14 @@ Lấy log còn thiếu cho từng run: `gh run list --commit <commit>`, sau đó
 
 1. Bổ sung logic nghiệp vụ và test tích hợp khi bắt đầu phase tiếp theo.
 2. Chọn DNS provider và hoàn thiện policy pháp lý trước khi mở dịch vụ cho khách thật.
+
+## P8a-fix — repeatable CP integration and proxy test seam
+
+- Đã rà toàn bộ `controlplane/internal/integration`: hiện chỉ có `core_integration_test.go`. Mọi test tạo identity/email đều đăng ký cleanup; cleanup xóa row theo tenant/user và Redis login-throttle key. Tenant/site/domain/hostname fixtures có ID ngẫu nhiên, suite không cần database rỗng.
+- CI CP chạy `go test -tags=integration -race -count=20` trên cùng PostgreSQL/Redis service, không dọn DB giữa lượt; thêm bước 100 lượt cho race hai tenant cùng claim hostname.
+- Hostname chuẩn hóa IDNA (U-label/punycode, hoa/thường, dấu chấm cuối); test kiểm cùng một khóa và lỗi unique ngoài `domains_hostname_key` không bị biến thành conflict. Test giữ cuộc đua quota và hai tenant thêm cùng hostname, phản hồi conflict không tiết lộ tenant.
+- Proxy test cấp DNS `origin.test → 203.0.113.4` và dialer riêng của test ánh xạ IP đã qua guard tới httptest listener. Test mặc định kiểm từ chối loopback/private/metadata/CGNAT/ULA; không thay đổi netguard.
+- **Đã xác minh trên Windows:** `go test ./controlplane/internal/site` PASS; integration package biên dịch với `go test -tags=integration -run '^$' ./controlplane/internal/integration` PASS; `go vet ./...` PASS; `go build ./...` PASS. `golangci-lint run ./...` đầu tiên phát hiện một `ineffassign` vừa thêm, đã sửa và cần chạy lại.
+- **Chưa xác minh:** `go test -race -count=1 ./...` không chạy vì `CGO_ENABLED=0`; `wsl.exe --list --verbose` trả `Wsl/E_ACCESSDENIED`; Docker daemon không có pipe; PostgreSQL/Redis service không lắng nghe. `go test ./edge/internal/proxy` bị sandbox Windows chặn loopback và báo 502/`connectex`; chưa thể xác minh test loopback đã sửa trên Linux. Chưa chạy CP integration với `CP_INTEGRATION_REQUIRED=1`.
+- Lệnh cần chạy trong WSL/Ubuntu, cùng DB không dọn giữa lượt: `golangci-lint run ./...`; `go vet ./...`; `go build ./...`; `go test -race -count=1 ./...`; `CP_INTEGRATION_REQUIRED=1 go test -tags=integration -race -count=20 ./controlplane/internal/integration`; `govulncheck ./...`; `bash scripts/check-controlplane-sql.sh`.
+- **TODO-P8A-FIX-1:** chờ xác minh Linux/WSL và Postgres/Redis thật trước khi đóng; ghi lại output của từng lệnh và xử lý mọi lỗi đỏ.
