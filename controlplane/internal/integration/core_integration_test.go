@@ -1735,6 +1735,19 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 	if err = admin.QueryRow(ctx, `SELECT id FROM public.sites WHERE tenant_id=$1 AND name=$2`, tenantA, raceSiteName).Scan(&siteAID); err != nil {
 		t.Fatal(err)
 	}
+	for _, siteID := range []uuid.UUID{siteAID, siteA.ID} {
+		var status string
+		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteID).Scan(&status); err != nil || status != "pending_dns" {
+			t.Fatalf("new site %s status=%q err=%v, want pending_dns", siteID, status, err)
+		}
+	}
+	if _, err := service.AddOrigin(ctx, tenantA, userA, siteAID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); err != nil {
+		t.Fatalf("add origin before verification: %v", err)
+	}
+	var originSiteStatus string
+	if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&originSiteStatus); err != nil || originSiteStatus != "pending_dns" {
+		t.Fatalf("adding an origin changed pending site status to %q: %v", originSiteStatus, err)
+	}
 	t.Run("same_hostname_race_and_non_disclosing_conflict", func(t *testing.T) {
 		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
 		unicodeHost := "BÜCHER-" + suffix + ".EXAMPLE.TEST."
@@ -1748,8 +1761,9 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		}
 		start := make(chan struct{})
 		type result struct {
-			proof site.DomainProof
-			err   error
+			proof  site.DomainProof
+			siteID uuid.UUID
+			err    error
 		}
 		results := make(chan result, 2)
 		var wg sync.WaitGroup
@@ -1759,22 +1773,26 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 				defer wg.Done()
 				<-start
 				p, e := service.AddDomain(ctx, v.tenant, v.user, v.sid, hostname)
-				results <- result{p, e}
+				results <- result{proof: p, siteID: v.sid, err: e}
 			}(input, []string{unicodeHost, punycodeHost}[i])
 		}
 		close(start)
 		wg.Wait()
 		close(results)
 		var winner site.DomainProof
+		var winnerSiteID uuid.UUID
+		var loserSiteID uuid.UUID
 		var conflictErr error
 		success, conflict := 0, 0
 		for r := range results {
 			if r.err == nil {
 				success++
 				winner = r.proof
+				winnerSiteID = r.siteID
 			} else if errors.Is(r.err, site.ErrHostnameUnavailable) {
 				conflict++
 				conflictErr = r.err
+				loserSiteID = r.siteID
 			} else {
 				t.Errorf("unexpected domain result: %v", r.err)
 			}
@@ -1785,8 +1803,20 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if winner.Hostname != canonicalHost || conflictErr == nil || strings.Contains(conflictErr.Error(), tenantA.String()) || strings.Contains(conflictErr.Error(), tenantB.String()) {
 			t.Fatalf("hostname normalization/conflict disclosure mismatch: winner=%q err=%v", winner.Hostname, conflictErr)
 		}
+		if winnerSiteID == uuid.Nil || loserSiteID == uuid.Nil || winnerSiteID == loserSiteID {
+			t.Fatalf("hostname race did not preserve winner/loser site identity: winner=%s loser=%s", winnerSiteID, loserSiteID)
+		}
 		if strings.Contains(winner.Hostname, tenantA.String()) || strings.Contains(winner.Hostname, tenantB.String()) {
 			t.Fatal("hostname conflict response exposed tenant identity")
+		}
+		for _, expected := range []struct {
+			siteID uuid.UUID
+			status string
+		}{{winnerSiteID, "pending_dns"}, {loserSiteID, "pending_dns"}} {
+			var status string
+			if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, expected.siteID).Scan(&status); err != nil || status != expected.status {
+				t.Fatalf("site %s status after domain creation=%q err=%v, want %s", expected.siteID, status, err, expected.status)
+			}
 		}
 		if _, err := service.AddDomain(ctx, tenantA, userA, siteA.ID, "cross-tenant-"+suffix+".example.test"); !errors.Is(err, site.ErrSiteNotFound) {
 			t.Fatalf("cross-tenant site reference err=%v, want not found", err)
@@ -1824,9 +1854,12 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if err := admin.QueryRow(ctx, `SELECT verification_status='active' FROM public.domains WHERE id=$1`, winner.ID).Scan(&verified); err != nil || !verified {
 			t.Fatalf("domain verification status active=%v err=%v", verified, err)
 		}
-		var status string
-		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&status); err != nil || status != "active" {
-			t.Fatalf("site status=%q err=%v", status, err)
+		var winnerStatus, loserStatus string
+		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, winnerSiteID).Scan(&winnerStatus); err != nil || winnerStatus != "active" {
+			t.Fatalf("verified domain owner site %s status=%q err=%v, want active", winnerSiteID, winnerStatus, err)
+		}
+		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, loserSiteID).Scan(&loserStatus); err != nil || loserStatus != "pending_dns" {
+			t.Fatalf("site %s without verified domain status=%q err=%v, want pending_dns", loserSiteID, loserStatus, err)
 		}
 		expiredProof, err := service.AddDomain(ctx, tenantA, userA, siteAID, "expired-"+suffix+".example.test")
 		if err != nil {
@@ -1835,12 +1868,20 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if _, err = admin.Exec(ctx, `UPDATE public.domains SET verification_expires_at=now()-interval '1 second' WHERE id=$1`, expiredProof.ID); err != nil {
 			t.Fatal(err)
 		}
+		var expiredSiteStatusBefore string
+		if err = admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&expiredSiteStatusBefore); err != nil {
+			t.Fatal(err)
+		}
 		if err = workerService.VerifyDomain(ctx, tenantA, expiredProof.ID, siteFakeDNS{records: []string{expiredProof.Token}}); !errors.Is(err, site.ErrVerificationExpired) {
 			t.Fatalf("expired proof result=%v, want ErrVerificationExpired", err)
 		}
 		var expiredStatus string
 		if err = admin.QueryRow(ctx, `SELECT verification_status FROM public.domains WHERE id=$1`, expiredProof.ID).Scan(&expiredStatus); err != nil || expiredStatus != "failed" {
 			t.Fatalf("expired domain status=%q err=%v", expiredStatus, err)
+		}
+		var expiredSiteStatusAfter string
+		if err = admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&expiredSiteStatusAfter); err != nil || expiredSiteStatusAfter != expiredSiteStatusBefore {
+			t.Fatalf("expired domain changed site status from %q to %q err=%v", expiredSiteStatusBefore, expiredSiteStatusAfter, err)
 		}
 	})
 	t.Run("site_status_machine_rejects_invalid_transitions", func(t *testing.T) {
