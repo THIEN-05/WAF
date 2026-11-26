@@ -1,4 +1,4 @@
-.PHONY: up up-wait down test test-integration test-cp-integration lint build bench gen migrate dev-check check-cp-sql
+.PHONY: up up-wait down test test-integration test-cp-integration lint build bench gen migrate dev-check check-cp-sql check-generated
 
 up:
 	docker compose -f deploy/docker-compose.yml up -d
@@ -20,6 +20,12 @@ test-cp-integration:
 
 check-cp-sql:
 	bash scripts/check-controlplane-sql.sh
+
+check-generated:
+	@if [ -n "$$(gofmt -l $$(git ls-files --cached --others --exclude-standard -- '*.go'))" ]; then gofmt -l $$(git ls-files --cached --others --exclude-standard -- '*.go'); exit 1; fi
+	go mod tidy
+	$(MAKE) gen
+	git diff --exit-code
 
 lint:
 	golangci-lint run ./...

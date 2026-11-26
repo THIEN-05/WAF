@@ -85,7 +85,14 @@ type integrationCleanup struct {
 	redis   *redis.Client
 	emails  []string
 	tenants []uuid.UUID
+	roles   []cleanupRole
 }
+
+type cleanupStatement struct {
+	sql  string
+	args []any
+}
+type cleanupRole struct{ name, group string }
 
 func cleanupForTest(t *testing.T, admin *pgxpool.Pool, clients ...*redis.Client) *integrationCleanup {
 	t.Helper()
@@ -98,9 +105,21 @@ func cleanupForTest(t *testing.T, admin *pgxpool.Pool, clients ...*redis.Client)
 }
 func (c *integrationCleanup) email(email string)  { c.emails = append(c.emails, email) }
 func (c *integrationCleanup) tenant(id uuid.UUID) { c.tenants = append(c.tenants, id) }
+func (c *integrationCleanup) role(name, group string) {
+	c.roles = append(c.roles, cleanupRole{name: name, group: group})
+}
 func (c *integrationCleanup) run() {
+	c.runWithRoles(true)
+}
+
+func (c *integrationCleanup) runFixtureRows() {
+	c.runWithRoles(false)
+}
+
+func (c *integrationCleanup) runWithRoles(includeRoles bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	var cleanupErrors []error
 	if c.redis != nil {
 		for _, email := range c.emails {
 			digest := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email))))
@@ -119,71 +138,347 @@ func (c *integrationCleanup) run() {
 			if tenantID != uuid.Nil {
 				tenants = append(tenants, tenantID)
 			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup lookup by test email %q: %w", email, err))
 		}
 	}
-	if len(users) == 0 && len(tenants) == 0 {
+	if len(users) == 0 && len(tenants) == 0 && len(c.roles) == 0 {
+		if len(cleanupErrors) > 0 {
+			c.t.Errorf("integration fixture cleanup errors: %v", errors.Join(cleanupErrors...))
+		}
 		return
 	}
-	// UUID arrays are passed separately to keep all statements parameterized.
-	for _, query := range []string{
-		`DELETE FROM public.config_change_outbox WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.certificates WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.domains WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.origins WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.waf_settings WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.rules WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.rate_limit_policies WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.access_lists WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.bot_settings WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.cache_settings WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.rule_history WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.alert_rules WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.notification_channels WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.alerts WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.usage_counters WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.api_keys WHERE tenant_id=ANY($1::uuid[]) OR created_by=ANY($2::uuid[])`,
-		`DELETE FROM public.invitations WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.subscriptions WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.invoices WHERE tenant_id=ANY($1::uuid[])`,
-		`DELETE FROM public.audit_logs WHERE tenant_id=ANY($1::uuid[]) OR actor_id=ANY($2::uuid[])`,
-		`DELETE FROM public.memberships WHERE tenant_id=ANY($1::uuid[]) OR user_id=ANY($2::uuid[])`,
-		`DELETE FROM public.refresh_tokens WHERE user_id=ANY($2::uuid[])`,
-		`DELETE FROM public.email_verification_tokens WHERE user_id=ANY($2::uuid[])`,
-		`DELETE FROM public.password_reset_tokens WHERE user_id=ANY($2::uuid[])`,
-		`DELETE FROM public.totp_recovery_codes WHERE user_id=ANY($2::uuid[])`,
-		`DELETE FROM public.sites WHERE tenant_id=ANY($1::uuid[])`,
-	} {
-		if _, err := c.admin.Exec(ctx, query, tenants, users); err != nil {
-			c.t.Errorf("integration fixture cleanup: %v", err)
-			return
+	tx, err := c.admin.Begin(ctx)
+	if err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("integration fixture cleanup begin: %w", err))
+		c.t.Errorf("integration fixture cleanup errors: %v", errors.Join(cleanupErrors...))
+		return
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	roles := c.roles
+	if !includeRoles {
+		roles = nil
+	}
+	statements := fixtureCleanupStatements(tenants, users, roles)
+	for i, stmt := range statements {
+		sp := fmt.Sprintf("fixture_cleanup_%d", i)
+		if _, err := tx.Exec(ctx, "SAVEPOINT "+sp); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup SQL %q savepoint: %w", stmt.sql, err))
+			continue
+		}
+		if _, err := tx.Exec(ctx, stmt.sql, stmt.args...); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup SQL %q: %w", stmt.sql, err))
+			if _, rollbackErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+sp); rollbackErr != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup SQL %q rollback: %w", stmt.sql, rollbackErr))
+			}
+		}
+		if _, releaseErr := tx.Exec(ctx, "RELEASE SAVEPOINT "+sp); releaseErr != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup SQL %q release: %w", stmt.sql, releaseErr))
 		}
 	}
-	if _, err := c.admin.Exec(ctx, `UPDATE public.users SET default_tenant_id=NULL WHERE id=ANY($1::uuid[])`, users); err != nil {
-		c.t.Errorf("integration fixture cleanup: %v", err)
-		return
+	if err := tx.Commit(ctx); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("integration fixture cleanup commit: %w", err))
 	}
-	if _, err := c.admin.Exec(ctx, `DELETE FROM public.organizations WHERE tenant_id=ANY($1::uuid[])`, tenants); err != nil {
-		c.t.Errorf("integration fixture cleanup: %v", err)
-		return
-	}
-	if _, err := c.admin.Exec(ctx, `DELETE FROM public.users WHERE id=ANY($1::uuid[])`, users); err != nil {
-		c.t.Errorf("integration fixture cleanup: %v", err)
+	if len(cleanupErrors) > 0 {
+		c.t.Errorf("integration fixture cleanup errors: %v", errors.Join(cleanupErrors...))
 	}
 }
 
-func apiRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url string) *pgxpool.Pool {
+func fixtureCleanupStatements(tenants, users []uuid.UUID, roles []cleanupRole) []cleanupStatement {
+	statements := []cleanupStatement{
+		{`DELETE FROM public.config_change_outbox WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.certificates WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.domains WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.origins WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.waf_settings WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.rules WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.rate_limit_policies WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.access_lists WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.bot_settings WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.cache_settings WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.rule_history WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.alert_rules WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.notification_channels WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.alerts WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.usage_counters WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.api_keys WHERE tenant_id=ANY($1::uuid[]) OR created_by=ANY($2::uuid[])`, []any{tenants, users}},
+		{`DELETE FROM public.invitations WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.subscriptions WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.invoices WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.audit_logs WHERE tenant_id=ANY($1::uuid[]) OR actor_id=ANY($2::uuid[])`, []any{tenants, users}},
+		{`DELETE FROM public.memberships WHERE tenant_id=ANY($1::uuid[]) OR user_id=ANY($2::uuid[])`, []any{tenants, users}},
+		{`DELETE FROM public.refresh_tokens WHERE user_id=ANY($1::uuid[])`, []any{users}},
+		{`DELETE FROM public.email_verification_tokens WHERE user_id=ANY($1::uuid[])`, []any{users}},
+		{`DELETE FROM public.password_reset_tokens WHERE user_id=ANY($1::uuid[])`, []any{users}},
+		{`DELETE FROM public.totp_recovery_codes WHERE user_id=ANY($1::uuid[])`, []any{users}},
+		{`DELETE FROM public.sites WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`UPDATE public.users SET default_tenant_id=NULL WHERE id=ANY($1::uuid[])`, []any{users}},
+		{`DELETE FROM public.organizations WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.users WHERE id=ANY($1::uuid[])`, []any{users}},
+	}
+	for _, role := range roles {
+		ident := pgx.Identifier{role.name}.Sanitize()
+		group := pgx.Identifier{role.group}.Sanitize()
+		statements = append(statements,
+			cleanupStatement{`REVOKE ` + group + ` FROM ` + ident, nil},
+			cleanupStatement{`DROP ROLE IF EXISTS ` + ident, nil},
+		)
+	}
+	return statements
+}
+
+var cleanupTableCoverage = map[string]string{
+	"users":                     "delete by tracked user UUID after clearing default_tenant_id",
+	"organizations":             "delete by tracked tenant UUID after tenant children and user references",
+	"memberships":               "delete by tenant_id or tracked user_id",
+	"invitations":               "delete by tenant_id",
+	"refresh_tokens":            "delete by user_id",
+	"api_keys":                  "delete by tenant_id or created_by",
+	"subscriptions":             "delete by tenant_id",
+	"invoices":                  "delete by tenant_id",
+	"sites":                     "delete by tenant_id after site-owned rows",
+	"domains":                   "delete by tenant_id after certificates",
+	"origins":                   "delete by tenant_id",
+	"waf_settings":              "delete by tenant_id",
+	"rules":                     "delete by tenant_id",
+	"rate_limit_policies":       "delete by tenant_id",
+	"access_lists":              "delete by tenant_id",
+	"bot_settings":              "delete by tenant_id",
+	"cache_settings":            "delete by tenant_id",
+	"certificates":              "delete by tenant_id before domains",
+	"rule_history":              "delete by tenant_id",
+	"alert_rules":               "delete by tenant_id",
+	"notification_channels":     "delete by tenant_id",
+	"alerts":                    "delete by tenant_id",
+	"audit_logs":                "delete by tenant_id or actor_id",
+	"usage_counters":            "delete by tenant_id",
+	"email_verification_tokens": "delete by user_id",
+	"password_reset_tokens":     "delete by user_id",
+	"totp_recovery_codes":       "delete by user_id",
+	"config_change_outbox":      "delete by tenant_id before site rows",
+}
+
+var cleanupGlobalTableAllowlist = map[string]string{
+	"plans":            "shared product catalog; seeded globally and contains no fixture ownership key",
+	"config_snapshots": "global signed snapshot inventory; integration fixtures do not create snapshots",
+	"edges":            "global edge inventory; integration fixtures do not create edges",
+	"webhook_events":   "global provider idempotency inbox; integration fixtures do not process webhooks",
+	"goose_db_version": "migration bookkeeping, never test fixture data",
+}
+
+func TestIntegrationCleanupSchemaCoverage(t *testing.T) {
+	ctx, pool, _ := integrationDeps(t)
+	statements := fixtureCleanupStatements(nil, nil, nil)
+	for table := range cleanupTableCoverage {
+		found := false
+		for _, statement := range statements {
+			if strings.Contains(statement.sql, "public."+table) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("cleanup coverage for table %q has no matching SQL statement", table)
+		}
+	}
+	rows, err := pool.Query(ctx, `SELECT c.relname,
+      EXISTS (SELECT 1 FROM information_schema.columns col WHERE col.table_schema='public' AND col.table_name=c.relname AND col.column_name IN ('tenant_id','user_id','actor_id','created_by'))
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE n.nspname='public' AND c.relkind IN ('r','p') ORDER BY c.relname`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var table string
+		var fixtureColumns bool
+		if err = rows.Scan(&table, &fixtureColumns); err != nil {
+			t.Fatal(err)
+		}
+		seen[table] = true
+		if fixtureColumns {
+			if _, ok := cleanupTableCoverage[table]; !ok {
+				t.Errorf("fixture-owned table %q is not covered by integration cleanup", table)
+			}
+			continue
+		}
+		if _, ok := cleanupTableCoverage[table]; ok {
+			continue
+		}
+		if _, ok := cleanupGlobalTableAllowlist[table]; !ok {
+			t.Errorf("public table %q has no fixture-cleanup rule or documented global allowlist reason", table)
+		}
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for table := range cleanupTableCoverage {
+		if !seen[table] {
+			t.Errorf("cleanup coverage references missing table %q", table)
+		}
+	}
+	for table := range cleanupGlobalTableAllowlist {
+		if !seen[table] {
+			t.Errorf("global cleanup allowlist references missing table %q", table)
+		}
+	}
+	owned, err := pool.Query(ctx, `SELECT DISTINCT col.table_name FROM information_schema.columns col JOIN information_schema.tables tab USING(table_schema,table_name) WHERE col.table_schema='public' AND tab.table_type='BASE TABLE' AND col.column_name IN ('tenant_id','user_id','actor_id','created_by') ORDER BY col.table_name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owned.Close()
+	for owned.Next() {
+		var table string
+		if err = owned.Scan(&table); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := cleanupTableCoverage[table]; !ok {
+			t.Errorf("new fixture-owned table %q is absent from cleanup coverage", table)
+		}
+	}
+	if err = owned.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrationCleanupRemovesFixtureRows(t *testing.T) {
+	ctx, admin, rc := integrationDeps(t)
+	cleanup := cleanupForTest(t, admin, rc)
+	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
+	mailer := &captureMailer{messages: make(chan capturedMail, 8)}
+	authSvc := newAuthService(t, app, rc, mailer)
+	email := "cleanup-" + uuid.NewString() + "@example.test"
+	cleanup.email(email)
+	if err := authSvc.Register(ctx, email, "a correct horse battery staple"); err != nil {
+		t.Fatal(err)
+	}
+	if err := authSvc.VerifyEmail(ctx, receivedToken(t, mailer, "Verification token: ")); err != nil {
+		t.Fatal(err)
+	}
+	var userID, tenantID uuid.UUID
+	if err := admin.QueryRow(ctx, `SELECT id,default_tenant_id FROM public.users WHERE email=$1`, email).Scan(&userID, &tenantID); err != nil {
+		t.Fatal(err)
+	}
+	session, err := authSvc.Login(ctx, email, "a correct horse battery staple", "integration-cleanup", "192.0.2.90", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authSvc.RequestPasswordReset(ctx, email); err != nil {
+		t.Fatal(err)
+	}
+	sites := site.Service{Pool: app}
+	createdSite, err := sites.Create(ctx, tenantID, userID, "cleanup-site-"+uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := sites.AddDomain(ctx, tenantID, userID, createdSite.ID, "cleanup-"+strings.ReplaceAll(uuid.NewString(), "-", "")+".example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = sites.AddOrigin(ctx, tenantID, userID, createdSite.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = (tenant.Service{Pool: app}).CreateAPIKey(ctx, tenantID, userID, "cleanup-key", []string{"sites:read"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = (tenant.Service{Pool: app}).Invite(ctx, tenantID, userID, "invite-"+uuid.NewString()+"@example.test", tenant.Viewer); err != nil {
+		t.Fatal(err)
+	}
+	if session.RefreshToken == "" || proof.ID == uuid.Nil {
+		t.Fatal("fixture setup did not create auth/site/domain data")
+	}
+	for table, want := range map[string]int{"users": 1, "organizations": 1, "sites": 1, "domains": 1, "origins": 1, "config_change_outbox": 3, "refresh_tokens": 1, "password_reset_tokens": 1, "api_keys": 1, "invitations": 1} {
+		var count int
+		query := fmt.Sprintf(`SELECT count(*) FROM %s WHERE `, pgx.Identifier{"public", table}.Sanitize())
+		switch table {
+		case "users":
+			query += `id=$1`
+			err = admin.QueryRow(ctx, query, userID).Scan(&count)
+		case "organizations":
+			query += `tenant_id=$1`
+			err = admin.QueryRow(ctx, query, tenantID).Scan(&count)
+		default:
+			query += `tenant_id=$1`
+			err = admin.QueryRow(ctx, query, tenantID).Scan(&count)
+		}
+		if err != nil {
+			t.Fatalf("count fixture rows in %s: %v", table, err)
+		}
+		if count < want {
+			t.Fatalf("fixture seeded %s rows=%d, want at least %d", table, count, want)
+		}
+	}
+	cleanup.runFixtureRows()
+	assertNoFixtureRows(t, ctx, admin, userID, tenantID)
+}
+
+func assertNoFixtureRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID, tenantID uuid.UUID) {
+	t.Helper()
+	var users, orgs, sites, domains int
+	for _, check := range []struct {
+		query string
+		id    uuid.UUID
+		dst   *int
+	}{
+		{`SELECT count(*) FROM public.users WHERE id=$1`, userID, &users},
+		{`SELECT count(*) FROM public.organizations WHERE tenant_id=$1`, tenantID, &orgs},
+		{`SELECT count(*) FROM public.sites WHERE tenant_id=$1`, tenantID, &sites},
+		{`SELECT count(*) FROM public.domains WHERE tenant_id=$1`, tenantID, &domains},
+	} {
+		if err := pool.QueryRow(ctx, check.query, check.id).Scan(check.dst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if users+orgs+sites+domains != 0 {
+		t.Fatalf("fixture rows remain: users=%d organizations=%d sites=%d domains=%d", users, orgs, sites, domains)
+	}
+	rows, err := pool.Query(ctx, `SELECT col.table_name,array_agg(col.column_name ORDER BY col.column_name) FROM information_schema.columns col JOIN information_schema.tables tab USING(table_schema,table_name) WHERE col.table_schema='public' AND tab.table_type='BASE TABLE' AND col.column_name IN ('tenant_id','user_id','actor_id','created_by') GROUP BY col.table_name ORDER BY col.table_name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var table string
+		var columns []string
+		if err = rows.Scan(&table, &columns); err != nil {
+			t.Fatal(err)
+		}
+		conditions := make([]string, 0, len(columns))
+		args := make([]any, 0, len(columns))
+		for _, column := range columns {
+			arg := userID
+			if column == "tenant_id" {
+				arg = tenantID
+			}
+			conditions = append(conditions, pgx.Identifier{column}.Sanitize()+"=$"+fmt.Sprint(len(args)+1))
+			args = append(args, arg)
+		}
+		query := "SELECT count(*) FROM " + pgx.Identifier{"public", table}.Sanitize() + " WHERE " + strings.Join(conditions, " OR ")
+		var count int
+		if err = pool.QueryRow(ctx, query, args...).Scan(&count); err != nil {
+			t.Errorf("inspect fixture rows in %s: %v", table, err)
+			continue
+		}
+		if count != 0 {
+			t.Errorf("fixture cleanup left %d matching rows in %s", count, table)
+		}
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func apiRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url string, cleanup *integrationCleanup) *pgxpool.Pool {
 	t.Helper()
 	roleName := "waf_test_api_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'test-api-role-password'`, roleName)); err != nil {
 		t.Fatalf("create api login: %v", err)
 	}
+	cleanup.role(roleName, "waf_api")
 	if _, err := admin.Exec(ctx, fmt.Sprintf(`GRANT waf_api TO %s`, roleName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = admin.Exec(context.Background(), fmt.Sprintf(`REVOKE waf_api FROM %s`, roleName))
-		_, _ = admin.Exec(context.Background(), fmt.Sprintf(`DROP ROLE IF EXISTS %s`, roleName))
-	})
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		t.Fatal(err)
@@ -208,19 +503,16 @@ func apiRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url str
 	return p
 }
 
-func workerRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url string) *pgxpool.Pool {
+func workerRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url string, cleanup *integrationCleanup) *pgxpool.Pool {
 	t.Helper()
 	roleName := "waf_test_worker_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'test-worker-role-password'`, roleName)); err != nil {
 		t.Fatalf("create worker login: %v", err)
 	}
+	cleanup.role(roleName, "waf_worker")
 	if _, err := admin.Exec(ctx, fmt.Sprintf(`GRANT waf_worker TO %s`, roleName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = admin.Exec(context.Background(), fmt.Sprintf(`REVOKE waf_worker FROM %s`, roleName))
-		_, _ = admin.Exec(context.Background(), fmt.Sprintf(`DROP ROLE IF EXISTS %s`, roleName))
-	})
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +543,7 @@ func workerRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url 
 func TestPostgresRLSAndAuthRedisIntegration(t *testing.T) {
 	ctx, pool, rc := integrationDeps(t)
 	cleanup := cleanupForTest(t, pool, rc)
-	appPool := apiRolePool(t, ctx, pool, os.Getenv("DATABASE_URL"))
+	appPool := apiRolePool(t, ctx, pool, os.Getenv("DATABASE_URL"), cleanup)
 	var apiBypass, workerBypass bool
 	if err := pool.QueryRow(ctx, `SELECT (SELECT rolbypassrls FROM pg_roles WHERE rolname='waf_api'),(SELECT rolbypassrls FROM pg_roles WHERE rolname='waf_worker')`).Scan(&apiBypass, &workerBypass); err != nil {
 		t.Fatal(err)
@@ -587,7 +879,7 @@ func receivedToken(t *testing.T, m *captureMailer, marker string) string {
 func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 	ctx, admin, rc := integrationDeps(t)
 	cleanup := cleanupForTest(t, admin, rc)
-	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
+	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
 	mail := &captureMailer{messages: make(chan capturedMail, 16)}
 	svc := newAuthService(t, app, rc, mail)
 	emailA, emailB := "security-a-"+uuid.NewString()+"@example.test", "security-b-"+uuid.NewString()+"@example.test"
@@ -824,7 +1116,7 @@ func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
 	ctx, admin, rc := integrationDeps(t)
 	cleanup := cleanupForTest(t, admin, rc)
-	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
+	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
 	mail := &captureMailer{messages: make(chan capturedMail, 8)}
 	svc := newAuthService(t, app, rc, mail)
 	registerAndVerify := func(email, password string) uuid.UUID {
@@ -1081,7 +1373,7 @@ func TestPublicTableRLSAllowlist(t *testing.T) {
 func TestAuthFlowsAndConcurrentRefreshRotation(t *testing.T) {
 	ctx, admin, rc := integrationDeps(t)
 	cleanup := cleanupForTest(t, admin, rc)
-	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
+	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
 	mail := &captureMailer{messages: make(chan capturedMail, 16)}
 	svc := newAuthService(t, app, rc, mail)
 	email := "flow-" + uuid.NewString() + "@example.test"
@@ -1190,8 +1482,8 @@ func (d siteFakeDNS) LookupIP(context.Context, string, string) ([]net.IP, error)
 func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 	ctx, admin, redisClient := integrationDeps(t)
 	cleanup := cleanupForTest(t, admin, redisClient)
-	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
-	worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"))
+	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
+	worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
 	mailer := &captureMailer{messages: make(chan capturedMail, 16)}
 	authSvc := newAuthService(t, app, redisClient, mailer)
 	register := func(label string) (uuid.UUID, uuid.UUID) {

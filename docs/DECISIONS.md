@@ -271,3 +271,11 @@ Integration test đối chiếu mọi hàm `SECURITY DEFINER` với allowlist n�
 - Tích hợp CP dùng UUID/email/hostname riêng cho mỗi lượt và dọn tenant/user, row phụ thuộc cùng Redis login throttle key bằng cleanup. CI giữ `-count=20` trên cùng service database để phát hiện phụ thuộc vào DB rỗng.
 - Proxy loopback test dùng DNS giả trả một IP tài liệu công khai và dialer riêng của test ánh xạ IP đã được netguard xác minh sang httptest origin. Cấu hình/env/snapshot production không có tùy chọn tắt guard; kiểm tra mặc định vẫn từ chối loopback, private, metadata, CGNAT và ULA.
 - **Chưa xác minh trên Linux:** sandbox hiện tại là Windows; `wsl.exe` và Docker daemon đều bị từ chối/không khả dụng, nên các test loopback và integration thật cần chạy lại trong WSL/CI.
+
+## P8a-fix-2 — dọn fixture cùng schema coverage
+
+- Integration cleanup chạy các lệnh xóa trong transaction quản trị duy nhất; từng lệnh giữ argument riêng và savepoint để gom mọi lỗi SQL, commit phần đã dọn rồi báo toàn bộ lỗi có câu SQL. Thứ tự xử lý con trước cha; role đăng nhập tạm được revoke/drop bằng cleanup riêng và lỗi được báo.
+- Schema test duyệt mọi bảng `public`: bảng có `tenant_id`, `user_id`, `actor_id` hoặc `created_by` phải nằm trong cleanup coverage; bảng toàn cục chưa có fixture key phải có allowlist và lý do (`plans`, `config_snapshots`, `edges`, `webhook_events`, `goose_db_version`).
+- `make check-generated` là cùng một cổng local/CI: gofmt không còn file, `go mod tidy`, `make gen`, `git diff --exit-code`; `make check-cp-sql` chạy riêng ngay sau trong CI.
+- **Chưa xác minh:** không truy cập được WSL/Linux, Docker/Postgres/Redis trong phiên này, nên không có kết quả `make check-generated` hay integration DB thật để xác nhận.
+- Local Windows đã xác nhận gofmt rỗng, `go mod tidy` exit 0, golangci-lint `0 issues`, `go vet`/`go build` exit 0 và integration package compile. Race cần CGO; `make` không cài; oapi/sqlc generation cùng govulncheck bị chặn bởi DNS; SQL checker/WSL bị `E_ACCESSDENIED`. Các kết quả này không thay thế chạy `make check-generated` và hai lượt Postgres integration trên Linux.

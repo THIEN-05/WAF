@@ -35,6 +35,7 @@ pkg/wafcore/ # DSL, snapshot schema, log schema, sign/verify edge/cmd/edge, edge
 12. Commit nhỏ, message dạng `phase-N: nội dung`. Cập nhật `docs/PROGRESS.md` cuối mỗi phase (làm xong gì, còn nợ gì, số đo benchmark thực).
 13. Không bịa số liệu hiệu năng; chỉ ghi số đo được.
 14. Khi một yêu cầu quá lớn, làm bản MVP chạy được trước và ghi TODO có đánh số vào `docs/PROGRESS.md`.
+15. Mọi thay đổi migration, query sqlc hoặc OpenAPI phải kèm mã sinh lại trong cùng commit. Trước khi kết thúc, chạy `make check-generated` (gofmt sạch, `go mod tidy`, `make gen`, `git diff --exit-code`); CI dùng cùng target.
 
 ## Lệnh chuẩn (Makefile)
 `make up` (docker compose dev), `make down`, `make test`, `make lint`, `make bench`, `make gen` (sqlc, oapi-codegen), `make migrate`.
