@@ -109,15 +109,19 @@ func (c *integrationCleanup) role(name, group string) {
 	c.roles = append(c.roles, cleanupRole{name: name, group: group})
 }
 func (c *integrationCleanup) run() {
-	c.runWithRoles(true)
+	c.runWithRolesAndPool(true, nil)
 }
 
 func (c *integrationCleanup) runFixtureRows() {
-	c.runWithRoles(false)
+	c.runWithRolesAndPool(false, nil)
 }
 
-func (c *integrationCleanup) runWithRoles(includeRoles bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+func (c *integrationCleanup) runFixtureRowsWithPool(pool *pgxpool.Pool) {
+	c.runWithRolesAndPool(false, pool)
+}
+
+func (c *integrationCleanup) runWithRolesAndPool(includeRoles bool, execPool *pgxpool.Pool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	var cleanupErrors []error
 	if c.redis != nil {
@@ -148,7 +152,10 @@ func (c *integrationCleanup) runWithRoles(includeRoles bool) {
 		}
 		return
 	}
-	tx, err := c.admin.Begin(ctx)
+	if execPool == nil {
+		execPool = c.admin
+	}
+	tx, err := execPool.Begin(ctx)
 	if err != nil {
 		cleanupErrors = append(cleanupErrors, fmt.Errorf("integration fixture cleanup begin: %w", err))
 		c.t.Errorf("integration fixture cleanup errors: %v", errors.Join(cleanupErrors...))
@@ -205,7 +212,6 @@ func fixtureCleanupStatements(tenants, users []uuid.UUID, roles []cleanupRole) [
 		{`DELETE FROM public.invitations WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
 		{`DELETE FROM public.subscriptions WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
 		{`DELETE FROM public.invoices WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
-		{`DELETE FROM public.audit_logs WHERE tenant_id=ANY($1::uuid[]) OR actor_id=ANY($2::uuid[])`, []any{tenants, users}},
 		{`DELETE FROM public.memberships WHERE tenant_id=ANY($1::uuid[]) OR user_id=ANY($2::uuid[])`, []any{tenants, users}},
 		{`DELETE FROM public.refresh_tokens WHERE user_id=ANY($1::uuid[])`, []any{users}},
 		{`DELETE FROM public.email_verification_tokens WHERE user_id=ANY($1::uuid[])`, []any{users}},
@@ -213,6 +219,7 @@ func fixtureCleanupStatements(tenants, users []uuid.UUID, roles []cleanupRole) [
 		{`DELETE FROM public.totp_recovery_codes WHERE user_id=ANY($1::uuid[])`, []any{users}},
 		{`DELETE FROM public.sites WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
 		{`UPDATE public.users SET default_tenant_id=NULL WHERE id=ANY($1::uuid[])`, []any{users}},
+		{`DELETE FROM public.audit_logs WHERE tenant_id=ANY($1::uuid[]) OR actor_id=ANY($2::uuid[])`, []any{tenants, users}},
 		{`DELETE FROM public.organizations WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
 		{`DELETE FROM public.users WHERE id=ANY($1::uuid[])`, []any{users}},
 	}
@@ -224,7 +231,33 @@ func fixtureCleanupStatements(tenants, users []uuid.UUID, roles []cleanupRole) [
 			cleanupStatement{`DROP ROLE IF EXISTS ` + ident, nil},
 		)
 	}
-	return statements
+	return orderAuditCleanupLastBeforeOrganization(statements)
+}
+
+func orderAuditCleanupLastBeforeOrganization(statements []cleanupStatement) []cleanupStatement {
+	audit := make([]cleanupStatement, 0, 1)
+	ordered := make([]cleanupStatement, 0, len(statements))
+	for _, statement := range statements {
+		if strings.HasPrefix(statement.sql, "DELETE FROM public.audit_logs ") {
+			audit = append(audit, statement)
+			continue
+		}
+		ordered = append(ordered, statement)
+	}
+	if len(audit) == 0 {
+		return ordered
+	}
+	insertAt := len(ordered)
+	for i, statement := range ordered {
+		if strings.HasPrefix(statement.sql, "DELETE FROM public.organizations ") {
+			insertAt = i
+			break
+		}
+	}
+	ordered = append(ordered, make([]cleanupStatement, len(audit))...)
+	copy(ordered[insertAt+len(audit):], ordered[insertAt:len(ordered)-len(audit)])
+	copy(ordered[insertAt:insertAt+len(audit)], audit)
+	return ordered
 }
 
 var cleanupTableCoverage = map[string]string{
@@ -269,6 +302,18 @@ var cleanupGlobalTableAllowlist = map[string]string{
 func TestIntegrationCleanupSchemaCoverage(t *testing.T) {
 	ctx, pool, _ := integrationDeps(t)
 	statements := fixtureCleanupStatements(nil, nil, nil)
+	auditIndex, organizationIndex := -1, -1
+	for i, statement := range statements {
+		if strings.HasPrefix(statement.sql, "DELETE FROM public.audit_logs ") {
+			auditIndex = i
+		}
+		if strings.HasPrefix(statement.sql, "DELETE FROM public.organizations ") {
+			organizationIndex = i
+		}
+	}
+	if auditIndex < 0 || organizationIndex != auditIndex+1 {
+		t.Fatalf("audit deletion must immediately precede organization deletion: audit=%d organization=%d", auditIndex, organizationIndex)
+	}
 	for table := range cleanupTableCoverage {
 		found := false
 		for _, statement := range statements {
@@ -342,10 +387,88 @@ func TestIntegrationCleanupSchemaCoverage(t *testing.T) {
 	}
 }
 
-func TestIntegrationCleanupRemovesFixtureRows(t *testing.T) {
+func TestIntegrationDatabaseIdentity(t *testing.T) {
+	ctx, pool, _ := integrationDeps(t)
+	var role string
+	var superuser bool
+	var pgVersion string
+	if err := pool.QueryRow(ctx, `SELECT current_user,r.rolsuper,version() FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`).Scan(&role, &superuser, &pgVersion); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Postgres integration connection: role=%s rolsuper=%t version=%s", role, superuser, pgVersion)
+}
+
+func TestZZIntegrationFixtureResidueBudget(t *testing.T) {
 	ctx, admin, rc := integrationDeps(t)
 	cleanup := cleanupForTest(t, admin, rc)
-	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
+	rows, err := admin.Query(ctx, `SELECT email FROM public.users WHERE
+      email ~ '^(integration-[0-9a-f-]+|security-[ab]-[0-9a-f-]+|bind-[ab](-not-used)?-[0-9a-f-]+|flow-[0-9a-f-]+|rotate-[0-9a-f-]+|site-race-[ab]-[0-9a-f-]+|cleanup-[0-9a-f-]+)@example[.]test$'
+      OR email ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@example[.]test$'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var email string
+		if err = rows.Scan(&email); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		cleanup.email(email)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	cleanup.runFixtureRows()
+	counts := make(map[string]int64)
+	for _, table := range []string{"users", "organizations", "sites", "domains", "audit_logs"} {
+		var count int64
+		if err = admin.QueryRow(ctx, `SELECT count(*) FROM `+pgx.Identifier{"public", table}.Sanitize()).Scan(&count); err != nil {
+			t.Fatalf("count residue in %s: %v", table, err)
+		}
+		counts[table] = count
+	}
+	t.Logf("integration DB residue after fixture purge: users=%d organizations=%d sites=%d domains=%d audit_logs=%d", counts["users"], counts["organizations"], counts["sites"], counts["domains"], counts["audit_logs"])
+	for table, count := range counts {
+		if count > 5 {
+			t.Errorf("integration database residue too high in %s: %d rows (limit 5)", table, count)
+		}
+	}
+}
+
+func TestAuditCleanupPlannerDefersAuditAfterNewTriggerTable(t *testing.T) {
+	statements := []cleanupStatement{
+		{`DELETE FROM public.audit_logs WHERE tenant_id=ANY($1::uuid[])`, []any{nil}},
+		{`DELETE FROM public.future_auth_rows WHERE tenant_id=ANY($1::uuid[])`, []any{nil}},
+		{`DELETE FROM public.organizations WHERE tenant_id=ANY($1::uuid[])`, []any{nil}},
+	}
+	ordered := orderAuditCleanupLastBeforeOrganization(statements)
+	if !strings.Contains(ordered[0].sql, "future_auth_rows") || !strings.Contains(ordered[1].sql, "audit_logs") || !strings.Contains(ordered[2].sql, "organizations") {
+		t.Fatalf("future trigger table must be deleted before its generated audit and tenant: %#v", ordered)
+	}
+}
+
+func TestIntegrationCleanupRemovesFixtureRows(t *testing.T) {
+	ctx, admin, rc := integrationDeps(t)
+	for _, mode := range []string{"superuser", "non_superuser_bypassrls"} {
+		t.Run(mode, func(t *testing.T) {
+			cleanup := cleanupForTest(t, admin, rc)
+			app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
+			cleanupPool := admin
+			if mode == "non_superuser_bypassrls" {
+				cleanupPool = nonSuperuserBypassPool(t, ctx, admin, os.Getenv("DATABASE_URL"))
+			}
+			userID, tenantID := seedCleanupFixture(t, ctx, admin, rc, app, cleanup)
+			cleanup.runFixtureRowsWithPool(cleanupPool)
+			cleanup.runFixtureRowsWithPool(cleanupPool)
+			assertNoFixtureRows(t, ctx, admin, userID, tenantID)
+		})
+	}
+}
+
+func seedCleanupFixture(t *testing.T, ctx context.Context, admin *pgxpool.Pool, rc *redis.Client, app *pgxpool.Pool, cleanup *integrationCleanup) (uuid.UUID, uuid.UUID) {
+	t.Helper()
 	mailer := &captureMailer{messages: make(chan capturedMail, 8)}
 	authSvc := newAuthService(t, app, rc, mailer)
 	email := "cleanup-" + uuid.NewString() + "@example.test"
@@ -360,11 +483,18 @@ func TestIntegrationCleanupRemovesFixtureRows(t *testing.T) {
 	if err := admin.QueryRow(ctx, `SELECT id,default_tenant_id FROM public.users WHERE email=$1`, email).Scan(&userID, &tenantID); err != nil {
 		t.Fatal(err)
 	}
+	verificationHash := sha256.Sum256([]byte(uuid.NewString()))
+	if _, err := admin.Exec(ctx, `INSERT INTO public.email_verification_tokens(id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4)`, uuid.New(), userID, verificationHash[:], time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("seed pending email-verification token for cleanup: %v", err)
+	}
 	session, err := authSvc.Login(ctx, email, "a correct horse battery staple", "integration-cleanup", "192.0.2.90", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = authSvc.RequestPasswordReset(ctx, email); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = authSvc.CreateTOTP(ctx, userID); err != nil {
 		t.Fatal(err)
 	}
 	sites := site.Service{Pool: app}
@@ -388,29 +518,36 @@ func TestIntegrationCleanupRemovesFixtureRows(t *testing.T) {
 	if session.RefreshToken == "" || proof.ID == uuid.Nil {
 		t.Fatal("fixture setup did not create auth/site/domain data")
 	}
-	for table, want := range map[string]int{"users": 1, "organizations": 1, "sites": 1, "domains": 1, "origins": 1, "config_change_outbox": 3, "refresh_tokens": 1, "password_reset_tokens": 1, "api_keys": 1, "invitations": 1} {
+	for _, check := range []struct {
+		table, column string
+		id            uuid.UUID
+		want          int
+	}{
+		{"users", "id", userID, 1}, {"organizations", "tenant_id", tenantID, 1},
+		{"sites", "tenant_id", tenantID, 1}, {"domains", "tenant_id", tenantID, 1},
+		{"origins", "tenant_id", tenantID, 1}, {"config_change_outbox", "tenant_id", tenantID, 3},
+		{"refresh_tokens", "user_id", userID, 1}, {"password_reset_tokens", "user_id", userID, 1},
+		{"email_verification_tokens", "user_id", userID, 1},
+		{"totp_recovery_codes", "user_id", userID, 10}, {"api_keys", "tenant_id", tenantID, 1},
+		{"invitations", "tenant_id", tenantID, 1}, {"audit_logs", "tenant_id", tenantID, 1},
+	} {
 		var count int
-		query := fmt.Sprintf(`SELECT count(*) FROM %s WHERE `, pgx.Identifier{"public", table}.Sanitize())
-		switch table {
-		case "users":
-			query += `id=$1`
-			err = admin.QueryRow(ctx, query, userID).Scan(&count)
-		case "organizations":
-			query += `tenant_id=$1`
-			err = admin.QueryRow(ctx, query, tenantID).Scan(&count)
-		default:
-			query += `tenant_id=$1`
-			err = admin.QueryRow(ctx, query, tenantID).Scan(&count)
+		query := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s=$1`, pgx.Identifier{"public", check.table}.Sanitize(), pgx.Identifier{check.column}.Sanitize())
+		if err := admin.QueryRow(ctx, query, check.id).Scan(&count); err != nil {
+			t.Fatalf("count fixture rows in %s: %v", check.table, err)
 		}
-		if err != nil {
-			t.Fatalf("count fixture rows in %s: %v", table, err)
-		}
-		if count < want {
-			t.Fatalf("fixture seeded %s rows=%d, want at least %d", table, count, want)
+		if count < check.want {
+			t.Fatalf("fixture seeded %s rows=%d, want at least %d", check.table, count, check.want)
 		}
 	}
-	cleanup.runFixtureRows()
-	assertNoFixtureRows(t, ctx, admin, userID, tenantID)
+	var recoveryInsertEvents int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM public.audit_logs WHERE tenant_id=$1 AND action='auth.totp_recovery_codes.insert'`, tenantID).Scan(&recoveryInsertEvents); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryInsertEvents != 10 {
+		t.Fatalf("recovery-code insert trigger generated %d audit rows, want 10", recoveryInsertEvents)
+	}
+	return userID, tenantID
 }
 
 func assertNoFixtureRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID, tenantID uuid.UUID) {
@@ -536,6 +673,52 @@ func workerRolePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url 
 	}
 	if !bypass || !member {
 		t.Fatalf("worker login must be a BYPASSRLS member: bypass=%v member=%v", bypass, member)
+	}
+	return p
+}
+
+func nonSuperuserBypassPool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, url string) *pgxpool.Pool {
+	t.Helper()
+	roleName := "waf_test_cleanup_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	ident := pgx.Identifier{roleName}.Sanitize()
+	if _, err := admin.Exec(ctx, `CREATE ROLE `+ident+` LOGIN BYPASSRLS PASSWORD 'test-cleanup-role-password'`); err != nil {
+		t.Fatalf("create cleanup login: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := admin.Exec(cleanupCtx, `DROP OWNED BY `+ident); err != nil {
+			t.Errorf("drop owned by cleanup login %s: %v", roleName, err)
+		}
+		if _, err := admin.Exec(cleanupCtx, `DROP ROLE IF EXISTS `+ident); err != nil {
+			t.Errorf("drop cleanup login %s: %v", roleName, err)
+		}
+	})
+	if _, err := admin.Exec(ctx, `GRANT USAGE ON SCHEMA public TO `+ident); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO `+ident); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.User, cfg.ConnConfig.Password = roleName, "test-cleanup-role-password"
+	p, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	if err = p.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var superuser, bypass bool
+	if err = p.QueryRow(ctx, `SELECT rolsuper,rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=current_user`).Scan(&superuser, &bypass); err != nil {
+		t.Fatal(err)
+	}
+	if superuser || !bypass {
+		t.Fatalf("cleanup role must be non-superuser BYPASSRLS: rolsuper=%v rolbypassrls=%v", superuser, bypass)
 	}
 	return p
 }

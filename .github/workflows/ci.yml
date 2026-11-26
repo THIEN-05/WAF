@@ -49,12 +49,12 @@ jobs:
           go test -tags=perf -count=30 -v ./edge/internal/waf -run '^(TestWAFParallel50GOMAXPROCSMatrix|TestWAFCleanFailClosedAtOnePWithCPUBackground)$'
         env:
           WAF_PERF_RUNNER: ${{ runner.name }}
-          WAF_PERF_RESULTS: ${{ runner.temp }}/waf-perf-results.json
+          WAF_PERF_RESULTS: edge/internal/waf/perf-results.json
       - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: waf-perf-results
-          path: ${{ runner.temp }}/waf-perf-results.json
+          path: edge/internal/waf/perf-results.json
 
   govulncheck:
     runs-on: ubuntu-latest
@@ -166,7 +166,23 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: PostgreSQL 18 auth and RLS integration (required, 20 runs)
+      - name: Report PostgreSQL role and version
+        run: go test -tags=integration -run '^TestIntegrationDatabaseIdentity$' -count=1 -v ./controlplane/internal/integration
+        env:
+          DATABASE_URL: postgres://waf:waf-test-password@127.0.0.1:5432/waf_test?sslmode=disable
+          REDIS_ADDR: 127.0.0.1:6379
+          REDIS_PASSWORD: ""
+          CP_INTEGRATION_REQUIRED: "1"
+      - name: PostgreSQL 18 auth and RLS integration (required, first 20 runs)
+        run: go test -tags=integration -race -count=20 -v ./controlplane/internal/integration
+        env:
+          DATABASE_URL: postgres://waf:waf-test-password@127.0.0.1:5432/waf_test?sslmode=disable
+          REDIS_ADDR: 127.0.0.1:6379
+          REDIS_PASSWORD: ""
+          MAILHOG_ADDR: 127.0.0.1:1025
+          MAILHOG_API_URL: http://127.0.0.1:8025/api/v2/messages
+          CP_INTEGRATION_REQUIRED: "1"
+      - name: PostgreSQL 18 auth and RLS integration (required, second 20 runs on same DB)
         run: go test -tags=integration -race -count=20 -v ./controlplane/internal/integration
         env:
           DATABASE_URL: postgres://waf:waf-test-password@127.0.0.1:5432/waf_test?sslmode=disable
@@ -177,6 +193,13 @@ jobs:
           CP_INTEGRATION_REQUIRED: "1"
       - name: Global hostname conflict race (required, 100 runs)
         run: go test -tags=integration -race -run '^TestSiteQuotaHostnameOwnershipAndStateIntegration/same_hostname_race_and_non_disclosing_conflict$' -count=100 ./controlplane/internal/integration
+        env:
+          DATABASE_URL: postgres://waf:waf-test-password@127.0.0.1:5432/waf_test?sslmode=disable
+          REDIS_ADDR: 127.0.0.1:6379
+          REDIS_PASSWORD: ""
+          CP_INTEGRATION_REQUIRED: "1"
+      - name: Assert integration fixture residue is small
+        run: go test -tags=integration -run '^TestZZIntegrationFixtureResidueBudget$' -count=1 -v ./controlplane/internal/integration
         env:
           DATABASE_URL: postgres://waf:waf-test-password@127.0.0.1:5432/waf_test?sslmode=disable
           REDIS_ADDR: 127.0.0.1:6379

@@ -10,6 +10,7 @@
 /web/out/
 /coverage.out
 /coverage.html
+/edge/internal/waf/perf-results.json
 /tmp/
 /test/corpus/external/
 /data/geoip/
