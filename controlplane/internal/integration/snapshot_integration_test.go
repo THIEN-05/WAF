@@ -360,6 +360,7 @@ func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
 	}
 	appSites := site.Service{Pool: app}
 	workerSites := site.Service{Pool: worker, VerificationCNAMEZone: "verify.example.net"}
+	const challengeKeyReference = "warning-challenge-key-reference"
 	makeVerifiedSite := func(name string) site.Site {
 		t.Helper()
 		created, err := appSites.Create(ctx, tenantID, userID, name)
@@ -368,6 +369,9 @@ func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
 		}
 		proof := addTestDomain(t, appSites, ctx, tenantID, userID, created.ID, name)
 		if _, err = appSites.AddOrigin(ctx, tenantID, userID, created.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.22")}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = admin.Exec(ctx, `INSERT INTO public.bot_settings(id,tenant_id,site_id,settings) VALUES($1,$2,$3,$4::jsonb)`, uuid.New(), tenantID, created.ID, `{"mode":"monitor","challenge_hmac_key_id":"`+challengeKeyReference+`"}`); err != nil {
 			t.Fatal(err)
 		}
 		if _, err = admin.Exec(ctx, `UPDATE public.domains SET next_verification_at=now()-interval '1 second' WHERE id=$1`, proof.ID); err != nil {
@@ -389,7 +393,7 @@ func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
 		}
 	}
 	const secretReference = "warning-secret-reference"
-	if _, err := admin.Exec(ctx, `INSERT INTO public.bot_settings(id,tenant_id,site_id,settings) VALUES($1,$2,$3,$4::jsonb)`, uuid.New(), tenantID, badModeSite.ID, `{"mode":"monitor","additional_secrets":{"tls":"`+secretReference+`"}}`); err != nil {
+	if _, err := admin.Exec(ctx, `UPDATE public.bot_settings SET settings=jsonb_set(settings,'{additional_secrets}','{"tls":"`+secretReference+`"}'::jsonb) WHERE site_id=$1 AND tenant_id=$2`, badModeSite.ID, tenantID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -430,6 +434,11 @@ func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
 	oldByID := make(map[string]wafcore.Site, len(oldSnapshot.Sites))
 	for _, oldSite := range oldSnapshot.Sites {
 		oldByID[oldSite.ID] = oldSite
+	}
+	for _, fixtureSite := range []site.Site{badRuleSite, badModeSite, badOriginSite, overQuotaSite, goodSite} {
+		if _, ok := oldByID[fixtureSite.ID.String()]; !ok {
+			t.Fatalf("valid baseline site %s was not included before introducing invalid config", fixtureSite.ID)
+		}
 	}
 	if _, err = admin.Exec(ctx, `INSERT INTO public.rules(id,tenant_id,site_id,expression,action,mode) VALUES($1,$2,$3,'invalid rule expression','block','enforce')`, uuid.New(), tenantID, badRuleSite.ID); err != nil {
 		t.Fatal(err)

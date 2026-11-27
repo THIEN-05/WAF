@@ -773,6 +773,13 @@ Lấy log còn thiếu cho từng run: `gh run list --commit <commit>`, sau đó
 - **Lưu ý quota:** theo `docs/control-plane.md` 5.3/5.8, snapshot builder cắt rules/policies vượt entitlement rồi phát phần còn lại; do đó fixture `warning-quota` được kiểm tra giữ site với 20 rule Pro, không tạo cảnh báo site-invalid. Không đổi hành vi đã chốt thành loại toàn site.
 - **Đã xác minh cục bộ (Windows):** `go test ./controlplane/internal/site` → PASS; `go test -tags=integration -run '^TestIntegrationHostnameFactoryRespectsDNSLimits$' ./controlplane/internal/integration` → PASS; integration compile `go test -tags=integration -run '^$' ./controlplane/internal/integration` → PASS, không chạy test dịch vụ.
 - **Chưa xác minh:** PostgreSQL/NATS integration, hai lượt `-race -count=20` cùng DB, full-repo race, CI GitHub và residue 0 sau sửa. WSL/Linux vẫn không truy cập được từ phiên này; cần chạy đầy đủ lệnh trong yêu cầu trên WSL.
+
+## P9a-fix-4 — last-good baseline đầy đủ
+
+- **Nguyên nhân gốc theo log và hợp đồng snapshot:** các fixture dùng gói Pro (entitlement `bot: js_challenge`) nhưng ban đầu không tạo `bot_settings.challenge_hmac_key_id`. `wafcore.Snapshot.Validate` yêu cầu key reference khi entitlement bật, nên builder loại fixture ngay ở lần build baseline. Sau đó test không thể yêu cầu giữ last-good cho site không hề được ký vào snapshot cũ. Không phải quyền `waf_worker`, `WarnSite`, NATS hay race; đây là dữ liệu baseline thiếu trường bắt buộc.
+- **Sửa test:** mọi site Pro do `makeVerifiedSite` tạo đều có bot settings monitor và challenge key reference hợp lệ trước build đầu. Test khẳng định cả năm site (gồm warning-good và các site sau sẽ hỏng) hiện diện trong last-good trước khi làm hỏng rule/bot mode/origin. Sau đó giữ nguyên yêu cầu fallback site cũ; cảnh báo vẫn được ghi bằng repository dùng pool `waf_worker`, và test ép lỗi ghi cảnh báo để xác nhận build vùng không bị lỗi.
+- **Đã xác minh trong phiên này (Windows):** `go test ./controlplane/internal/snapshot` → PASS; test hostname helper → PASS; integration compile → PASS; `git diff --check` sạch. Chưa có kết quả Postgres/NATS thật sau sửa.
+- **Chưa xác minh:** integration `-race -count=20` hai lần trên cùng DB, full race, residue 0 và CI GitHub; WSL trả `Wsl/E_ACCESSDENIED`. Cần chạy lại trên WSL trước khi xác nhận test sửa xong.
 ## P8-fix-5 — integration subtest isolation
 
 - Root cause: CI dùng `-run '^TestSiteQuotaHostnameOwnershipAndStateIntegration/same_hostname_race_and_non_disclosing_conflict$'`. Go gọi test cha nhưng lọc subtest quota; phần thân cha vẫn chạy tiếp và truy vấn site mà subtest quota lẽ ra tạo. Truy vấn tại dòng cũ 1736 nhận `pgx.ErrNoRows`, khớp log CI.
