@@ -6,10 +6,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,10 +19,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/wafplatform/controlplane/internal/fleet"
 	"github.com/example/wafplatform/controlplane/internal/platform/db"
 	platformnats "github.com/example/wafplatform/controlplane/internal/platform/nats"
 	"github.com/example/wafplatform/controlplane/internal/platform/secret"
 	"github.com/example/wafplatform/controlplane/internal/snapshot"
+	"github.com/google/uuid"
 )
 
 func main() {
@@ -132,16 +136,9 @@ func run() error {
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.Handle("GET /internal/snapshot", snapshot.EdgeHandler{Repository: repository, Objects: objects, Resolver: repository})
-	server := &http.Server{Addr: env("WORKER_ADDR", ":8082"), Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	certFile, keyFile, caFile := os.Getenv("WORKER_TLS_CERT_FILE"), os.Getenv("WORKER_TLS_KEY_FILE"), os.Getenv("EDGE_CLIENT_CA_FILE")
 	if certFile == "" || keyFile == "" || caFile == "" {
-		return errors.New("WORKER_TLS_CERT_FILE, WORKER_TLS_KEY_FILE, and EDGE_CLIENT_CA_FILE are required for internal snapshot mTLS")
+		return errors.New("WORKER_TLS_CERT_FILE, WORKER_TLS_KEY_FILE, and EDGE_CLIENT_CA_FILE are required for internal mTLS")
 	}
 	caPEM, err := readConfiguredFile(caFile)
 	if err != nil {
@@ -151,6 +148,75 @@ func run() error {
 	if !caPool.AppendCertsFromPEM(caPEM) {
 		return errors.New("EDGE_CLIENT_CA_FILE contains no valid certificates")
 	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	mux.Handle("GET /internal/snapshot", snapshot.EdgeHandler{Repository: repository, Objects: objects, Resolver: repository})
+	fleetService := fleet.Service{Pool: pool.Pool}
+	mux.HandleFunc("POST /internal/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
+			http.Error(w, "mTLS client certificate required", http.StatusUnauthorized)
+			return
+		}
+		edgeID, ok := edgeIDFromCertificate(r.TLS.PeerCertificates[0])
+		if !ok {
+			http.Error(w, "edge identity is invalid", http.StatusUnauthorized)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		var heartbeat fleet.Heartbeat
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&heartbeat); err != nil {
+			http.Error(w, "invalid heartbeat", http.StatusBadRequest)
+			return
+		}
+		if err := fleetService.Heartbeat(r.Context(), edgeID, r.TLS.PeerCertificates[0].SerialNumber.Text(16), heartbeat); err != nil {
+			if errors.Is(err, fleet.ErrEdgeCertificateRejected) {
+				http.Error(w, "edge certificate rejected", http.StatusUnauthorized)
+			} else {
+				http.Error(w, "heartbeat rejected", http.StatusConflict)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /internal/edges/renew", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
+			http.Error(w, "mTLS client certificate required", http.StatusUnauthorized)
+			return
+		}
+		peer := r.TLS.PeerCertificates[0]
+		edgeID, ok := edgeIDFromCertificate(peer)
+		if !ok {
+			http.Error(w, "edge identity is invalid", http.StatusUnauthorized)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		var request struct {
+			CSR string `json:"csr"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			http.Error(w, "invalid renewal request", http.StatusBadRequest)
+			return
+		}
+		registration, err := fleetService.RenewCertificate(r.Context(), edgeID, peer.SerialNumber.Text(16), []byte(request.CSR), caPEM)
+		if err != nil {
+			http.Error(w, "certificate renewal rejected", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		if err = json.NewEncoder(w).Encode(registration); err != nil {
+			log.Printf("edge certificate renewal response failed")
+		}
+	})
+	server := &http.Server{Addr: env("WORKER_ADDR", ":8082"), Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	server.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: caPool}
 	go func() {
 		<-ctx.Done()
@@ -158,12 +224,54 @@ func run() error {
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		providers := map[string]fleet.DNSProvider{"cloudflare": fleet.ProviderStub{Name: "cloudflare"}, "route53": fleet.ProviderStub{Name: "route53"}}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				_ = now
+				sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				if err := fleetService.SweepHealth(sweepCtx, providers, 90*time.Second, 3, 1); err != nil {
+					log.Printf("edge health sweep failed: %q", err.Error())
+				}
+				cancel()
+			}
+		}
+	}()
 	log.Printf("snapshot worker listening with mTLS on %s region=%q", server.Addr, region)
 	err = server.ListenAndServeTLS(certFile, keyFile)
 	if errors.Is(err, http.ErrServerClosed) {
 		return ctx.Err()
 	}
 	return err
+}
+
+func edgeIDFromCertificate(cert *x509.Certificate) (uuid.UUID, bool) {
+	if cert == nil {
+		return uuid.Nil, false
+	}
+	for _, identity := range cert.URIs {
+		if identity == nil || identity.Scheme != "spiffe" || identity.Host != "waf" {
+			continue
+		}
+		parsed, err := url.Parse(identity.String())
+		if err != nil {
+			continue
+		}
+		const prefix = "/edge/"
+		if len(parsed.Path) <= len(prefix) || parsed.Path[:len(prefix)] != prefix {
+			continue
+		}
+		id, err := uuid.Parse(parsed.Path[len(prefix):])
+		if err == nil && cert.Subject.CommonName == id.String() {
+			return id, true
+		}
+	}
+	return uuid.Nil, false
 }
 
 func readConfiguredFile(path string) ([]byte, error) {

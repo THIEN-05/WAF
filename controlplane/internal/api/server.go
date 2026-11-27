@@ -12,11 +12,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/example/wafplatform/controlplane/internal/auth"
 	"github.com/example/wafplatform/controlplane/internal/entitlement"
+	"github.com/example/wafplatform/controlplane/internal/fleet"
 	"github.com/example/wafplatform/controlplane/internal/platform/config"
 	"github.com/example/wafplatform/controlplane/internal/platform/db"
 	"github.com/example/wafplatform/controlplane/internal/platform/logger"
@@ -38,6 +40,8 @@ type Server struct {
 	private      ed25519.PrivateKey
 	tenant       tenant.Service
 	entitlements entitlement.Service
+	edges        fleet.Service
+	edgeCACert   []byte
 }
 
 func New(cfg config.Config, pool *db.Pool, rc *redis.Client, log *slog.Logger) (*Server, error) {
@@ -55,7 +59,35 @@ func New(cfg config.Config, pool *db.Pool, rc *redis.Client, log *slog.Logger) (
 	if err != nil || len(totpKey) < 32 {
 		return nil, errors.New("TOTP_ENCRYPTION_KEY must be base64 encoded and contain at least 32 bytes")
 	}
-	s := &Server{cfg: cfg, pool: pool, redis: rc, log: log, private: ed25519.PrivateKey(privateRaw), auth: auth.Service{Pool: pool.Pool, Redis: rc, Mailer: auth.SMTPMailer{Addr: cfg.SMTPAddr, From: cfg.SMTPFrom}, JWTPrivate: ed25519.PrivateKey(privateRaw), JWTKeyID: "cp-1", TOTPEncryptionKey: totpKey}, tenant: tenant.Service{Pool: pool.Pool}, entitlements: entitlement.Service{Pool: pool.Pool}}
+	var edgeCA *fleet.Authority
+	var edgeCACert []byte
+	if cfg.EdgeCACertFile != "" || cfg.EdgeCAKeyFile != "" {
+		if cfg.EdgeCACertFile == "" || cfg.EdgeCAKeyFile == "" {
+			return nil, errors.New("EDGE_CA_CERT_FILE and EDGE_CA_KEY_FILE must be configured together")
+		}
+		certPEM, readErr := os.ReadFile(cfg.EdgeCACertFile)
+		if readErr != nil {
+			return nil, errors.New("read edge CA certificate")
+		}
+		keyPEM, readErr := os.ReadFile(cfg.EdgeCAKeyFile)
+		if readErr != nil {
+			return nil, errors.New("read edge CA private key")
+		}
+		edgeCA, err = fleet.NewAuthorityFromPEM(certPEM, keyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("load edge CA: %w", err)
+		}
+		edgeCACert = certPEM
+	} else {
+		if strings.EqualFold(cfg.Environment, "production") {
+			return nil, errors.New("production requires EDGE_CA_CERT_FILE and EDGE_CA_KEY_FILE")
+		}
+		edgeCA, edgeCACert, err = fleet.NewDevelopmentAuthority(time.Now())
+		if err != nil {
+			return nil, err
+		}
+	}
+	s := &Server{cfg: cfg, pool: pool, redis: rc, log: log, private: ed25519.PrivateKey(privateRaw), auth: auth.Service{Pool: pool.Pool, Redis: rc, Mailer: auth.SMTPMailer{Addr: cfg.SMTPAddr, From: cfg.SMTPFrom}, JWTPrivate: ed25519.PrivateKey(privateRaw), JWTKeyID: "cp-1", TOTPEncryptionKey: totpKey}, tenant: tenant.Service{Pool: pool.Pool}, entitlements: entitlement.Service{Pool: pool.Pool}, edges: fleet.Service{Pool: pool.Pool, CA: edgeCA}, edgeCACert: edgeCACert}
 	return s, nil
 }
 func (s *Server) Router() http.Handler {
@@ -80,6 +112,7 @@ func (s *Server) Router() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready\n"))
 	})
+	r.With(func(next http.Handler) http.Handler { return middleware.RedisRateLimit(s.redis, 30, time.Minute, next) }).Post("/internal/edges/register", s.registerEdge)
 	r.Route("/v1", func(v chi.Router) {
 		v.Use(func(next http.Handler) http.Handler {
 			return middleware.RedisRateLimit(s.redis, 120, time.Minute, next)
@@ -240,6 +273,32 @@ func clientIP(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+func (s *Server) registerEdge(w http.ResponseWriter, r *http.Request) {
+	if r.TLS == nil {
+		problem.Write(w, r, http.StatusUpgradeRequired, "https_required", "Secure transport required", "Edge registration requires HTTPS")
+		return
+	}
+	var in struct {
+		Token string `json:"token"`
+		CSR   string `json:"csr"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	registration, err := s.edges.Register(r.Context(), in.Token, []byte(in.CSR), s.edgeCACert)
+	if err != nil {
+		if errors.Is(err, fleet.ErrBootstrapRejected) {
+			problem.Write(w, r, http.StatusUnauthorized, "bootstrap_rejected", "Registration rejected", "Bootstrap token is invalid, expired, or already used")
+			return
+		}
+		problem.Write(w, r, http.StatusBadRequest, "registration_rejected", "Registration rejected", "The CSR or registration request is invalid")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(registration)
 }
 
 type principal struct {

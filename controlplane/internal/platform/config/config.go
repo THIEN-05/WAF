@@ -10,6 +10,8 @@ import (
 type Config struct {
 	APIAddr, DatabaseURL, RedisAddr, RedisPassword, NATSURL string
 	SMTPAddr, SMTPFrom, JWTPrivateKey, TOTPKey              string
+	Environment, EdgeCACertFile, EdgeCAKeyFile              string
+	APITLSCertFile, APITLSKeyFile                           string
 	AllowedOrigins                                          []string
 	RedisDB                                                 int
 }
@@ -20,7 +22,9 @@ func Load() (Config, error) {
 		RedisAddr: env("REDIS_ADDR", "127.0.0.1:6379"), RedisPassword: os.Getenv("REDIS_PASSWORD"),
 		NATSURL: env("NATS_URL", "nats://127.0.0.1:4222"), SMTPAddr: env("SMTP_ADDR", "127.0.0.1:1025"),
 		SMTPFrom: env("SMTP_FROM", "no-reply@localhost"), JWTPrivateKey: os.Getenv("JWT_ED25519_PRIVATE_KEY"),
-		TOTPKey: os.Getenv("TOTP_ENCRYPTION_KEY"),
+		TOTPKey:     os.Getenv("TOTP_ENCRYPTION_KEY"),
+		Environment: env("APP_ENV", "development"), EdgeCACertFile: os.Getenv("EDGE_CA_CERT_FILE"), EdgeCAKeyFile: os.Getenv("EDGE_CA_KEY_FILE"),
+		APITLSCertFile: os.Getenv("API_TLS_CERT_FILE"), APITLSKeyFile: os.Getenv("API_TLS_KEY_FILE"),
 	}
 	if raw := os.Getenv("REDIS_DB"); raw != "" {
 		n, err := strconv.Atoi(raw)
