@@ -497,7 +497,7 @@ func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
 	for _, siteID := range []string{ids.badRule, ids.badMode, ids.badOrigin} {
 		var count int
 		var actualTenant, details string
-		if err = admin.QueryRow(ctx, `SELECT count(*),min(tenant_id)::text,min(details::text) FROM public.alerts WHERE tenant_id=$1 AND status='open' AND details->>'kind'='snapshot_site_invalid' AND details->>'site_id'=$2`, tenantID, siteID).Scan(&count, &actualTenant, &details); err != nil {
+		if err = admin.QueryRow(ctx, `SELECT count(*),min(tenant_id::text),min(details::text) FROM public.alerts WHERE tenant_id=$1 AND status='open' AND details->>'kind'='snapshot_site_invalid' AND details->>'site_id'=$2`, tenantID, siteID).Scan(&count, &actualTenant, &details); err != nil {
 			t.Fatal(err)
 		}
 		if count != 1 || actualTenant != tenantID.String() || !strings.Contains(details, siteID) || strings.Contains(details, secretReference) {
