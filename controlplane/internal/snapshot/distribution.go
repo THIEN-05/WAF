@@ -40,7 +40,7 @@ func (h EdgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	registeredEdge, region, err := h.Resolver.ResolveEdge(r.Context(), r.TLS.PeerCertificates[0])
-	if err != nil || registeredEdge != requestedEdge || !validRegion(region) {
+	if err != nil || registeredEdge != requestedEdge || !certificateNamesEdge(r.TLS.PeerCertificates[0], registeredEdge) || !validRegion(region) {
 		http.Error(w, "edge identity is not registered", http.StatusForbidden)
 		return
 	}
@@ -80,6 +80,26 @@ func (h EdgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+}
+
+func certificateNamesEdge(cert *x509.Certificate, edgeID string) bool {
+	if cert == nil || edgeID == "" {
+		return false
+	}
+	if cert.Subject.CommonName == edgeID {
+		return true
+	}
+	for _, name := range cert.DNSNames {
+		if name == edgeID {
+			return true
+		}
+	}
+	for _, uri := range cert.URIs {
+		if uri != nil && uri.Path == "/edges/"+edgeID {
+			return true
+		}
+	}
+	return false
 }
 
 type UpdateNotifier interface {

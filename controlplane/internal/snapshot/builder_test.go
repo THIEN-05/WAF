@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -182,18 +183,25 @@ func TestEdgeHandlerRequiresVerifiedMTLSAndSupportsSince(t *testing.T) {
 		t.Fatalf("without mTLS status=%d", rec.Code)
 	}
 	req = httptest.NewRequest(http.MethodGet, "/internal/snapshot?edge_id=edge-1&since=4", nil)
-	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{}}, VerifiedChains: [][]*x509.Certificate{{{}}}}
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Subject: pkix.Name{CommonName: "edge-1"}}}, VerifiedChains: [][]*x509.Certificate{{{}}}}
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || rec.Header().Get("ETag") != `"abc"` || rec.Body.String() != `{"signed":true}` {
 		t.Fatalf("snapshot response status=%d headers=%v body=%q", rec.Code, rec.Header(), rec.Body.String())
 	}
 	req = httptest.NewRequest(http.MethodGet, "/internal/snapshot?edge_id=edge-1&since=5", nil)
-	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{}}, VerifiedChains: [][]*x509.Certificate{{{}}}}
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Subject: pkix.Name{CommonName: "edge-1"}}}, VerifiedChains: [][]*x509.Certificate{{{}}}}
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotModified {
 		t.Fatalf("current version response status=%d", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/internal/snapshot?edge_id=edge-1&since=4", nil)
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Subject: pkix.Name{CommonName: "different-edge"}}}, VerifiedChains: [][]*x509.Certificate{{{}}}}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("certificate identity mismatch status=%d, want 403", rec.Code)
 	}
 }
 

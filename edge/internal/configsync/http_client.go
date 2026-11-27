@@ -163,8 +163,13 @@ func (h *HTTPClient) RenewCertificate(ctx context.Context, edgeID string, csr []
 	return cert, nil
 }
 func (h *HTTPClient) FetchSnapshot(ctx context.Context, edgeID string, since uint64, etag string) (SnapshotReply, error) {
-	_ = edgeID // the CP contract scopes the authenticated client identity to its edge
-	path := "/v1/snapshot?since=" + strconv.FormatUint(since, 10)
+	if edgeID == "" {
+		return SnapshotReply{}, errors.New("empty edge id")
+	}
+	query := url.Values{}
+	query.Set("since", strconv.FormatUint(since, 10))
+	query.Set("edge_id", edgeID)
+	path := "/internal/snapshot?" + query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.endpoint(path), nil)
 	if err != nil {
 		return SnapshotReply{}, err
