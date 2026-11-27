@@ -12,9 +12,31 @@ import (
 type Pool struct{ *pgxpool.Pool }
 
 func Open(ctx context.Context, databaseURL string) (*Pool, error) {
+	return open(ctx, databaseURL, "waf_api", false)
+}
+
+// OpenWorker accepts only a non-superuser login granted to the narrowly
+// privileged background role. It is not suitable for API traffic.
+func OpenWorker(ctx context.Context, databaseURL string) (*Pool, error) {
+	return open(ctx, databaseURL, "waf_worker", true)
+}
+
+func open(ctx context.Context, databaseURL, role string, allowBypass bool) (*Pool, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database config: %w", err)
+	}
+	if allowBypass {
+		previous := cfg.AfterConnect
+		cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			if previous != nil {
+				if err := previous(ctx, conn); err != nil {
+					return err
+				}
+			}
+			_, err := conn.Exec(ctx, `SET ROLE waf_worker`)
+			return err
+		}
 	}
 	cfg.MaxConns = 20
 	cfg.MinConns = 2
@@ -26,13 +48,17 @@ func Open(ctx context.Context, databaseURL string) (*Pool, error) {
 		p.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
-	var superuser, bypass, apiMember bool
-	if err := p.QueryRow(ctx, `SELECT r.rolsuper,r.rolbypassrls,pg_has_role(current_user,'waf_api','member') FROM pg_roles r WHERE r.rolname=current_user`).Scan(&superuser, &bypass, &apiMember); err != nil {
+	var sessionSuperuser, superuser, bypass, member bool
+	query := `SELECT (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname=session_user),r.rolsuper,r.rolbypassrls,pg_has_role(session_user,$1,'member') FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`
+	if err := p.QueryRow(ctx, query, role).Scan(&sessionSuperuser, &superuser, &bypass, &member); err != nil {
 		p.Close()
 		return nil, fmt.Errorf("inspect database role: %w", err)
 	}
-	if superuser || bypass || !apiMember {
+	if sessionSuperuser || superuser || !member || (!allowBypass && bypass) || (allowBypass && !bypass) {
 		p.Close()
+		if allowBypass {
+			return nil, fmt.Errorf("worker database URL must use a non-superuser login granted waf_worker (BYPASSRLS)")
+		}
 		return nil, fmt.Errorf("DATABASE_URL must use a non-superuser login with the waf_api role (NOBYPASSRLS)")
 	}
 	return &Pool{Pool: p}, nil

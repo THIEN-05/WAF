@@ -26,13 +26,14 @@ type GlobalConfig struct {
 }
 
 type Entitlements struct {
-	MaxRules       int  `json:"max_rules" yaml:"max_rules"`
-	MaxBodyBytes   int  `json:"max_body_bytes" yaml:"max_body_bytes"`
-	MaxRegexBytes  int  `json:"max_regex_bytes" yaml:"max_regex_bytes"`
-	MaxCounterKeys int  `json:"max_counter_keys" yaml:"max_counter_keys"`
-	BotJSChallenge bool `json:"bot_js_challenge" yaml:"bot_js_challenge"`
-	BotCaptcha     bool `json:"bot_captcha" yaml:"bot_captcha"`
-	VerifiedBots   bool `json:"verified_bots" yaml:"verified_bots"`
+	MaxRules             int  `json:"max_rules" yaml:"max_rules"`
+	MaxRateLimitPolicies int  `json:"max_rate_limit_policies,omitempty" yaml:"max_rate_limit_policies,omitempty"`
+	MaxBodyBytes         int  `json:"max_body_bytes" yaml:"max_body_bytes"`
+	MaxRegexBytes        int  `json:"max_regex_bytes" yaml:"max_regex_bytes"`
+	MaxCounterKeys       int  `json:"max_counter_keys" yaml:"max_counter_keys"`
+	BotJSChallenge       bool `json:"bot_js_challenge" yaml:"bot_js_challenge"`
+	BotCaptcha           bool `json:"bot_captcha" yaml:"bot_captcha"`
+	VerifiedBots         bool `json:"verified_bots" yaml:"verified_bots"`
 }
 
 type Site struct {
@@ -275,6 +276,9 @@ func (s Snapshot) Validate() error {
 		}
 		if site.Entitlements.MaxRules > 0 && len(site.Rules) > site.Entitlements.MaxRules {
 			errs = append(errs, fmt.Sprintf("%s.rules: %d rules exceed entitlement max_rules %d", p, len(site.Rules), site.Entitlements.MaxRules))
+		}
+		if site.Entitlements.MaxRateLimitPolicies > 0 && len(site.RateLimits) > site.Entitlements.MaxRateLimitPolicies {
+			errs = append(errs, fmt.Sprintf("%s.rate_limits: %d policies exceed entitlement max_rate_limit_policies %d", p, len(site.RateLimits), site.Entitlements.MaxRateLimitPolicies))
 		}
 		if site.Entitlements.MaxRegexBytes > 0 {
 			for j, r := range site.Rules {
