@@ -502,10 +502,7 @@ func seedCleanupFixture(t *testing.T, ctx context.Context, admin *pgxpool.Pool, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	proof, err := sites.AddDomain(ctx, tenantID, userID, createdSite.ID, "cleanup-"+strings.ReplaceAll(uuid.NewString(), "-", "")+".example.test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	proof := addTestDomain(t, sites, ctx, tenantID, userID, createdSite.ID, "cleanup")
 	if _, err = sites.AddOrigin(ctx, tenantID, userID, createdSite.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1690,6 +1687,79 @@ func registerSiteIntegrationUser(t *testing.T, ctx context.Context, admin *pgxpo
 	return userID, tenantID
 }
 
+func testHostname(prefix string) string {
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+	var clean strings.Builder
+	for _, r := range strings.ToLower(prefix) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			clean.WriteRune(r)
+		case clean.Len() > 0 && !strings.HasSuffix(clean.String(), "-"):
+			clean.WriteByte('-')
+		}
+	}
+	base := strings.Trim(clean.String(), "-")
+	if base == "" {
+		base = "test"
+	}
+	const maxPrefixBytes = 63 - 1 - 8
+	if len(base) > maxPrefixBytes {
+		base = strings.TrimRight(base[:maxPrefixBytes], "-")
+	}
+	if base == "" {
+		base = "test"
+	}
+	return base + "-" + suffix + ".example.test"
+}
+
+func assertTestHostname(t *testing.T, hostname string) {
+	t.Helper()
+	normalized, err := site.NormalizeHostname(hostname)
+	if err != nil {
+		t.Fatalf("invalid integration hostname %q: %v", hostname, err)
+	}
+	if len(normalized) > 253 {
+		t.Fatalf("integration hostname length=%d exceeds 253: %q", len(normalized), normalized)
+	}
+	for _, label := range strings.Split(normalized, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			t.Fatalf("integration hostname label length=%d outside 1..63: %q", len(label), label)
+		}
+	}
+}
+
+func addTestDomain(t *testing.T, service site.Service, ctx context.Context, tenantID, actor, siteID uuid.UUID, prefix string) site.DomainProof {
+	t.Helper()
+	hostname := testHostname(prefix)
+	assertTestHostname(t, hostname)
+	proof, err := service.AddDomain(ctx, tenantID, actor, siteID, hostname)
+	if err != nil {
+		t.Fatalf("add test domain %q: %v", hostname, err)
+	}
+	return proof
+}
+
+func TestIntegrationHostnameFactoryRespectsDNSLimits(t *testing.T) {
+	for _, prefix := range []string{"", "1numeric", "warning---rule", strings.Repeat("LongPrefix-", 20)} {
+		hostname := testHostname(prefix)
+		assertTestHostname(t, hostname)
+		label := strings.Split(hostname, ".")[0]
+		parts := strings.Split(label, "-")
+		suffix := parts[len(parts)-1]
+		if len(suffix) != 8 || strings.Trim(suffix, "0123456789abcdef") != "" {
+			t.Errorf("hostname %q lacks an 8-hex random suffix", hostname)
+		}
+	}
+	base := strings.TrimSuffix(testHostname("race"), ".example.test")
+	unicode := "B\u00dcCHER-" + base + ".EXAMPLE.TEST."
+	assertTestHostname(t, unicode)
+	canonical, err := site.NormalizeHostname(unicode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTestHostname(t, canonical)
+}
+
 func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 	t.Run("free_site_quota_serializes_concurrent_creates", func(t *testing.T) {
 		ctx, admin, app, rc, cleanup := siteIntegrationBase(t)
@@ -1751,7 +1821,9 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 				t.Fatalf("add origin before verification: %v", err)
 			}
 		}
-		unicodeHost := "B\u00dcCHER-" + suffix + ".EXAMPLE.TEST."
+		baseHost := strings.TrimSuffix(testHostname("race"), ".example.test")
+		unicodeHost := "B\u00dcCHER-" + baseHost + ".EXAMPLE.TEST."
+		assertTestHostname(t, unicodeHost)
 		canonicalHost, err := site.NormalizeHostname(unicodeHost)
 		if err != nil {
 			t.Fatal(err)
@@ -1760,6 +1832,7 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		assertTestHostname(t, punycodeHost)
 		start := make(chan struct{})
 		type result struct {
 			proof  site.DomainProof
@@ -1819,7 +1892,9 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 				t.Fatalf("site %s status after domain creation=%q err=%v, want %s", expected.siteID, status, err, expected.status)
 			}
 		}
-		if _, err := service.AddDomain(ctx, tenantA, userA, siteB.ID, "cross-tenant-"+suffix+".example.test"); !errors.Is(err, site.ErrSiteNotFound) {
+		crossTenantHost := testHostname("cross-tenant")
+		assertTestHostname(t, crossTenantHost)
+		if _, err := service.AddDomain(ctx, tenantA, userA, siteB.ID, crossTenantHost); !errors.Is(err, site.ErrSiteNotFound) {
 			t.Fatalf("cross-tenant site reference err=%v, want not found", err)
 		}
 		if _, err := service.AddOrigin(ctx, tenantA, userA, siteB.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); !errors.Is(err, site.ErrSiteNotFound) {
@@ -1860,10 +1935,7 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, loserSiteID).Scan(&loserStatus); err != nil || loserStatus != "pending_dns" {
 			t.Fatalf("site %s without verified domain status=%q err=%v, want pending_dns", loserSiteID, loserStatus, err)
 		}
-		expiredProof, err := service.AddDomain(ctx, tenantA, userA, siteA.ID, "expired-"+suffix+".example.test")
-		if err != nil {
-			t.Fatal(err)
-		}
+		expiredProof := addTestDomain(t, service, ctx, tenantA, userA, siteA.ID, "expired")
 		if _, err = admin.Exec(ctx, `UPDATE public.domains SET verification_expires_at=now()-interval '1 second' WHERE id=$1`, expiredProof.ID); err != nil {
 			t.Fatal(err)
 		}

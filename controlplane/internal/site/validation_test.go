@@ -112,6 +112,34 @@ func TestNormalizeHostnameUsesCanonicalIDNAKey(t *testing.T) {
 	}
 }
 
+func TestNormalizeHostnameRFC1035And1123Boundaries(t *testing.T) {
+	label63 := strings.Repeat("a", 63)
+	label64 := strings.Repeat("a", 64)
+	host253 := strings.Join([]string{label63, label63, label63, strings.Repeat("a", 61)}, ".")
+	host254 := strings.Join([]string{label63, label63, label63, strings.Repeat("a", 62)}, ".")
+	for _, valid := range []string{
+		label63 + ".test",
+		host253,
+		"1numeric-label.test",
+		"XN--BCHER-KVA.EXAMPLE.TEST.",
+	} {
+		if _, err := NormalizeHostname(valid); err != nil {
+			t.Errorf("rejected valid DNS boundary case %q: %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{
+		label64 + ".test",
+		host254,
+		"-leading.test",
+		"trailing-.test",
+		"xn--invalid-punycode-!",
+	} {
+		if _, err := NormalizeHostname(invalid); err == nil {
+			t.Errorf("accepted invalid DNS boundary case %q", invalid)
+		}
+	}
+}
+
 func TestMapDomainInsertErrorRequiresDomainConstraint(t *testing.T) {
 	domainDuplicate := &pgconn.PgError{Code: "23505", ConstraintName: "domains_hostname_key"}
 	if got := mapDomainInsertError(domainDuplicate); got != ErrHostnameUnavailable {

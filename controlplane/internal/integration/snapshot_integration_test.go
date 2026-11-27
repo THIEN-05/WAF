@@ -63,10 +63,7 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proof, err := service.AddDomain(ctx, tenantID, userID, created.ID, "snapshot-"+suffix+".example.test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	proof := addTestDomain(t, service, ctx, tenantID, userID, created.ID, "snapshot")
 	if _, err = service.AddOrigin(ctx, tenantID, userID, created.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); err != nil {
 		t.Fatal(err)
 	}
@@ -233,23 +230,23 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	}
 
 	edgeID := uuid.New()
-	caPool, clientCert, serial, err := testEdgeClientCertificate(t, edgeID.String(), time.Now().Add(-time.Minute), time.Now().Add(time.Hour))
+	caPool, clientCert, serial, err := testEdgeClientCertificate(t, edgeID.String(), time.Now().Add(-5*time.Minute), time.Now().Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !hasExtKeyUsage(clientCert.Leaf, x509.ExtKeyUsageClientAuth) || !contains(clientCert.Leaf.DNSNames, edgeID.String()) {
 		t.Fatal("test edge certificate must contain clientAuth EKU and the edge ID DNS SAN")
 	}
-	_, unknownSerialCert, unknownSerial, err := testEdgeClientCertificate(t, edgeID.String(), time.Now().Add(-time.Minute), time.Now().Add(time.Hour))
+	_, unknownSerialCert, unknownSerial, err := testEdgeClientCertificate(t, edgeID.String(), time.Now().Add(-5*time.Minute), time.Now().Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, expiredCert, _, err := testEdgeClientCertificate(t, edgeID.String(), time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+	_, expiredCert, _, err := testEdgeClientCertificate(t, edgeID.String(), time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	wrongEdgeID := uuid.New()
-	_, wrongNameCert, wrongNameSerial, err := testEdgeClientCertificate(t, "different-edge", time.Now().Add(-time.Minute), time.Now().Add(time.Hour))
+	_, wrongNameCert, wrongNameSerial, err := testEdgeClientCertificate(t, "different-edge", time.Now().Add(-5*time.Minute), time.Now().Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,11 +366,7 @@ func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
-		proof, err := appSites.AddDomain(ctx, tenantID, userID, created.ID, name+"-"+suffix+".example.test")
-		if err != nil {
-			t.Fatal(err)
-		}
+		proof := addTestDomain(t, appSites, ctx, tenantID, userID, created.ID, name)
 		if _, err = appSites.AddOrigin(ctx, tenantID, userID, created.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.22")}}); err != nil {
 			t.Fatal(err)
 		}
@@ -441,10 +434,10 @@ func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
 	if _, err = admin.Exec(ctx, `INSERT INTO public.rules(id,tenant_id,site_id,expression,action,mode) VALUES($1,$2,$3,'invalid rule expression','block','enforce')`, uuid.New(), tenantID, badRuleSite.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = admin.Exec(ctx, `INSERT INTO public.rules(id,tenant_id,site_id,expression,action,mode) VALUES($1,$2,$3,'true == true','block','unknown-mode')`, uuid.New(), tenantID, badModeSite.ID); err != nil {
+	if _, err = admin.Exec(ctx, `UPDATE public.origins SET url='://invalid-origin' WHERE site_id=$1 AND tenant_id=$2`, badOriginSite.ID, tenantID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = admin.Exec(ctx, `UPDATE public.origins SET url='://invalid-origin' WHERE site_id=$1 AND tenant_id=$2`, badOriginSite.ID, tenantID); err != nil {
+	if _, err = admin.Exec(ctx, `UPDATE public.bot_settings SET settings=jsonb_set(settings,'{mode}','"unknown-bot-mode"'::jsonb) WHERE site_id=$1 AND tenant_id=$2`, badModeSite.ID, tenantID); err != nil {
 		t.Fatal(err)
 	}
 	for run := 0; run < 2; run++ {
@@ -473,6 +466,21 @@ func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
 		if len(byID[overQuotaSite.ID.String()].Rules) != 20 {
 			t.Fatalf("Pro over-quota rules were not capped: got %d, want 20", len(byID[overQuotaSite.ID.String()].Rules))
 		}
+	}
+	failedWarnCtx, cancelWarnings := context.WithCancel(ctx)
+	cancelWarnings()
+	var forcedWarningError error
+	failedSinkBuilder := *builder
+	failedSinkBuilder.OnWarning = func(w snapshot.Warning) {
+		if w.SiteID != "" {
+			forcedWarningError = repository.WarnSite(failedWarnCtx, w.SiteID, w.Message)
+		}
+	}
+	if _, err = failedSinkBuilder.Build(ctx, region); err != nil {
+		t.Fatalf("warning sink failure poisoned the region snapshot: %v", err)
+	}
+	if forcedWarningError == nil {
+		t.Fatal("expected the canceled warning write to fail")
 	}
 	if len(warningWriteErrors) != 0 {
 		t.Fatalf("persist site warnings: %v", warningWriteErrors)
