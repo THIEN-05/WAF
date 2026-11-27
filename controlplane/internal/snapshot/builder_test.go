@@ -113,6 +113,25 @@ func TestBuilderCapsEntitlementsAndKeepsOnlyBrokenSitesFromLastGood(t *testing.T
 	}
 }
 
+func TestEntitlementCapsOnlyPublishChallengeKeyReferenceWhenEntitled(t *testing.T) {
+	free := testSite("free")
+	free.Bot.Mode = "challenge"
+	free.Secrets.ChallengeHMACKeyID = "free-key-reference"
+	applyEntitlementCaps(&free)
+	if free.Secrets.ChallengeHMACKeyID != "" || free.Bot.Mode != "monitor" {
+		t.Fatalf("Free entitlement retained unavailable challenge config: %+v", free)
+	}
+
+	pro := testSite("pro")
+	pro.Entitlements.BotJSChallenge = true
+	pro.Bot.Mode = "monitor"
+	pro.Secrets.ChallengeHMACKeyID = "pro-key-reference"
+	applyEntitlementCaps(&pro)
+	if pro.Secrets.ChallengeHMACKeyID != "pro-key-reference" {
+		t.Fatalf("entitled Pro snapshot lost challenge key reference: %+v", pro.Secrets)
+	}
+}
+
 type keyStore struct{ key []byte }
 
 func (k keyStore) Get(context.Context, string) ([]byte, error) {

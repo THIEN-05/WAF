@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,12 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	t.Cleanup(nc.Close)
 
 	userID, tenantID := registerSiteIntegrationUser(t, ctx, admin, app, redisClient, cleanup, "snapshot")
+	// Exercise Pro entitlements: the challenge key reference must be retained,
+	// and over-quota rules/policies must be trimmed to the Pro limits.
+	tag, err := admin.Exec(ctx, `UPDATE public.subscriptions SET plan_id=(SELECT id FROM public.plans WHERE code='pro') WHERE tenant_id=$1 AND status='active'`, tenantID)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("set snapshot fixture plan to Pro: rows=%d err=%v", tag.RowsAffected(), err)
+	}
 	service := site.Service{Pool: app}
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
 	created, err := service.Create(ctx, tenantID, userID, "snapshot-"+suffix)
@@ -72,12 +79,12 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	}
 	// Seed over-quota config and secret references. The literal secret values
 	// exist only in the test SecretStore; snapshot fields contain references.
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 22; i++ {
 		if _, err = admin.Exec(ctx, `INSERT INTO public.rules(id,tenant_id,site_id,priority,expression,action,mode) VALUES($1,$2,$3,$4,'true == true','log','enforce')`, uuid.New(), tenantID, created.ID, i); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 6; i++ {
 		if _, err = admin.Exec(ctx, `INSERT INTO public.rate_limit_policies(id,tenant_id,site_id,match_expr,key_expr,request_limit,window_seconds,action) VALUES($1,$2,$3,'true == true','ip',10,60,'block')`, uuid.New(), tenantID, created.ID); err != nil {
 			t.Fatal(err)
 		}
@@ -190,7 +197,7 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 			included = &verified.Sites[i]
 		}
 	}
-	if included == nil || len(included.Rules) != 3 || len(included.RateLimits) != 1 {
+	if included == nil || len(included.Rules) != 20 || len(included.RateLimits) != 5 {
 		t.Fatalf("snapshot entitlement trim site=%+v", included)
 	}
 	for _, rule := range included.Rules {
@@ -230,27 +237,62 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !hasExtKeyUsage(clientCert.Leaf, x509.ExtKeyUsageClientAuth) || !contains(clientCert.Leaf.DNSNames, edgeID.String()) {
+		t.Fatal("test edge certificate must contain clientAuth EKU and the edge ID DNS SAN")
+	}
+	_, unknownSerialCert, unknownSerial, err := testEdgeClientCertificate(t, edgeID.String(), time.Now().Add(-time.Minute), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, expiredCert, _, err := testEdgeClientCertificate(t, edgeID.String(), time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongEdgeID := uuid.New()
+	_, wrongNameCert, wrongNameSerial, err := testEdgeClientCertificate(t, "different-edge", time.Now().Add(-time.Minute), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cert := range []tls.Certificate{unknownSerialCert, expiredCert, wrongNameCert} {
+		ca, parseErr := x509.ParseCertificate(cert.Certificate[1])
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		caPool.AddCert(ca)
+	}
 	if _, err = admin.Exec(ctx, `INSERT INTO public.edges(id,region,provider,status,cert_serial) VALUES($1,$2,'integration','ready',$3)`, edgeID, region, serial); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = admin.Exec(ctx, `INSERT INTO public.edges(id,region,provider,status,cert_serial) VALUES($1,$2,'integration','ready',$3)`, wrongEdgeID, region, wrongNameSerial); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), `DELETE FROM public.edges WHERE id=$1`, edgeID) })
+	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), `DELETE FROM public.edges WHERE id=$1`, wrongEdgeID) })
 	endpoint := snapshot.EdgeHandler{Repository: repository, Objects: objects, Resolver: repository}
 	server := httptest.NewUnstartedServer(endpoint)
 	server.TLS = &tls.Config{MinVersion: tls.VersionTLS12, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: caPool}
 	server.StartTLS()
 	t.Cleanup(server.Close)
-	client := server.Client()
-	transport := client.Transport.(*http.Transport).Clone()
-	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
-	transport.TLSClientConfig.Certificates = []tls.Certificate{clientCert}
-	client.Transport = transport
-	t.Cleanup(client.CloseIdleConnections)
-	requestSnapshot := func(query string) (*http.Response, []byte, error) {
-		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/internal/snapshot?edge_id="+edgeID.String()+query, nil)
+	serverCert := server.Certificate()
+	if serverCert == nil || !hasExtKeyUsage(serverCert, x509.ExtKeyUsageServerAuth) || len(serverCert.IPAddresses) == 0 {
+		t.Fatal("test CP certificate must contain serverAuth EKU and an IP SAN")
+	}
+	clientFor := func(certs ...tls.Certificate) *http.Client {
+		client := server.Client()
+		transport := client.Transport.(*http.Transport).Clone()
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+		transport.TLSClientConfig.Certificates = certs
+		client.Transport = transport
+		t.Cleanup(client.CloseIdleConnections)
+		return client
+	}
+	client := clientFor(clientCert)
+	requestSnapshotWith := func(testClient *http.Client, requestedEdge string, query string) (*http.Response, []byte, error) {
+		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/internal/snapshot?edge_id="+requestedEdge+query, nil)
 		if requestErr != nil {
 			return nil, nil, requestErr
 		}
-		response, requestErr := client.Do(request)
+		response, requestErr := testClient.Do(request)
 		if requestErr != nil {
 			return nil, nil, requestErr
 		}
@@ -260,6 +302,9 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 			return response, nil, readErr
 		}
 		return response, body, closeErr
+	}
+	requestSnapshot := func(query string) (*http.Response, []byte, error) {
+		return requestSnapshotWith(client, edgeID.String(), query)
 	}
 	response, body, err := requestSnapshot("&since=0")
 	if err != nil || response.StatusCode != http.StatusOK || response.Header.Get("ETag") != `"`+record.Checksum+`"` || !bytes.Equal(body, signed) {
@@ -275,7 +320,177 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	if err != nil || response.StatusCode != http.StatusBadRequest || bytes.Contains(internalBody, []byte(serial)) {
 		t.Fatalf("invalid since response status=%v body=%q err=%v", response.StatusCode, internalBody, err)
 	}
+	response, _, err = requestSnapshotWith(client, uuid.NewString(), "&since=0")
+	if err != nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("client-supplied mismatched edge_id status=%v err=%v, want 403", response.StatusCode, err)
+	}
+	wrongNameClient := clientFor(wrongNameCert)
+	response, _, err = requestSnapshotWith(wrongNameClient, wrongEdgeID.String(), "&since=0")
+	if err != nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("edge certificate CN/SAN mismatch status=%v err=%v, want 403", response.StatusCode, err)
+	}
+	unknownSerialClient := clientFor(unknownSerialCert)
+	response, _, err = requestSnapshotWith(unknownSerialClient, edgeID.String(), "&since=0")
+	if err != nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("unregistered client certificate serial=%s status=%v err=%v, want 403", unknownSerial, response.StatusCode, err)
+	}
+	if _, err = admin.Exec(ctx, `UPDATE public.edges SET status='revoked' WHERE id=$1`, edgeID); err != nil {
+		t.Fatal(err)
+	}
+	response, _, err = requestSnapshot("&since=0")
+	if err != nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("revoked client certificate status=%v err=%v, want 403", response.StatusCode, err)
+	}
+	noCertClient := clientFor()
+	if _, _, err = requestSnapshotWith(noCertClient, edgeID.String(), "&since=0"); err == nil {
+		t.Fatal("mTLS endpoint accepted a connection without a client certificate")
+	}
+	expiredClient := clientFor(expiredCert)
+	if _, _, err = requestSnapshotWith(expiredClient, edgeID.String(), "&since=0"); err == nil {
+		t.Fatal("mTLS endpoint accepted an expired client certificate")
+	}
 	t.Logf("snapshot build-to-edge-apply elapsed=%s (PostgreSQL/NATS real services, local in-process HTTP listener)", time.Since(started))
+}
+
+func TestSnapshotWarnSiteIsolatedAndPersistedIntegration(t *testing.T) {
+	ctx, admin, redisClient := integrationDeps(t)
+	cleanup := cleanupForTest(t, admin, redisClient)
+	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
+	worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
+	userID, tenantID := registerSiteIntegrationUser(t, ctx, admin, app, redisClient, cleanup, "snapshot-warning")
+	if _, err := admin.Exec(ctx, `UPDATE public.subscriptions SET plan_id=(SELECT id FROM public.plans WHERE code='pro') WHERE tenant_id=$1 AND status='active'`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	appSites := site.Service{Pool: app}
+	workerSites := site.Service{Pool: worker, VerificationCNAMEZone: "verify.example.net"}
+	makeVerifiedSite := func(name string) site.Site {
+		t.Helper()
+		created, err := appSites.Create(ctx, tenantID, userID, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+		proof, err := appSites.AddDomain(ctx, tenantID, userID, created.ID, name+"-"+suffix+".example.test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = appSites.AddOrigin(ctx, tenantID, userID, created.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.22")}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = admin.Exec(ctx, `UPDATE public.domains SET next_verification_at=now()-interval '1 second' WHERE id=$1`, proof.ID); err != nil {
+			t.Fatal(err)
+		}
+		if verified, verifyErr := workerSites.VerifyDueDomains(ctx, siteFakeDNS{records: []string{proof.Token}}, time.Now(), 10); verifyErr != nil || verified != 1 {
+			t.Fatalf("verify %s domain count=%d err=%v", name, verified, verifyErr)
+		}
+		return created
+	}
+	badRuleSite := makeVerifiedSite("warning-rule-" + strings.ReplaceAll(uuid.NewString(), "-", ""))
+	badModeSite := makeVerifiedSite("warning-mode-" + strings.ReplaceAll(uuid.NewString(), "-", ""))
+	badOriginSite := makeVerifiedSite("warning-origin-" + strings.ReplaceAll(uuid.NewString(), "-", ""))
+	overQuotaSite := makeVerifiedSite("warning-quota-" + strings.ReplaceAll(uuid.NewString(), "-", ""))
+	goodSite := makeVerifiedSite("warning-good-" + strings.ReplaceAll(uuid.NewString(), "-", ""))
+	for i := 0; i < 22; i++ {
+		if _, err := admin.Exec(ctx, `INSERT INTO public.rules(id,tenant_id,site_id,priority,expression,action,mode) VALUES($1,$2,$3,$4,'true == true','block','enforce')`, uuid.New(), tenantID, overQuotaSite.ID, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const secretReference = "warning-secret-reference"
+	if _, err := admin.Exec(ctx, `INSERT INTO public.bot_settings(id,tenant_id,site_id,settings) VALUES($1,$2,$3,$4::jsonb)`, uuid.New(), tenantID, badModeSite.ID, `{"mode":"monitor","additional_secrets":{"tls":"`+secretReference+`"}}`); err != nil {
+		t.Fatal(err)
+	}
+
+	repository := snapshot.PostgresRepository{Pool: worker}
+	objects := snapshot.FileObjects{Root: t.TempDir()}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := secret.NewMemory()
+	const kid = "warning-test-kid"
+	if err = store.Put(ctx, "snapshot-signing/"+kid, privateKey); err != nil {
+		t.Fatal(err)
+	}
+	region := "warn-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	t.Cleanup(func() {
+		_, _ = admin.Exec(context.Background(), `DELETE FROM public.config_snapshots WHERE scope=$1`, region)
+	})
+	type warningSiteIDs struct{ badRule, badMode, badOrigin string }
+	ids := warningSiteIDs{badRuleSite.ID.String(), badModeSite.ID.String(), badOriginSite.ID.String()}
+	var warningWriteErrors []error
+	builder := &snapshot.Builder{Repository: repository, Objects: objects, Signer: snapshot.SecretSigner{Store: store, KeyID: kid}, PublicKeys: map[string]ed25519.PublicKey{kid: publicKey}, OnWarning: func(w snapshot.Warning) {
+		if w.SiteID == "" {
+			return
+		}
+		if warnErr := repository.WarnSite(ctx, w.SiteID, w.Message); warnErr != nil {
+			warningWriteErrors = append(warningWriteErrors, warnErr)
+		}
+	}}
+	first, err := builder.Build(ctx, region)
+	if err != nil {
+		t.Fatalf("initial snapshot build: %v", err)
+	}
+	oldSnapshot, err := wafcore.VerifySnapshot(first.Signed, builder.PublicKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldByID := make(map[string]wafcore.Site, len(oldSnapshot.Sites))
+	for _, oldSite := range oldSnapshot.Sites {
+		oldByID[oldSite.ID] = oldSite
+	}
+	if _, err = admin.Exec(ctx, `INSERT INTO public.rules(id,tenant_id,site_id,expression,action,mode) VALUES($1,$2,$3,'invalid rule expression','block','enforce')`, uuid.New(), tenantID, badRuleSite.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = admin.Exec(ctx, `INSERT INTO public.rules(id,tenant_id,site_id,expression,action,mode) VALUES($1,$2,$3,'true == true','block','unknown-mode')`, uuid.New(), tenantID, badModeSite.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = admin.Exec(ctx, `UPDATE public.origins SET url='://invalid-origin' WHERE site_id=$1 AND tenant_id=$2`, badOriginSite.ID, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	for run := 0; run < 2; run++ {
+		record, buildErr := builder.Build(ctx, region)
+		if buildErr != nil {
+			t.Fatalf("site-local warning build %d failed region-wide: %v", run, buildErr)
+		}
+		built, verifyErr := wafcore.VerifySnapshot(record.Signed, builder.PublicKeys)
+		if verifyErr != nil {
+			t.Fatal(verifyErr)
+		}
+		byID := make(map[string]wafcore.Site, len(built.Sites))
+		for _, actual := range built.Sites {
+			byID[actual.ID] = actual
+		}
+		for _, siteID := range []string{ids.badRule, ids.badMode, ids.badOrigin} {
+			oldSite, oldOK := oldByID[siteID]
+			actual, actualOK := byID[siteID]
+			if !oldOK || !actualOK || !reflect.DeepEqual(actual, oldSite) {
+				t.Fatalf("site %s was not retained from last-good after invalid config: present=%v snapshot=%+v", siteID, actualOK, actual)
+			}
+		}
+		if _, ok := byID[goodSite.ID.String()]; !ok {
+			t.Fatalf("unaffected site %s was lost", goodSite.ID)
+		}
+		if len(byID[overQuotaSite.ID.String()].Rules) != 20 {
+			t.Fatalf("Pro over-quota rules were not capped: got %d, want 20", len(byID[overQuotaSite.ID.String()].Rules))
+		}
+	}
+	if len(warningWriteErrors) != 0 {
+		t.Fatalf("persist site warnings: %v", warningWriteErrors)
+	}
+	for _, siteID := range []string{ids.badRule, ids.badMode, ids.badOrigin} {
+		var count int
+		var actualTenant, details string
+		if err = admin.QueryRow(ctx, `SELECT count(*),min(tenant_id)::text,min(details::text) FROM public.alerts WHERE tenant_id=$1 AND status='open' AND details->>'kind'='snapshot_site_invalid' AND details->>'site_id'=$2`, tenantID, siteID).Scan(&count, &actualTenant, &details); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 || actualTenant != tenantID.String() || !strings.Contains(details, siteID) || strings.Contains(details, secretReference) {
+			t.Fatalf("site warning count=%d tenant=%q details=%q", count, actualTenant, details)
+		}
+	}
+	var alertCount int
+	if err = admin.QueryRow(ctx, `SELECT count(*) FROM public.alerts WHERE tenant_id=$1 AND status='open' AND details->>'kind'='snapshot_site_invalid'`, tenantID).Scan(&alertCount); err != nil || alertCount != 3 {
+		t.Fatalf("site warning count=%d err=%v, want exactly 3 distinct invalid sites", alertCount, err)
+	}
 }
 
 func TestSnapshotConcurrentReservationsAreGlobalAndStalePublishIsRejectedIntegration(t *testing.T) {
@@ -377,3 +592,24 @@ func testEdgeClientCertificate(t *testing.T, commonName string, notBefore, notAf
 }
 
 func jsonNumber(value uint64) string { return strconv.FormatUint(value, 10) }
+
+func hasExtKeyUsage(cert *x509.Certificate, want x509.ExtKeyUsage) bool {
+	if cert == nil {
+		return false
+	}
+	for _, usage := range cert.ExtKeyUsage {
+		if usage == want {
+			return true
+		}
+	}
+	return false
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
