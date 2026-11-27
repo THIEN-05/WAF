@@ -146,7 +146,11 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
+	var fixtureWarnings []string
 	builder := &snapshot.Builder{Repository: repository, Objects: objects, Signer: snapshot.SecretSigner{Store: store, KeyID: keyID}, PublicKeys: map[string]ed25519.PublicKey{keyID: publicKey}, OnWarning: func(w snapshot.Warning) {
+		if w.SiteID == created.ID.String() {
+			fixtureWarnings = append(fixtureWarnings, w.Message)
+		}
 		if w.SiteID != "" {
 			if warnErr := repository.WarnSite(ctx, w.SiteID, w.Message); warnErr != nil {
 				t.Errorf("persist site snapshot warning: %v", warnErr)
@@ -156,6 +160,9 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	record, err := builder.Build(ctx, region)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(fixtureWarnings) != 0 {
+		t.Fatalf("valid fixture site was rejected from snapshot: %v", fixtureWarnings)
 	}
 	var storedCount int
 	if err = admin.QueryRow(ctx, `SELECT count(*) FROM public.config_snapshots WHERE scope=$1 AND version=$2 AND rollout_state='active'`, region, record.Version).Scan(&storedCount); err != nil || storedCount != 1 {
@@ -185,6 +192,11 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	}
 	if included == nil || len(included.Rules) != 3 || len(included.RateLimits) != 1 {
 		t.Fatalf("snapshot entitlement trim site=%+v", included)
+	}
+	for _, rule := range included.Rules {
+		if rule.Mode != "" {
+			t.Fatalf("database enforce mode must map to wafcore default enforcement, rule=%+v", rule)
+		}
 	}
 	if !strings.Contains(included.Secrets.ChallengeHMACKeyID, "reference") || len(included.Secrets.OriginCredentialIDs) != 1 || included.Secrets.OriginCredentialIDs[0] != "origin-credential-reference" {
 		t.Fatalf("snapshot secret fields should be references only: %+v", included.Secrets)

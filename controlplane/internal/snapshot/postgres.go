@@ -158,6 +158,10 @@ func (p PostgresRepository) loadSite(ctx context.Context, tx pgx.Tx, id, tenantI
 			rows.Close()
 			return site, err
 		}
+		// The database stores the full rule execution mode ("enforce" or
+		// "log"), while wafcore uses an empty mode for normal enforcement and
+		// "log" only for monitor-only rules.
+		rule.Mode = ruleModeFromDatabase(rule.Mode)
 		rule.ExpiresAt = expires
 		var actionParams map[string]string
 		if err = json.Unmarshal([]byte(params), &actionParams); err != nil {
@@ -260,6 +264,13 @@ func (p PostgresRepository) loadSite(ctx context.Context, tx pgx.Tx, id, tenantI
 		return site, fmt.Errorf("site has no origin")
 	}
 	return site, nil
+}
+
+func ruleModeFromDatabase(mode string) string {
+	if mode == "enforce" {
+		return ""
+	}
+	return mode
 }
 
 func (p PostgresRepository) Latest(ctx context.Context, region string) (Record, error) {
@@ -373,7 +384,7 @@ func (p PostgresRepository) WarnSite(ctx context.Context, siteID, message string
 		return err
 	}
 	_, err = p.Pool.Exec(ctx, `INSERT INTO public.alerts(id,tenant_id,status,details)
-SELECT $1,s.tenant_id,'open',jsonb_build_object('kind','snapshot_site_invalid','site_id',s.id::text,'message',$3)
+SELECT $1,s.tenant_id,'open',jsonb_build_object('kind','snapshot_site_invalid','site_id',s.id::text,'message',$3::text)
 FROM public.sites s WHERE s.id=$2 AND NOT EXISTS (
   SELECT 1 FROM public.alerts a WHERE a.tenant_id=s.tenant_id AND a.status='open'
     AND a.details->>'kind'='snapshot_site_invalid' AND a.details->>'site_id'=s.id::text
