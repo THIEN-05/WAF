@@ -402,7 +402,7 @@ func TestZZIntegrationFixtureResidueBudget(t *testing.T) {
 	ctx, admin, rc := integrationDeps(t)
 	cleanup := cleanupForTest(t, admin, rc)
 	rows, err := admin.Query(ctx, `SELECT email FROM public.users WHERE
-      email ~ '^(integration-[0-9a-f-]+|security-[ab]-[0-9a-f-]+|bind-[ab](-not-used)?-[0-9a-f-]+|flow-[0-9a-f-]+|rotate-[0-9a-f-]+|site-race-[ab]-[0-9a-f-]+|cleanup-[0-9a-f-]+)@example[.]test$'
+      email ~ '^(integration-[0-9a-f-]+|security-[ab]-[0-9a-f-]+|bind-[ab](-not-used)?-[0-9a-f-]+|flow-[0-9a-f-]+|rotate-[0-9a-f-]+|site-race-[ab]-[0-9a-f-]+|site-quota-[0-9a-f-]+|site-state-[0-9a-f-]+|cleanup-[0-9a-f-]+)@example[.]test$'
       OR email ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@example[.]test$'`)
 	if err != nil {
 		t.Fatal(err)
@@ -431,8 +431,8 @@ func TestZZIntegrationFixtureResidueBudget(t *testing.T) {
 	}
 	t.Logf("integration DB residue after fixture purge: users=%d organizations=%d sites=%d domains=%d audit_logs=%d", counts["users"], counts["organizations"], counts["sites"], counts["domains"], counts["audit_logs"])
 	for table, count := range counts {
-		if count > 5 {
-			t.Errorf("integration database residue too high in %s: %d rows (limit 5)", table, count)
+		if count != 0 {
+			t.Errorf("integration database residue remains in %s: %d rows (want 0)", table, count)
 		}
 	}
 }
@@ -1130,7 +1130,7 @@ func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 		}
 	}
 
-	t.Run("user_scope_and_sensitive_table_denials", func(t *testing.T) {
+	{
 		var noUserContext int
 		if e := app.QueryRow(ctx, `SELECT count(id) FROM public.users`).Scan(&noUserContext); e != nil {
 			t.Fatalf("missing app.user_id should not error: %v", e)
@@ -1198,9 +1198,9 @@ func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 		if _, e := app.Exec(ctx, `UPDATE public.email_verification_tokens SET used_at=now() WHERE user_id=$1`, userB); e == nil {
 			t.Fatal("API updated another user's verification token")
 		}
-	})
+	}
 
-	t.Run("function_owner_search_path_and_column_privileges", func(t *testing.T) {
+	{
 		var unsafe int
 		if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace JOIN pg_catalog.pg_roles r ON r.oid=p.proowner WHERE n.nspname='public' AND p.prosecdef AND (r.rolname<>'waf_worker' OR r.rolsuper OR NOT r.rolbypassrls OR NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(p.proconfig) AS cfg(setting) WHERE cfg.setting LIKE 'search_path=pg_catalog, public%'))`).Scan(&unsafe); err != nil {
 			t.Fatal(err)
@@ -1246,8 +1246,8 @@ func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 		if auditEvents == 0 {
 			t.Fatal("credential mutations did not emit audit events")
 		}
-	})
-	t.Run("invitation_token_and_narrow_member_directory", func(t *testing.T) {
+	}
+	{
 		tenantService := tenant.Service{Pool: app}
 		invitation, e := tenantService.Invite(ctx, sessionA.TenantID, userA, emailB, tenant.Viewer)
 		if e != nil {
@@ -1293,7 +1293,7 @@ func TestAuthCredentialIsolationAndDefinerHardening(t *testing.T) {
 		if len(members) != 2 {
 			t.Fatalf("narrow member directory returned %d rows, want 2", len(members))
 		}
-	})
+	}
 }
 
 func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
@@ -1326,7 +1326,7 @@ func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
 	if err := admin.QueryRow(ctx, `SELECT default_tenant_id FROM public.users WHERE id=$1`, userB).Scan(&tenantB); err != nil {
 		t.Fatal(err)
 	}
-	t.Run("identity_arguments_require_matching_session_or_return_empty", func(t *testing.T) {
+	{
 		var totpConfigured bool
 		if err := db.WithUserTx(ctx, app, userA, func(tx pgx.Tx) error {
 			return tx.QueryRow(ctx, `SELECT public.auth_configure_totp($1,$2,'[]'::jsonb)`, userB, []byte("not-used")).Scan(&totpConfigured)
@@ -1371,7 +1371,7 @@ func TestRefreshCreationRequiresBoundIdentityAndDefinerInventory(t *testing.T) {
 		if _, err := app.Exec(ctx, `SELECT public.tenant_create_api_key($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), tenantB, "no-context", []byte("hash"), []string{"sites:read"}, userB, uuid.New(), time.Now().Add(time.Hour)); err == nil {
 			t.Fatal("tenant_create_api_key accepted missing session context")
 		}
-	})
+	}
 
 	before := func() int {
 		var n int
@@ -1662,42 +1662,44 @@ func (d siteFakeDNS) LookupTXT(context.Context, string) ([]string, error)       
 func (d siteFakeDNS) LookupCNAME(context.Context, string) (string, error)        { return d.cname, nil }
 func (d siteFakeDNS) LookupIP(context.Context, string, string) ([]net.IP, error) { return d.ips, nil }
 
-func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
+func siteIntegrationBase(t *testing.T) (context.Context, *pgxpool.Pool, *pgxpool.Pool, *redis.Client, *integrationCleanup) {
+	t.Helper()
 	ctx, admin, redisClient := integrationDeps(t)
 	cleanup := cleanupForTest(t, admin, redisClient)
 	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
-	worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
-	mailer := &captureMailer{messages: make(chan capturedMail, 16)}
+	return ctx, admin, app, redisClient, cleanup
+}
+
+func registerSiteIntegrationUser(t *testing.T, ctx context.Context, admin *pgxpool.Pool, app *pgxpool.Pool, redisClient *redis.Client, cleanup *integrationCleanup, label string) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	mailer := &captureMailer{messages: make(chan capturedMail, 8)}
 	authSvc := newAuthService(t, app, redisClient, mailer)
-	register := func(label string) (uuid.UUID, uuid.UUID) {
-		t.Helper()
-		email := label + "-" + uuid.NewString() + "@example.test"
-		cleanup.email(email)
-		if err := authSvc.Register(ctx, email, "a correct horse battery staple"); err != nil {
-			t.Fatal(err)
-		}
-		if err := authSvc.VerifyEmail(ctx, receivedToken(t, mailer, "Verification token: ")); err != nil {
-			t.Fatal(err)
-		}
-		var userID, tenantID uuid.UUID
-		if err := admin.QueryRow(ctx, `SELECT id,default_tenant_id FROM public.users WHERE email=$1`, email).Scan(&userID, &tenantID); err != nil {
-			t.Fatal(err)
-		}
-		return userID, tenantID
+	email := label + "-" + uuid.NewString() + "@example.test"
+	cleanup.email(email)
+	if err := authSvc.Register(ctx, email, "a correct horse battery staple"); err != nil {
+		t.Fatal(err)
 	}
-	userA, tenantA := register("site-race-a")
-	userB, tenantB := register("site-race-b")
-	cleanup.tenant(tenantA)
-	cleanup.tenant(tenantB)
-	siteNameSuffix := strings.ReplaceAll(uuid.NewString(), "-", "")
-	raceSiteName := "race-site-" + siteNameSuffix
-	tenantBSiteName := "tenant-b-site-" + siteNameSuffix
-	service := site.Service{Pool: app}
+	if err := authSvc.VerifyEmail(ctx, receivedToken(t, mailer, "Verification token: ")); err != nil {
+		t.Fatal(err)
+	}
+	var userID, tenantID uuid.UUID
+	if err := admin.QueryRow(ctx, `SELECT id,default_tenant_id FROM public.users WHERE email=$1`, email).Scan(&userID, &tenantID); err != nil {
+		t.Fatal(err)
+	}
+	cleanup.tenant(tenantID)
+	return userID, tenantID
+}
+
+func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 	t.Run("free_site_quota_serializes_concurrent_creates", func(t *testing.T) {
+		ctx, admin, app, rc, cleanup := siteIntegrationBase(t)
+		userID, tenantID := registerSiteIntegrationUser(t, ctx, admin, app, rc, cleanup, "site-quota")
+		service := site.Service{Pool: app}
+		name := "quota-" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		start := make(chan struct{})
 		type result struct {
-			site site.Site
-			err  error
+			created site.Site
+			err     error
 		}
 		results := make(chan result, 2)
 		var wg sync.WaitGroup
@@ -1706,51 +1708,50 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				<-start
-				s, e := service.Create(ctx, tenantA, userA, raceSiteName)
-				results <- result{s, e}
+				created, err := service.Create(ctx, tenantID, userID, name)
+				results <- result{created, err}
 			}()
 		}
 		close(start)
 		wg.Wait()
 		close(results)
 		success, quota := 0, 0
-		for r := range results {
-			if r.err == nil {
+		for result := range results {
+			switch {
+			case result.err == nil:
 				success++
-			} else if errors.Is(r.err, entitlement.ErrQuotaExceeded) {
+			case errors.Is(result.err, entitlement.ErrQuotaExceeded):
 				quota++
-			} else {
-				t.Errorf("unexpected concurrent site creation result: %v", r.err)
+			default:
+				t.Errorf("unexpected concurrent site creation result: %v", result.err)
 			}
 		}
 		if success != 1 || quota != 1 {
 			t.Fatalf("site create successes=%d quota rejects=%d; want one each", success, quota)
 		}
 	})
-	siteA, err := service.Create(ctx, tenantB, userB, tenantBSiteName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var siteAID uuid.UUID
-	if err = admin.QueryRow(ctx, `SELECT id FROM public.sites WHERE tenant_id=$1 AND name=$2`, tenantA, raceSiteName).Scan(&siteAID); err != nil {
-		t.Fatal(err)
-	}
-	for _, siteID := range []uuid.UUID{siteAID, siteA.ID} {
-		var status string
-		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteID).Scan(&status); err != nil || status != "pending_dns" {
-			t.Fatalf("new site %s status=%q err=%v, want pending_dns", siteID, status, err)
-		}
-	}
-	if _, err := service.AddOrigin(ctx, tenantA, userA, siteAID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); err != nil {
-		t.Fatalf("add origin before verification: %v", err)
-	}
-	var originSiteStatus string
-	if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&originSiteStatus); err != nil || originSiteStatus != "pending_dns" {
-		t.Fatalf("adding an origin changed pending site status to %q: %v", originSiteStatus, err)
-	}
+
 	t.Run("same_hostname_race_and_non_disclosing_conflict", func(t *testing.T) {
+		ctx, admin, app, rc, cleanup := siteIntegrationBase(t)
+		worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
+		userA, tenantA := registerSiteIntegrationUser(t, ctx, admin, app, rc, cleanup, "site-race-a")
+		userB, tenantB := registerSiteIntegrationUser(t, ctx, admin, app, rc, cleanup, "site-race-b")
+		service := site.Service{Pool: app}
 		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
-		unicodeHost := "BÜCHER-" + suffix + ".EXAMPLE.TEST."
+		siteA, err := service.Create(ctx, tenantA, userA, "race-a-"+suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		siteB, err := service.Create(ctx, tenantB, userB, "race-b-"+suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, fixture := range []struct{ tenant, user, id uuid.UUID }{{tenantA, userA, siteA.ID}, {tenantB, userB, siteB.ID}} {
+			if _, err := service.AddOrigin(ctx, fixture.tenant, fixture.user, fixture.id, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); err != nil {
+				t.Fatalf("add origin before verification: %v", err)
+			}
+		}
+		unicodeHost := "B\u00dcCHER-" + suffix + ".EXAMPLE.TEST."
 		canonicalHost, err := site.NormalizeHostname(unicodeHost)
 		if err != nil {
 			t.Fatal(err)
@@ -1767,34 +1768,34 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		}
 		results := make(chan result, 2)
 		var wg sync.WaitGroup
-		for i, input := range []struct{ tenant, user, sid uuid.UUID }{{tenantA, userA, siteAID}, {tenantB, userB, siteA.ID}} {
+		for i, input := range []struct{ tenant, user, sid uuid.UUID }{{tenantA, userA, siteA.ID}, {tenantB, userB, siteB.ID}} {
 			wg.Add(1)
 			go func(v struct{ tenant, user, sid uuid.UUID }, hostname string) {
 				defer wg.Done()
 				<-start
-				p, e := service.AddDomain(ctx, v.tenant, v.user, v.sid, hostname)
-				results <- result{proof: p, siteID: v.sid, err: e}
+				proof, createErr := service.AddDomain(ctx, v.tenant, v.user, v.sid, hostname)
+				results <- result{proof: proof, siteID: v.sid, err: createErr}
 			}(input, []string{unicodeHost, punycodeHost}[i])
 		}
 		close(start)
 		wg.Wait()
 		close(results)
 		var winner site.DomainProof
-		var winnerSiteID uuid.UUID
-		var loserSiteID uuid.UUID
+		var winnerSiteID, loserSiteID uuid.UUID
 		var conflictErr error
 		success, conflict := 0, 0
-		for r := range results {
-			if r.err == nil {
+		for result := range results {
+			switch {
+			case result.err == nil:
 				success++
-				winner = r.proof
-				winnerSiteID = r.siteID
-			} else if errors.Is(r.err, site.ErrHostnameUnavailable) {
+				winner = result.proof
+				winnerSiteID = result.siteID
+			case errors.Is(result.err, site.ErrHostnameUnavailable):
 				conflict++
-				conflictErr = r.err
-				loserSiteID = r.siteID
-			} else {
-				t.Errorf("unexpected domain result: %v", r.err)
+				conflictErr = result.err
+				loserSiteID = result.siteID
+			default:
+				t.Errorf("unexpected domain result: %v", result.err)
 			}
 		}
 		if success != 1 || conflict != 1 {
@@ -1818,10 +1819,10 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 				t.Fatalf("site %s status after domain creation=%q err=%v, want %s", expected.siteID, status, err, expected.status)
 			}
 		}
-		if _, err := service.AddDomain(ctx, tenantA, userA, siteA.ID, "cross-tenant-"+suffix+".example.test"); !errors.Is(err, site.ErrSiteNotFound) {
+		if _, err := service.AddDomain(ctx, tenantA, userA, siteB.ID, "cross-tenant-"+suffix+".example.test"); !errors.Is(err, site.ErrSiteNotFound) {
 			t.Fatalf("cross-tenant site reference err=%v, want not found", err)
 		}
-		if _, err := service.AddOrigin(ctx, tenantA, userA, siteA.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); !errors.Is(err, site.ErrSiteNotFound) {
+		if _, err := service.AddOrigin(ctx, tenantA, userA, siteB.ID, "https://origin.example", siteFakeDNS{ips: []net.IP{net.ParseIP("203.0.113.21")}}); !errors.Is(err, site.ErrSiteNotFound) {
 			t.Fatalf("cross-tenant origin reference err=%v, want not found", err)
 		}
 		hash := sha256.Sum256([]byte(winner.Token))
@@ -1839,15 +1840,13 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if _, err := admin.Exec(ctx, `UPDATE public.domains SET next_verification_at=now()-interval '1 second' WHERE id=$1`, winner.ID); err != nil {
 			t.Fatal(err)
 		}
-		badDNS := siteFakeDNS{records: []string{"not-the-token"}}
-		if count, err := workerService.VerifyDueDomains(ctx, badDNS, time.Now(), 10); err != nil || count != 0 {
+		if count, err := workerService.VerifyDueDomains(ctx, siteFakeDNS{records: []string{"not-the-token"}}, time.Now(), 10); err != nil || count != 0 {
 			t.Fatalf("invalid DNS proof batch count=%d err=%v", count, err)
 		}
 		if _, err := admin.Exec(ctx, `UPDATE public.domains SET next_verification_at=now()-interval '1 second' WHERE id=$1`, winner.ID); err != nil {
 			t.Fatal(err)
 		}
-		dns := siteFakeDNS{records: []string{"not-the-token", winner.Token}}
-		if count, err := workerService.VerifyDueDomains(ctx, dns, time.Now(), 10); err != nil || count != 1 {
+		if count, err := workerService.VerifyDueDomains(ctx, siteFakeDNS{records: []string{"not-the-token", winner.Token}}, time.Now(), 10); err != nil || count != 1 {
 			t.Fatalf("valid DNS proof batch count=%d err=%v", count, err)
 		}
 		var verified bool
@@ -1861,7 +1860,7 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 		if err := admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, loserSiteID).Scan(&loserStatus); err != nil || loserStatus != "pending_dns" {
 			t.Fatalf("site %s without verified domain status=%q err=%v, want pending_dns", loserSiteID, loserStatus, err)
 		}
-		expiredProof, err := service.AddDomain(ctx, tenantA, userA, siteAID, "expired-"+suffix+".example.test")
+		expiredProof, err := service.AddDomain(ctx, tenantA, userA, siteA.ID, "expired-"+suffix+".example.test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1869,7 +1868,7 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		var expiredSiteStatusBefore string
-		if err = admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&expiredSiteStatusBefore); err != nil {
+		if err = admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteA.ID).Scan(&expiredSiteStatusBefore); err != nil {
 			t.Fatal(err)
 		}
 		if err = workerService.VerifyDomain(ctx, tenantA, expiredProof.ID, siteFakeDNS{records: []string{expiredProof.Token}}); !errors.Is(err, site.ErrVerificationExpired) {
@@ -1880,21 +1879,24 @@ func TestSiteQuotaHostnameOwnershipAndStateIntegration(t *testing.T) {
 			t.Fatalf("expired domain status=%q err=%v", expiredStatus, err)
 		}
 		var expiredSiteStatusAfter string
-		if err = admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteAID).Scan(&expiredSiteStatusAfter); err != nil || expiredSiteStatusAfter != expiredSiteStatusBefore {
+		if err = admin.QueryRow(ctx, `SELECT status FROM public.sites WHERE id=$1`, siteA.ID).Scan(&expiredSiteStatusAfter); err != nil || expiredSiteStatusAfter != expiredSiteStatusBefore {
 			t.Fatalf("expired domain changed site status from %q to %q err=%v", expiredSiteStatusBefore, expiredSiteStatusAfter, err)
 		}
 	})
+
 	t.Run("site_status_machine_rejects_invalid_transitions", func(t *testing.T) {
-		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='suspended' WHERE id=$1`, siteA.ID); err != nil {
+		ctx, admin, app, rc, cleanup := siteIntegrationBase(t)
+		userID, tenantID := registerSiteIntegrationUser(t, ctx, admin, app, rc, cleanup, "site-state")
+		created, err := (site.Service{Pool: app}).Create(ctx, tenantID, userID, "state-"+strings.ReplaceAll(uuid.NewString(), "-", ""))
+		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='active' WHERE id=$1`, siteA.ID); err != nil {
-			t.Fatal(err)
+		for _, status := range []string{"suspended", "active", "deleted"} {
+			if _, err := admin.Exec(ctx, `UPDATE public.sites SET status=$1 WHERE id=$2`, status, created.ID); err != nil {
+				t.Fatalf("transition to %s: %v", status, err)
+			}
 		}
-		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='deleted' WHERE id=$1`, siteA.ID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='active' WHERE id=$1`, siteA.ID); err == nil {
+		if _, err := admin.Exec(ctx, `UPDATE public.sites SET status='active' WHERE id=$1`, created.ID); err == nil {
 			t.Fatal("deleted site transitioned back to active")
 		}
 	})
