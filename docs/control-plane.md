@@ -411,7 +411,7 @@ Các trường được bổ sung trong quá trình P1–P5a (ngoài trường n
 **Đăng ký và định danh**
 
 1. Terraform/admin tạo **token bootstrap dùng một lần** (lưu băm, hạn 1 giờ, gắn vùng và nhà cung cấp).  
-2. Edge gọi POST /internal/edges/register kèm token và CSR; control plane kiểm tra rồi cấp **chứng chỉ mTLS ngắn hạn** từ CA nội bộ (ví dụ step-ca hoặc Vault PKI), edge tự gia hạn.  
+2. Edge gọi POST /internal/edges/register qua HTTPS trên worker nội bộ kèm token và CSR; vì edge chưa có cert trước lần bootstrap đầu, endpoint này xác thực token một lần thay cho mTLS. Worker kiểm tra rồi cấp **chứng chỉ mTLS ngắn hạn** từ CA nội bộ (ví dụ step-ca hoặc Vault PKI); các request nội bộ tiếp theo bắt buộc mTLS.
 3. Chứng chỉ gắn edge\_id và vùng; control plane chỉ trả bí mật của site cho edge thuộc vùng được phép.
 
 **Heartbeat** (15–30 giây/lần): version snapshot, tuổi snapshot, CPU/RAM, RPS, tỷ lệ lỗi, p99, hạn chứng chỉ, số log bị bỏ. Trạng thái edge: registering → ready → degraded → draining → offline → decommissioned.
@@ -509,7 +509,7 @@ site\_stats\_1m nhận số liệu **tổng hợp theo phút do edge gửi**, n�
 | Thanh toán | GET /v1/billing/plans, POST /v1/billing/checkout, /portal, GET /v1/billing/invoices |
 | Cảnh báo | /v1/alert-rules, /v1/channels, /v1/alerts |
 | Công khai | GET /v1/edge-ips |
-| Nội bộ (mTLS, không công khai) | POST /internal/edges/register, GET /internal/snapshot, POST /internal/heartbeat, POST /internal/logs |
+| Nội bộ (không công khai; bootstrap HTTPS + token, sau đó mTLS) | POST /internal/edges/register, GET /internal/snapshot, POST /internal/heartbeat, POST /internal/logs |
 
 **Ví dụ tạo rule**
 

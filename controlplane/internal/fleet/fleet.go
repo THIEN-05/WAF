@@ -69,6 +69,21 @@ type Authority struct {
 }
 
 func NewDevelopmentAuthority(now time.Time) (*Authority, []byte, error) {
+	certificatePEM, privateKeyPEM, err := NewDevelopmentAuthorityPEM(now)
+	if err != nil {
+		return nil, nil, err
+	}
+	authority, err := NewAuthorityFromPEM(certificatePEM, privateKeyPEM)
+	if err != nil {
+		return nil, nil, err
+	}
+	return authority, certificatePEM, nil
+}
+
+// NewDevelopmentAuthorityPEM creates ephemeral development CA material. Callers
+// should place the private key in their SecretStore and must never log or persist
+// it in the repository.
+func NewDevelopmentAuthorityPEM(now time.Time) (certificatePEM, privateKeyPEM []byte, err error) {
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate development CA key: %w", err)
@@ -82,11 +97,13 @@ func NewDevelopmentAuthority(now time.Time) (*Authority, []byte, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("create development CA: %w", err)
 	}
-	parsed, err := x509.ParseCertificate(der)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("marshal development CA key: %w", err)
 	}
-	return &Authority{certificate: parsed, privateKey: key}, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
+	certificatePEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	privateKeyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return certificatePEM, privateKeyPEM, nil
 }
 
 func NewAuthorityFromPEM(certificatePEM, privateKeyPEM []byte) (*Authority, error) {

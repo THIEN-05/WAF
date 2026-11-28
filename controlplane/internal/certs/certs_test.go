@@ -31,6 +31,21 @@ func TestRetryBackoffAndExpiryWarningThreshold(t *testing.T) {
 	}
 }
 
+func TestPostgresRetryTimestampNeverRoundsBackoffDown(t *testing.T) {
+	base := time.Date(2026, 11, 28, 4, 19, 9, 628318700, time.UTC)
+	want := base.Add(time.Minute)
+	got := postgresTimestampCeil(want)
+	if got.Before(want) {
+		t.Fatalf("database timestamp rounded retry earlier: got=%s want_at_least=%s", got, want)
+	}
+	if got.After(want.Add(time.Microsecond)) {
+		t.Fatalf("database timestamp rounding exceeded one microsecond: got=%s want_at_most=%s", got, want.Add(time.Microsecond))
+	}
+	if got != got.Truncate(time.Microsecond) {
+		t.Fatalf("retry timestamp is not PostgreSQL microsecond precision: %s", got)
+	}
+}
+
 func TestManagerDeduplicatesOrderAndRateLimits(t *testing.T) {
 	now := time.Now()
 	m := Manager{Now: func() time.Time { return now }, MaxOrdersPerMinute: 1}

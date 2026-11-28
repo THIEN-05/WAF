@@ -1,18 +1,18 @@
 package api
 
 import (
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
-func TestEdgeRegistrationRejectsPlainHTTP(t *testing.T) {
-	server := &Server{}
-	request := httptest.NewRequest("POST", "/internal/edges/register", strings.NewReader(`{"token":"bootstrap-token-placeholder-value","csr":"pem"}`))
+func TestPublicAPIDoesNotExposeEdgeRegistration(t *testing.T) {
+	server := &Server{log: slog.New(slog.NewTextHandler(httptest.NewRecorder(), nil))}
+	request := httptest.NewRequest(http.MethodPost, "/internal/edges/register", nil)
 	response := httptest.NewRecorder()
-	server.registerEdge(response, request)
-	if response.Code != http.StatusUpgradeRequired {
-		t.Fatalf("plain HTTP registration status=%d body=%s", response.Code, response.Body.String())
+	server.Router().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("public API edge registration status=%d body=%s; expected route to be absent", response.Code, response.Body.String())
 	}
 }

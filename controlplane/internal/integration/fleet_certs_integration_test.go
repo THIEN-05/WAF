@@ -28,7 +28,6 @@ import (
 func TestFleetEnrollmentHeartbeatDNSAndCertificateRevocationIntegration(t *testing.T) {
 	ctx, admin, redisClient := integrationDeps(t)
 	cleanup := cleanupForTest(t, admin, redisClient)
-	app := apiRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
 	worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
 	now := time.Now().UTC()
 	ca, caPEM, err := fleet.NewDevelopmentAuthority(now)
@@ -37,39 +36,16 @@ func TestFleetEnrollmentHeartbeatDNSAndCertificateRevocationIntegration(t *testi
 	}
 	clock := now
 	service := fleet.Service{Pool: worker, CA: ca, Now: func() time.Time { return clock }, CertificateLifetime: 24 * time.Hour}
-	apiFleet := fleet.Service{Pool: app, CA: ca, Now: func() time.Time { return clock }, CertificateLifetime: 24 * time.Hour}
+	workerFleet := fleet.Service{Pool: worker, CA: ca, Now: func() time.Time { return clock }, CertificateLifetime: 24 * time.Hour}
 	region := "it-fleet-" + uuid.NewString()
-	var edgeIDs []uuid.UUID
-	t.Cleanup(func() {
-		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, cleanupErr := admin.Exec(c, `DELETE FROM public.edge_dns_withdrawal_limits WHERE region=$1`, region)
-		if cleanupErr != nil {
-			t.Errorf("delete test DNS limiter row: %v", cleanupErr)
-		}
-		for _, id := range edgeIDs {
-			if _, cleanupErr = admin.Exec(c, `DELETE FROM public.edge_bootstrap_tokens WHERE edge_id=$1`, id); cleanupErr != nil {
-				t.Errorf("delete test bootstrap token rows: %v", cleanupErr)
-			}
-			if _, cleanupErr = admin.Exec(c, `DELETE FROM public.edge_certificates WHERE edge_id=$1`, id); cleanupErr != nil {
-				t.Errorf("delete test edge certificate rows: %v", cleanupErr)
-			}
-			if _, cleanupErr = admin.Exec(c, `DELETE FROM public.edges WHERE id=$1`, id); cleanupErr != nil {
-				t.Errorf("delete test edge row: %v", cleanupErr)
-			}
-			var left int
-			if cleanupErr = admin.QueryRow(c, `SELECT (SELECT count(*) FROM public.edge_bootstrap_tokens WHERE edge_id=$1)+(SELECT count(*) FROM public.edge_certificates WHERE edge_id=$1)+(SELECT count(*) FROM public.edges WHERE id=$1)`, id).Scan(&left); cleanupErr != nil || left != 0 {
-				t.Errorf("fleet fixture residue for edge %s: rows=%d err=%v", id, left, cleanupErr)
-			}
-		}
-	})
+	cleanup.region(region)
 	register := func(lifetime time.Duration) (fleet.Bootstrap, fleet.Registration) {
 		t.Helper()
 		bootstrap, e := service.CreateBootstrapToken(ctx, region, "integration")
 		if e != nil {
 			t.Fatal(e)
 		}
-		edgeIDs = append(edgeIDs, bootstrap.EdgeID)
+		cleanup.edge(bootstrap.EdgeID)
 		var storedHash []byte
 		if e = admin.QueryRow(ctx, `SELECT token_hash FROM public.edge_bootstrap_tokens WHERE edge_id=$1`, bootstrap.EdgeID).Scan(&storedHash); e != nil {
 			t.Fatal(e)
@@ -87,12 +63,12 @@ func TestFleetEnrollmentHeartbeatDNSAndCertificateRevocationIntegration(t *testi
 			t.Fatal(e)
 		}
 		csr := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
-		apiFleet.CertificateLifetime = lifetime
-		registration, e := apiFleet.Register(ctx, bootstrap.Token, csr, caPEM)
+		workerFleet.CertificateLifetime = lifetime
+		registration, e := workerFleet.Register(ctx, bootstrap.Token, csr, caPEM)
 		if e != nil {
 			t.Fatal(e)
 		}
-		if _, e = apiFleet.Register(ctx, bootstrap.Token, csr, caPEM); !errors.Is(e, fleet.ErrBootstrapRejected) {
+		if _, e = workerFleet.Register(ctx, bootstrap.Token, csr, caPEM); !errors.Is(e, fleet.ErrBootstrapRejected) {
 			t.Fatalf("reused bootstrap token accepted: %v", e)
 		}
 		block, _ := pem.Decode([]byte(registration.Certificate))
@@ -171,7 +147,7 @@ func TestFleetEnrollmentHeartbeatDNSAndCertificateRevocationIntegration(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	edgeIDs = append(edgeIDs, expiredBootstrap.EdgeID)
+	cleanup.edge(expiredBootstrap.EdgeID)
 	_, renewalKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -181,7 +157,7 @@ func TestFleetEnrollmentHeartbeatDNSAndCertificateRevocationIntegration(t *testi
 		t.Fatal(err)
 	}
 	clock = clock.Add(time.Hour + time.Second)
-	if _, err = apiFleet.Register(ctx, expiredBootstrap.Token, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: renewalCSRDER}), caPEM); !errors.Is(err, fleet.ErrBootstrapRejected) {
+	if _, err = workerFleet.Register(ctx, expiredBootstrap.Token, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: renewalCSRDER}), caPEM); !errors.Is(err, fleet.ErrBootstrapRejected) {
 		t.Fatalf("expired bootstrap token error=%v", err)
 	}
 	if err = good.Validate(); err != nil {
@@ -189,6 +165,15 @@ func TestFleetEnrollmentHeartbeatDNSAndCertificateRevocationIntegration(t *testi
 	}
 	if err = (fleet.Heartbeat{CPUPercent: 101}).Validate(); err == nil {
 		t.Fatal("invalid heartbeat metrics accepted")
+	}
+	cleanup.runFixtureRows()
+	var fleetResidue int
+	if err = admin.QueryRow(ctx, `SELECT
+      (SELECT count(*) FROM public.edges WHERE id=ANY($1::uuid[]))+
+      (SELECT count(*) FROM public.edge_bootstrap_tokens WHERE edge_id=ANY($1::uuid[]))+
+      (SELECT count(*) FROM public.edge_certificates WHERE edge_id=ANY($1::uuid[]))+
+      (SELECT count(*) FROM public.edge_dns_withdrawal_limits WHERE region=ANY($2::text[]))`, cleanup.edges, cleanup.regions).Scan(&fleetResidue); err != nil || fleetResidue != 0 {
+		t.Fatalf("fleet fixture cleanup left %d rows: %v", fleetResidue, err)
 	}
 }
 
@@ -218,13 +203,7 @@ func TestCertificateRenewalBackoffAndSecretStoreIntegration(t *testing.T) {
 	issuer := &certs.FakeIssuer{Now: func() time.Time { return now }}
 	secrets := secret.NewMemory()
 	issuerKey := "integration-" + uuid.NewString()
-	t.Cleanup(func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, cleanupErr := admin.Exec(cleanupCtx, `DELETE FROM public.certificate_issuance_rate_limits WHERE issuer_key=$1`, issuerKey); cleanupErr != nil {
-			t.Errorf("delete test issuer rate limit: %v", cleanupErr)
-		}
-	})
+	cleanup.issuer(issuerKey)
 	manager := certs.Manager{Pool: worker, Issuer: issuer, Secrets: secrets, Now: func() time.Time { return now }, RateLimitKey: issuerKey}
 	count, err := manager.RenewDue(ctx, 10)
 	if err != nil || count != 1 {
@@ -317,6 +296,13 @@ func TestCertificateRenewalBackoffAndSecretStoreIntegration(t *testing.T) {
 	}
 	if issuer.Calls != 2 {
 		t.Fatalf("duplicate or premature issuer calls: %d, want 2", issuer.Calls)
+	}
+	cleanup.runFixtureRows()
+	var renewalResidue int
+	if err = admin.QueryRow(ctx, `SELECT
+      (SELECT count(*) FROM public.certificates WHERE tenant_id=$1)+
+      (SELECT count(*) FROM public.certificate_issuance_rate_limits WHERE issuer_key=ANY($2::text[]))`, cleanup.tenants[0], cleanup.issuers).Scan(&renewalResidue); err != nil || renewalResidue != 0 {
+		t.Fatalf("certificate renewal fixture cleanup left %d rows: %v", renewalResidue, err)
 	}
 }
 

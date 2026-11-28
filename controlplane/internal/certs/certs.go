@@ -231,7 +231,7 @@ func (m *Manager) RenewDue(ctx context.Context, limit int) (int, error) {
 		if issueErr != nil {
 			attempt := c.attempts + 1
 			delay := retryDelay(attempt)
-			_, dbErr := m.Pool.Exec(ctx, `UPDATE public.certificates SET status='active',renewal_attempts=$2,next_attempt_at=$3,renewal_claimed_at=NULL,last_error_code='issuer_failure',updated_at=now() WHERE id=$1`, c.id, attempt, m.now().Add(delay))
+			_, dbErr := m.Pool.Exec(ctx, `UPDATE public.certificates SET status='active',renewal_attempts=$2,next_attempt_at=$3,renewal_claimed_at=NULL,last_error_code='issuer_failure',updated_at=now() WHERE id=$1`, c.id, attempt, postgresTimestampCeil(m.now().Add(delay)))
 			if dbErr != nil {
 				workerErrors = append(workerErrors, fmt.Errorf("schedule certificate retry: %w", dbErr))
 			}
@@ -263,6 +263,12 @@ func retryDelay(attempt int) time.Duration {
 		return 24 * time.Hour
 	}
 	return d
+}
+
+// PostgreSQL stores timestamptz at microsecond precision. Round retry instants up
+// so persistence cannot schedule a retry slightly earlier than the selected backoff.
+func postgresTimestampCeil(value time.Time) time.Time {
+	return value.Add(time.Microsecond - time.Nanosecond).Truncate(time.Microsecond)
 }
 
 func reserveIssuerQuota(ctx context.Context, tx pgx.Tx, issuer string, limit int, now time.Time) (bool, error) {
