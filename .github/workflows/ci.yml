@@ -130,6 +130,38 @@ jobs:
           MAILHOG_ADDR: 127.0.0.1:1025
           MAILHOG_API_URL: http://127.0.0.1:8025/api/v2/messages
 
+  analytics-integration:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.3.3.42
+        env:
+          CLICKHOUSE_DB: waf
+          CLICKHOUSE_USER: waf
+          CLICKHOUSE_PASSWORD: waf-test-password
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user waf --password waf-test-password --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: ClickHouse analytics integration
+        run: go test -tags=integration -run '^TestClickHouseBatchRetentionAndTenantPredicatesIntegration$' -bench '^BenchmarkClickHouseWriteBatchIntegration$' -benchtime=5x -count=1 -v ./controlplane/internal/analytics
+        env:
+          CLICKHOUSE_URL: http://127.0.0.1:8123
+          CLICKHOUSE_DATABASE: waf
+          CLICKHOUSE_USER: waf
+          CLICKHOUSE_PASSWORD: waf-test-password
+          CLICKHOUSE_INTEGRATION_REQUIRED: "1"
+
   cp-integration:
     runs-on: ubuntu-latest
     env:
