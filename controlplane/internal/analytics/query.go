@@ -87,7 +87,7 @@ func (s AnalyticsService) Query(ctx context.Context, tenantID, siteID uuid.UUID,
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	params := url.Values{"param_tenant_id": {tenantID.String()}, "param_site_id": {siteID.String()}, "param_from": {from.UTC().Format(time.RFC3339Nano)}, "param_to": {to.UTC().Format(time.RFC3339Nano)}, "param_limit": {strconv.Itoa(limit)}}
+	params := url.Values{"param_tenant_id": {tenantID.String()}, "param_site_id": {siteID.String()}, "param_from": {clickHouseTimestamp(from, "2006-01-02 15:04:05.000")}, "param_to": {clickHouseTimestamp(to, "2006-01-02 15:04:05.000")}, "param_limit": {strconv.Itoa(limit)}}
 	body, err := s.ClickHouse.query(queryCtx, query, params)
 	if err != nil {
 		return QueryResult{}, err

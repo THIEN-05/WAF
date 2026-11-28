@@ -50,7 +50,7 @@ func TestClickHouseBatchRetentionAndTenantPredicatesIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("clickhouse integration batch events=%d stats=%d elapsed=%s", len(rows.Events), len(rows.Stats), time.Since(started))
-	params := url.Values{"param_tenant_id": {tenantA}, "param_site_id": {siteA}, "param_from": {now.Add(-time.Minute).Format(time.RFC3339Nano)}, "param_to": {now.Add(time.Minute).Format(time.RFC3339Nano)}}
+	params := url.Values{"param_tenant_id": {tenantA}, "param_site_id": {siteA}, "param_from": {clickHouseTimestamp(now.Add(-time.Minute), "2006-01-02 15:04:05.000")}, "param_to": {clickHouseTimestamp(now.Add(time.Minute), "2006-01-02 15:04:05.000")}}
 	result, err := client.query(context.Background(), `SELECT count() count,any(retention_days) retention_days FROM security_events WHERE tenant_id={tenant_id:UUID} AND site_id={site_id:UUID} AND ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)}`, params)
 	if err != nil {
 		t.Fatal(err)

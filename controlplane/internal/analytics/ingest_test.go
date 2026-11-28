@@ -147,6 +147,13 @@ func TestAnalyticsQueriesAlwaysScopeByTenantAndSite(t *testing.T) {
 	}
 }
 
+func TestClickHouseTimestampUsesUTCDateTimeFormat(t *testing.T) {
+	input := time.Date(2026, time.November, 28, 12, 47, 17, 123000000, time.FixedZone("test", 7*60*60))
+	if got, want := clickHouseTimestamp(input, "2006-01-02 15:04:05.000"), "2026-11-28 05:47:17.123"; got != want {
+		t.Fatalf("ClickHouse timestamp=%q, want %q", got, want)
+	}
+}
+
 type writerStub struct {
 	rows chan Rows
 	err  error
