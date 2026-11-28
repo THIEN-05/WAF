@@ -260,11 +260,17 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	if _, err = admin.Exec(ctx, `INSERT INTO public.edges(id,region,provider,status,cert_serial) VALUES($1,$2,'integration','ready',$3)`, edgeID, region, serial); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = admin.Exec(ctx, `INSERT INTO public.edge_certificates(serial,edge_id,status,not_after) VALUES($1,$2,'active',$3)`, serial, edgeID, clientCert.Leaf.NotAfter); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = admin.Exec(ctx, `INSERT INTO public.edges(id,region,provider,status,cert_serial) VALUES($1,$2,'integration','ready',$3)`, wrongEdgeID, region, wrongNameSerial); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), `DELETE FROM public.edges WHERE id=$1`, edgeID) })
-	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), `DELETE FROM public.edges WHERE id=$1`, wrongEdgeID) })
+	if _, err = admin.Exec(ctx, `INSERT INTO public.edge_certificates(serial,edge_id,status,not_after) VALUES($1,$2,'active',$3)`, wrongNameSerial, wrongEdgeID, time.Now().Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	cleanup.edge(edgeID)
+	cleanup.edge(wrongEdgeID)
 	endpoint := snapshot.EdgeHandler{Repository: repository, Objects: objects, Resolver: repository}
 	server := httptest.NewUnstartedServer(endpoint)
 	server.TLS = &tls.Config{MinVersion: tls.VersionTLS12, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: caPool}

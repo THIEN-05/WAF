@@ -22,15 +22,21 @@ func TestCertificateSecretReferenceIsNotReadableOrPublicIntegration(t *testing.T
 		t.Fatalf("reading certificates.secret_ref failed for unexpected reason: %v", err)
 	}
 
-	// This explicit inventory is intentionally empty: no secret, token, hash, key, or
-	// serial column is approved for direct reads by the public API role.
-	allowed := map[string]string{}
-	rows, err := admin.Query(ctx, `SELECT table_name,column_name
+	// key_expr describes the limiter key expression (for example "ip"); it is
+	// configuration, not key material. Keep this exception explicit so newly
+	// readable credentials remain a test failure.
+	allowed := map[string]string{
+		"rate_limit_policies.key_expr": "limiter key expression, not cryptographic key material",
+	}
+	rows, err := admin.Query(ctx, `WITH candidates AS MATERIALIZED (
+  SELECT table_name,column_name
   FROM information_schema.columns
   WHERE table_schema='public'
     AND column_name ~* '(hash|token|secret|serial|key)'
-    AND has_column_privilege('waf_api',format('public.%I',table_name),column_name,'SELECT')
-  ORDER BY table_name,column_name`)
+)
+SELECT table_name,column_name FROM candidates
+WHERE has_column_privilege('waf_api',format('public.%I',table_name),column_name,'SELECT')
+ORDER BY table_name,column_name`)
 	if err != nil {
 		t.Fatal(err)
 	}
