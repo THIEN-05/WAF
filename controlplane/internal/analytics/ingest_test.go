@@ -91,6 +91,7 @@ func TestProcessorRejectsInvalidSchemaAndUnknownSite(t *testing.T) {
 
 func TestClickHouseWriterUsesExactInsertTablesAndRows(t *testing.T) {
 	calls := 0
+	stamp := time.Date(2026, time.November, 28, 12, 47, 17, 123000000, time.FixedZone("test", 7*60*60))
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		calls++
 		if r.Method != http.MethodPost || r.URL.Query().Get("database") != "waf" {
@@ -104,13 +105,19 @@ func TestClickHouseWriterUsesExactInsertTablesAndRows(t *testing.T) {
 		if calls == 1 && !bytes.Contains(body, []byte(`"retention_days":7`)) {
 			t.Errorf("event retention missing: %s", body)
 		}
+		if calls == 1 && !bytes.Contains(body, []byte(`"ts":"2026-11-28 05:47:17.123"`)) {
+			t.Errorf("event timestamp is not ClickHouse DateTime64 JSONEachRow format: %s", body)
+		}
 		if calls == 2 && query != "INSERT INTO site_stats_1m FORMAT JSONEachRow" {
 			t.Errorf("stats query=%q", query)
+		}
+		if calls == 2 && !bytes.Contains(body, []byte(`"minute":"2026-11-28 05:47:00"`)) {
+			t.Errorf("stats timestamp is not ClickHouse DateTime JSONEachRow format: %s", body)
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: r}, nil
 	})}
 	w := ClickHouseHTTP{Endpoint: "http://clickhouse.invalid:8123", Database: "waf", Client: client}
-	rows := Rows{Events: []EventRow{{Event: wafcore.LogEvent{TS: time.Now(), TenantID: "00000000-0000-7000-8000-000000000001", SiteID: "00000000-0000-7000-8000-000000000002", ClientIP: "192.0.2.1"}, RetentionDays: 7}}, Stats: []wafcore.SiteStats1m{{Minute: time.Now().Truncate(time.Minute), TenantID: "00000000-0000-7000-8000-000000000001", SiteID: "00000000-0000-7000-8000-000000000002"}}}
+	rows := Rows{Events: []EventRow{{Event: wafcore.LogEvent{TS: stamp, TenantID: "00000000-0000-7000-8000-000000000001", SiteID: "00000000-0000-7000-8000-000000000002", ClientIP: "192.0.2.1"}, RetentionDays: 7}}, Stats: []wafcore.SiteStats1m{{Minute: stamp.Truncate(time.Minute), TenantID: "00000000-0000-7000-8000-000000000001", SiteID: "00000000-0000-7000-8000-000000000002"}}}
 	if err := w.Write(context.Background(), rows); err != nil {
 		t.Fatal(err)
 	}

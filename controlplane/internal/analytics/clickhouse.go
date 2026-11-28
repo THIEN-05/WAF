@@ -32,24 +32,41 @@ type ClickHouseHTTP struct {
 }
 
 type eventInsert struct {
-	TS            time.Time `json:"ts"`
-	TenantID      string    `json:"tenant_id"`
-	SiteID        string    `json:"site_id"`
-	EdgeID        string    `json:"edge_id"`
-	Region        string    `json:"region"`
-	ClientIP      string    `json:"client_ip"`
-	Country       string    `json:"country"`
-	ASN           uint32    `json:"asn"`
-	Method        string    `json:"method"`
-	Host          string    `json:"host"`
-	Path          string    `json:"path"`
-	Status        uint16    `json:"status"`
-	Action        string    `json:"action"`
-	RuleID        string    `json:"rule_id"`
-	WAFScore      uint16    `json:"waf_score"`
-	BotScore      uint8     `json:"bot_score"`
-	LatencyMS     uint32    `json:"latency_ms"`
-	RetentionDays uint16    `json:"retention_days"`
+	TS            string `json:"ts"`
+	TenantID      string `json:"tenant_id"`
+	SiteID        string `json:"site_id"`
+	EdgeID        string `json:"edge_id"`
+	Region        string `json:"region"`
+	ClientIP      string `json:"client_ip"`
+	Country       string `json:"country"`
+	ASN           uint32 `json:"asn"`
+	Method        string `json:"method"`
+	Host          string `json:"host"`
+	Path          string `json:"path"`
+	Status        uint16 `json:"status"`
+	Action        string `json:"action"`
+	RuleID        string `json:"rule_id"`
+	WAFScore      uint16 `json:"waf_score"`
+	BotScore      uint8  `json:"bot_score"`
+	LatencyMS     uint32 `json:"latency_ms"`
+	RetentionDays uint16 `json:"retention_days"`
+}
+
+type statsInsert struct {
+	Minute      string `json:"minute"`
+	TenantID    string `json:"tenant_id"`
+	SiteID      string `json:"site_id"`
+	Requests    uint64 `json:"requests"`
+	Blocked     uint64 `json:"blocked"`
+	Challenged  uint64 `json:"challenged"`
+	RateLimited uint64 `json:"rate_limited"`
+	CacheHits   uint64 `json:"cache_hits"`
+	BytesOut    uint64 `json:"bytes_out"`
+	Status5xx   uint64 `json:"status_5xx"`
+}
+
+func clickHouseTimestamp(value time.Time, precision string) string {
+	return value.UTC().Format(precision)
 }
 
 func (c ClickHouseHTTP) Write(ctx context.Context, rows Rows) error {
@@ -74,7 +91,7 @@ func (c ClickHouseHTTP) Write(ctx context.Context, rows Rows) error {
 					ip6 = ip.String()
 				}
 			}
-			if err := enc.Encode(eventInsert{TS: e.TS, TenantID: e.TenantID, SiteID: e.SiteID, EdgeID: e.EdgeID, Region: e.Region, ClientIP: ip6, Country: e.Country, ASN: e.ASN, Method: e.Method, Host: e.Host, Path: e.Path, Status: e.Status, Action: e.Action, RuleID: e.RuleID, WAFScore: e.WAFScore, BotScore: e.BotScore, LatencyMS: e.LatencyMS, RetentionDays: row.RetentionDays}); err != nil {
+			if err := enc.Encode(eventInsert{TS: clickHouseTimestamp(e.TS, "2006-01-02 15:04:05.000"), TenantID: e.TenantID, SiteID: e.SiteID, EdgeID: e.EdgeID, Region: e.Region, ClientIP: ip6, Country: e.Country, ASN: e.ASN, Method: e.Method, Host: e.Host, Path: e.Path, Status: e.Status, Action: e.Action, RuleID: e.RuleID, WAFScore: e.WAFScore, BotScore: e.BotScore, LatencyMS: e.LatencyMS, RetentionDays: row.RetentionDays}); err != nil {
 				return err
 			}
 		}
@@ -86,7 +103,7 @@ func (c ClickHouseHTTP) Write(ctx context.Context, rows Rows) error {
 		var body bytes.Buffer
 		enc := json.NewEncoder(&body)
 		for _, stats := range rows.Stats {
-			if err := enc.Encode(stats); err != nil {
+			if err := enc.Encode(statsInsert{Minute: clickHouseTimestamp(stats.Minute, "2006-01-02 15:04:05"), TenantID: stats.TenantID, SiteID: stats.SiteID, Requests: stats.Requests, Blocked: stats.Blocked, Challenged: stats.Challenged, RateLimited: stats.RateLimited, CacheHits: stats.CacheHits, BytesOut: stats.BytesOut, Status5xx: stats.Status5xx}); err != nil {
 				return err
 			}
 		}
