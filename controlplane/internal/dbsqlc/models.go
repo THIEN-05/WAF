@@ -88,15 +88,25 @@ type CacheSetting struct {
 }
 
 type Certificate struct {
-	ID        pgtype.UUID        `json:"id"`
-	TenantID  pgtype.UUID        `json:"tenant_id"`
-	DomainID  pgtype.UUID        `json:"domain_id"`
-	Status    string             `json:"status"`
-	NotAfter  pgtype.Timestamptz `json:"not_after"`
-	SecretRef string             `json:"secret_ref"`
-	Issuer    string             `json:"issuer"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	ID               pgtype.UUID        `json:"id"`
+	TenantID         pgtype.UUID        `json:"tenant_id"`
+	DomainID         pgtype.UUID        `json:"domain_id"`
+	Status           string             `json:"status"`
+	NotAfter         pgtype.Timestamptz `json:"not_after"`
+	SecretRef        string             `json:"secret_ref"`
+	Issuer           string             `json:"issuer"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	RenewalAttempts  int32              `json:"renewal_attempts"`
+	NextAttemptAt    pgtype.Timestamptz `json:"next_attempt_at"`
+	RenewalClaimedAt pgtype.Timestamptz `json:"renewal_claimed_at"`
+	LastErrorCode    string             `json:"last_error_code"`
+}
+
+type CertificateIssuanceRateLimit struct {
+	IssuerKey       string             `json:"issuer_key"`
+	WindowStartedAt pgtype.Timestamptz `json:"window_started_at"`
+	OrdersCount     int32              `json:"orders_count"`
 }
 
 type ConfigChangeOutbox struct {
@@ -138,15 +148,45 @@ type Domain struct {
 }
 
 type Edge struct {
-	ID              pgtype.UUID        `json:"id"`
-	Region          string             `json:"region"`
-	Provider        string             `json:"provider"`
-	Status          string             `json:"status"`
-	SnapshotVersion int64              `json:"snapshot_version"`
-	LastHeartbeatAt pgtype.Timestamptz `json:"last_heartbeat_at"`
-	CertSerial      string             `json:"cert_serial"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	ID               pgtype.UUID        `json:"id"`
+	Region           string             `json:"region"`
+	Provider         string             `json:"provider"`
+	Status           string             `json:"status"`
+	SnapshotVersion  int64              `json:"snapshot_version"`
+	LastHeartbeatAt  pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CertSerial       string             `json:"cert_serial"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	DnsPresent       bool               `json:"dns_present"`
+	HealthyStreak    int32              `json:"healthy_streak"`
+	UnhealthyStreak  int32              `json:"unhealthy_streak"`
+	CertNotAfter     pgtype.Timestamptz `json:"cert_not_after"`
+	LastHeartbeat    []byte             `json:"last_heartbeat"`
+	CompromisedAt    pgtype.Timestamptz `json:"compromised_at"`
+	DecommissionedAt pgtype.Timestamptz `json:"decommissioned_at"`
+}
+
+type EdgeBootstrapToken struct {
+	ID         pgtype.UUID        `json:"id"`
+	EdgeID     pgtype.UUID        `json:"edge_id"`
+	TokenHash  []byte             `json:"token_hash"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	ConsumedAt pgtype.Timestamptz `json:"consumed_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+type EdgeCertificate struct {
+	Serial    string             `json:"serial"`
+	EdgeID    pgtype.UUID        `json:"edge_id"`
+	Status    string             `json:"status"`
+	NotAfter  pgtype.Timestamptz `json:"not_after"`
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type EdgeDnsWithdrawalLimit struct {
+	Region           string             `json:"region"`
+	LastWithdrawalAt pgtype.Timestamptz `json:"last_withdrawal_at"`
 }
 
 type EmailVerificationToken struct {

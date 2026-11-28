@@ -85,6 +85,9 @@ type integrationCleanup struct {
 	redis   *redis.Client
 	emails  []string
 	tenants []uuid.UUID
+	edges   []uuid.UUID
+	regions []string
+	issuers []string
 	roles   []cleanupRole
 }
 
@@ -103,8 +106,11 @@ func cleanupForTest(t *testing.T, admin *pgxpool.Pool, clients ...*redis.Client)
 	t.Cleanup(c.run)
 	return c
 }
-func (c *integrationCleanup) email(email string)  { c.emails = append(c.emails, email) }
-func (c *integrationCleanup) tenant(id uuid.UUID) { c.tenants = append(c.tenants, id) }
+func (c *integrationCleanup) email(email string)   { c.emails = append(c.emails, email) }
+func (c *integrationCleanup) tenant(id uuid.UUID)  { c.tenants = append(c.tenants, id) }
+func (c *integrationCleanup) edge(id uuid.UUID)    { c.edges = append(c.edges, id) }
+func (c *integrationCleanup) region(region string) { c.regions = append(c.regions, region) }
+func (c *integrationCleanup) issuer(issuer string) { c.issuers = append(c.issuers, issuer) }
 func (c *integrationCleanup) role(name, group string) {
 	c.roles = append(c.roles, cleanupRole{name: name, group: group})
 }
@@ -146,7 +152,7 @@ func (c *integrationCleanup) runWithRolesAndPool(includeRoles bool, execPool *pg
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup lookup by test email %q: %w", email, err))
 		}
 	}
-	if len(users) == 0 && len(tenants) == 0 && len(c.roles) == 0 {
+	if len(users) == 0 && len(tenants) == 0 && len(c.edges) == 0 && len(c.regions) == 0 && len(c.issuers) == 0 && len(c.roles) == 0 {
 		if len(cleanupErrors) > 0 {
 			c.t.Errorf("integration fixture cleanup errors: %v", errors.Join(cleanupErrors...))
 		}
@@ -166,7 +172,7 @@ func (c *integrationCleanup) runWithRolesAndPool(includeRoles bool, execPool *pg
 	if !includeRoles {
 		roles = nil
 	}
-	statements := fixtureCleanupStatements(tenants, users, roles)
+	statements := fixtureCleanupStatements(tenants, users, roles, cleanupFixtureKeys{edgeIDs: c.edges, regions: c.regions, issuers: c.issuers})
 	for i, stmt := range statements {
 		sp := fmt.Sprintf("fixture_cleanup_%d", i)
 		if _, err := tx.Exec(ctx, "SAVEPOINT "+sp); err != nil {
@@ -191,10 +197,25 @@ func (c *integrationCleanup) runWithRolesAndPool(includeRoles bool, execPool *pg
 	}
 }
 
-func fixtureCleanupStatements(tenants, users []uuid.UUID, roles []cleanupRole) []cleanupStatement {
+type cleanupFixtureKeys struct {
+	edgeIDs []uuid.UUID
+	regions []string
+	issuers []string
+}
+
+func fixtureCleanupStatements(tenants, users []uuid.UUID, roles []cleanupRole, keys ...cleanupFixtureKeys) []cleanupStatement {
+	var fixture cleanupFixtureKeys
+	if len(keys) > 0 {
+		fixture = keys[0]
+	}
 	statements := []cleanupStatement{
 		{`DELETE FROM public.config_change_outbox WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
 		{`DELETE FROM public.certificates WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
+		{`DELETE FROM public.edge_bootstrap_tokens WHERE edge_id=ANY($1::uuid[])`, []any{fixture.edgeIDs}},
+		{`DELETE FROM public.edge_certificates WHERE edge_id=ANY($1::uuid[])`, []any{fixture.edgeIDs}},
+		{`DELETE FROM public.edges WHERE id=ANY($1::uuid[])`, []any{fixture.edgeIDs}},
+		{`DELETE FROM public.edge_dns_withdrawal_limits WHERE region=ANY($1::text[])`, []any{fixture.regions}},
+		{`DELETE FROM public.certificate_issuance_rate_limits WHERE issuer_key=ANY($1::text[])`, []any{fixture.issuers}},
 		{`DELETE FROM public.domains WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
 		{`DELETE FROM public.origins WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
 		{`DELETE FROM public.waf_settings WHERE tenant_id=ANY($1::uuid[])`, []any{tenants}},
@@ -228,6 +249,7 @@ func fixtureCleanupStatements(tenants, users []uuid.UUID, roles []cleanupRole) [
 		group := pgx.Identifier{role.group}.Sanitize()
 		statements = append(statements,
 			cleanupStatement{`REVOKE ` + group + ` FROM ` + ident, nil},
+			cleanupStatement{`DROP OWNED BY ` + ident, nil},
 			cleanupStatement{`DROP ROLE IF EXISTS ` + ident, nil},
 		)
 	}
@@ -261,47 +283,55 @@ func orderAuditCleanupLastBeforeOrganization(statements []cleanupStatement) []cl
 }
 
 var cleanupTableCoverage = map[string]string{
-	"users":                     "delete by tracked user UUID after clearing default_tenant_id",
-	"organizations":             "delete by tracked tenant UUID after tenant children and user references",
-	"memberships":               "delete by tenant_id or tracked user_id",
-	"invitations":               "delete by tenant_id",
-	"refresh_tokens":            "delete by user_id",
-	"api_keys":                  "delete by tenant_id or created_by",
-	"subscriptions":             "delete by tenant_id",
-	"invoices":                  "delete by tenant_id",
-	"sites":                     "delete by tenant_id after site-owned rows",
-	"domains":                   "delete by tenant_id after certificates",
-	"origins":                   "delete by tenant_id",
-	"waf_settings":              "delete by tenant_id",
-	"rules":                     "delete by tenant_id",
-	"rate_limit_policies":       "delete by tenant_id",
-	"access_lists":              "delete by tenant_id",
-	"bot_settings":              "delete by tenant_id",
-	"cache_settings":            "delete by tenant_id",
-	"certificates":              "delete by tenant_id before domains",
-	"rule_history":              "delete by tenant_id",
-	"alert_rules":               "delete by tenant_id",
-	"notification_channels":     "delete by tenant_id",
-	"alerts":                    "delete by tenant_id",
-	"audit_logs":                "delete by tenant_id or actor_id",
-	"usage_counters":            "delete by tenant_id",
-	"email_verification_tokens": "delete by user_id",
-	"password_reset_tokens":     "delete by user_id",
-	"totp_recovery_codes":       "delete by user_id",
-	"config_change_outbox":      "delete by tenant_id before site rows",
+	"users":                            "delete by tracked user UUID after clearing default_tenant_id",
+	"organizations":                    "delete by tracked tenant UUID after tenant children and user references",
+	"memberships":                      "delete by tenant_id or tracked user_id",
+	"invitations":                      "delete by tenant_id",
+	"refresh_tokens":                   "delete by user_id",
+	"api_keys":                         "delete by tenant_id or created_by",
+	"subscriptions":                    "delete by tenant_id",
+	"invoices":                         "delete by tenant_id",
+	"sites":                            "delete by tenant_id after site-owned rows",
+	"domains":                          "delete by tenant_id after certificates",
+	"origins":                          "delete by tenant_id",
+	"waf_settings":                     "delete by tenant_id",
+	"rules":                            "delete by tenant_id",
+	"rate_limit_policies":              "delete by tenant_id",
+	"access_lists":                     "delete by tenant_id",
+	"bot_settings":                     "delete by tenant_id",
+	"cache_settings":                   "delete by tenant_id",
+	"certificates":                     "delete by tenant_id before domains",
+	"edges":                            "delete only edge UUIDs registered by the current integration fixture",
+	"edge_bootstrap_tokens":            "delete by tracked fixture edge UUID before deleting edges",
+	"edge_certificates":                "delete by tracked fixture edge UUID before deleting edges",
+	"edge_dns_withdrawal_limits":       "delete by tracked fixture region",
+	"certificate_issuance_rate_limits": "delete by tracked fixture issuer key",
+	"rule_history":                     "delete by tenant_id",
+	"alert_rules":                      "delete by tenant_id",
+	"notification_channels":            "delete by tenant_id",
+	"alerts":                           "delete by tenant_id",
+	"audit_logs":                       "delete by tenant_id or actor_id",
+	"usage_counters":                   "delete by tenant_id",
+	"email_verification_tokens":        "delete by user_id",
+	"password_reset_tokens":            "delete by user_id",
+	"totp_recovery_codes":              "delete by user_id",
+	"config_change_outbox":             "delete by tenant_id before site rows",
 }
 
 var cleanupGlobalTableAllowlist = map[string]string{
-	"plans":            "shared product catalog; seeded globally and contains no fixture ownership key",
-	"config_snapshots": "global signed snapshot inventory; integration fixtures do not create snapshots",
-	"edges":            "global edge inventory; integration fixtures do not create edges",
-	"webhook_events":   "global provider idempotency inbox; integration fixtures do not process webhooks",
-	"goose_db_version": "migration bookkeeping, never test fixture data",
+	"plans":                            "shared product catalog; seeded globally and contains no fixture ownership key",
+	"config_snapshots":                 "global signed snapshot inventory; integration fixtures do not create snapshots",
+	"edge_bootstrap_tokens":            "fleet bootstrap records are cleaned by tracked edge UUID in integration fixtures",
+	"edge_certificates":                "fleet certificates are cleaned by tracked edge UUID in integration fixtures",
+	"edge_dns_withdrawal_limits":       "fleet cooldown records are cleaned by tracked fixture region",
+	"certificate_issuance_rate_limits": "issuer quota rows are cleaned by tracked fixture issuer key",
+	"webhook_events":                   "global provider idempotency inbox; integration fixtures do not process webhooks",
+	"goose_db_version":                 "migration bookkeeping, never test fixture data",
 }
 
 func TestIntegrationCleanupSchemaCoverage(t *testing.T) {
 	ctx, pool, _ := integrationDeps(t)
-	statements := fixtureCleanupStatements(nil, nil, nil)
+	statements := fixtureCleanupStatements(nil, nil, nil, cleanupFixtureKeys{})
 	auditIndex, organizationIndex := -1, -1
 	for i, statement := range statements {
 		if strings.HasPrefix(statement.sql, "DELETE FROM public.audit_logs ") {
@@ -1489,11 +1519,15 @@ func TestPublicTableRLSAllowlist(t *testing.T) {
 	ctx, pool, _ := integrationDeps(t)
 	_ = cleanupForTest(t, pool)
 	allow := map[string]string{
-		"plans":            "globally readable product catalog; contains no tenant data",
-		"config_snapshots": "control-plane signed snapshot metadata, restricted by deployment grants",
-		"edges":            "fleet-wide control-plane inventory, restricted by deployment grants",
-		"webhook_events":   "provider idempotency inbox, restricted by deployment grants",
-		"goose_db_version": "migration bookkeeping, not application tenant data",
+		"plans":                            "globally readable product catalog; contains no tenant data",
+		"config_snapshots":                 "control-plane signed snapshot metadata, restricted by deployment grants",
+		"edges":                            "fleet inventory accessible only to waf_worker",
+		"edge_certificates":                "edge certificate serial and revocation state accessible only to waf_worker",
+		"edge_bootstrap_tokens":            "hashed one-time credentials accessible only to waf_worker",
+		"certificate_issuance_rate_limits": "worker-only issuer quota state",
+		"edge_dns_withdrawal_limits":       "worker-only DNS withdrawal cooldown state",
+		"webhook_events":                   "provider idempotency inbox, restricted by deployment grants",
+		"goose_db_version":                 "migration bookkeeping, not application tenant data",
 	}
 	rows, err := pool.Query(ctx, `SELECT c.relname,c.relrowsecurity FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') ORDER BY c.relname`)
 	if err != nil {

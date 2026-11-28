@@ -1,26 +1,34 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/example/wafplatform/controlplane/internal/fleet"
 	"github.com/example/wafplatform/controlplane/internal/platform/db"
 	platformnats "github.com/example/wafplatform/controlplane/internal/platform/nats"
 	"github.com/example/wafplatform/controlplane/internal/platform/secret"
 	"github.com/example/wafplatform/controlplane/internal/snapshot"
+	"github.com/google/uuid"
 )
 
 func main() {
@@ -132,31 +140,173 @@ func run() error {
 		}
 	}()
 
+	certFile, keyFile, clientCAPath := os.Getenv("WORKER_TLS_CERT_FILE"), os.Getenv("WORKER_TLS_KEY_FILE"), os.Getenv("EDGE_CLIENT_CA_FILE")
+	if certFile == "" || keyFile == "" {
+		return errors.New("WORKER_TLS_CERT_FILE and WORKER_TLS_KEY_FILE are required for internal TLS")
+	}
+	var clientCAPEM []byte
+	if clientCAPath != "" {
+		clientCAPEM, err = readConfiguredFile(clientCAPath)
+		if err != nil {
+			return fmt.Errorf("read edge client CA: %w", err)
+		}
+	}
+	caCertificatePath := os.Getenv("EDGE_CA_CERT_FILE")
+	if caCertificatePath == "" && len(clientCAPEM) > 0 {
+		caCertificatePath = clientCAPath
+	}
+	var caCertificatePEM []byte
+	if caCertificatePath != "" {
+		caCertificatePEM, err = readConfiguredFile(caCertificatePath)
+		if err != nil {
+			return fmt.Errorf("read edge signing CA certificate: %w", err)
+		}
+	}
+	caStore := secret.NewMemory()
+	caAuthority, caPEM, err := loadEdgeAuthority(ctx, caCertificatePEM, os.Getenv("EDGE_CA_KEY_FILE"), os.Getenv("APP_ENV"), caStore)
+	if err != nil {
+		return err
+	}
+	if len(clientCAPEM) == 0 {
+		clientCAPEM = caPEM
+	}
+	if !bytesEqualCertificates(caPEM, clientCAPEM) {
+		return errors.New("EDGE_CA_CERT_FILE and EDGE_CLIENT_CA_FILE must identify the same internal CA")
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(clientCAPEM) {
+		return errors.New("EDGE_CLIENT_CA_FILE contains no valid certificates")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.Handle("GET /internal/snapshot", snapshot.EdgeHandler{Repository: repository, Objects: objects, Resolver: repository})
-	server := &http.Server{Addr: env("WORKER_ADDR", ":8082"), Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
-	certFile, keyFile, caFile := os.Getenv("WORKER_TLS_CERT_FILE"), os.Getenv("WORKER_TLS_KEY_FILE"), os.Getenv("EDGE_CLIENT_CA_FILE")
-	if certFile == "" || keyFile == "" || caFile == "" {
-		return errors.New("WORKER_TLS_CERT_FILE, WORKER_TLS_KEY_FILE, and EDGE_CLIENT_CA_FILE are required for internal snapshot mTLS")
+	fleetService := fleet.Service{Pool: pool.Pool, CA: caAuthority}
+	mux.HandleFunc("POST /internal/edges/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			http.Error(w, "secure transport required", http.StatusUpgradeRequired)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		var request struct {
+			Token string `json:"token"`
+			CSR   string `json:"csr"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			http.Error(w, "invalid registration request", http.StatusBadRequest)
+			return
+		}
+		registration, registerErr := fleetService.Register(r.Context(), request.Token, []byte(request.CSR), caPEM)
+		if registerErr != nil {
+			if errors.Is(registerErr, fleet.ErrBootstrapRejected) {
+				http.Error(w, "bootstrap token rejected", http.StatusUnauthorized)
+			} else {
+				http.Error(w, "registration rejected", http.StatusBadRequest)
+			}
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(registration)
+	})
+	mux.HandleFunc("POST /internal/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
+			http.Error(w, "mTLS client certificate required", http.StatusUnauthorized)
+			return
+		}
+		edgeID, ok := edgeIDFromCertificate(r.TLS.PeerCertificates[0])
+		if !ok {
+			http.Error(w, "edge identity is invalid", http.StatusUnauthorized)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		var heartbeat fleet.Heartbeat
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&heartbeat); err != nil {
+			http.Error(w, "invalid heartbeat", http.StatusBadRequest)
+			return
+		}
+		if err := fleetService.Heartbeat(r.Context(), edgeID, r.TLS.PeerCertificates[0].SerialNumber.Text(16), heartbeat); err != nil {
+			if errors.Is(err, fleet.ErrEdgeCertificateRejected) {
+				http.Error(w, "edge certificate rejected", http.StatusUnauthorized)
+			} else {
+				http.Error(w, "heartbeat rejected", http.StatusConflict)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /internal/edges/renew", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
+			http.Error(w, "mTLS client certificate required", http.StatusUnauthorized)
+			return
+		}
+		peer := r.TLS.PeerCertificates[0]
+		edgeID, ok := edgeIDFromCertificate(peer)
+		if !ok {
+			http.Error(w, "edge identity is invalid", http.StatusUnauthorized)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		var request struct {
+			CSR string `json:"csr"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			http.Error(w, "invalid renewal request", http.StatusBadRequest)
+			return
+		}
+		registration, err := fleetService.RenewCertificate(r.Context(), edgeID, peer.SerialNumber.Text(16), []byte(request.CSR), caPEM)
+		if err != nil {
+			http.Error(w, "certificate renewal rejected", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		if err = json.NewEncoder(w).Encode(registration); err != nil {
+			log.Printf("edge certificate renewal response failed")
+		}
+	})
+	workerAddr := env("WORKER_ADDR", "127.0.0.1:8082")
+	if err := validateWorkerBind(workerAddr, os.Getenv("WORKER_ALLOW_NETWORK") == "true"); err != nil {
+		return err
 	}
-	caPEM, err := readConfiguredFile(caFile)
-	if err != nil {
-		return fmt.Errorf("read edge client CA: %w", err)
-	}
-	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caPEM) {
-		return errors.New("EDGE_CLIENT_CA_FILE contains no valid certificates")
-	}
-	server.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: caPool}
+	server := &http.Server{Addr: workerAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	// A new edge cannot present a client certificate during bootstrap. Registration
+	// therefore uses HTTPS plus its one-time token; all post-enrollment routes enforce
+	// verified client certificates in their handlers.
+	server.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: caPool}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
+	}()
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		providers := map[string]fleet.DNSProvider{"cloudflare": fleet.ProviderStub{Name: "cloudflare"}, "route53": fleet.ProviderStub{Name: "route53"}}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				_ = now
+				sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				if err := fleetService.SweepHealth(sweepCtx, providers, 90*time.Second, 3, 1); err != nil {
+					log.Printf("edge health sweep failed: %q", err.Error())
+				}
+				cancel()
+			}
+		}
 	}()
 	log.Printf("snapshot worker listening with mTLS on %s region=%q", server.Addr, region)
 	err = server.ListenAndServeTLS(certFile, keyFile)
@@ -164,6 +314,150 @@ func run() error {
 		return ctx.Err()
 	}
 	return err
+}
+
+func validateWorkerBind(addr string, allowNetwork bool) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid WORKER_ADDR: %w", err)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	if !allowNetwork {
+		return errors.New("non-loopback WORKER_ADDR requires WORKER_ALLOW_NETWORK=true; TLS is mandatory")
+	}
+	return nil
+}
+
+func edgeIDFromCertificate(cert *x509.Certificate) (uuid.UUID, bool) {
+	if cert == nil {
+		return uuid.Nil, false
+	}
+	for _, identity := range cert.URIs {
+		if identity == nil || identity.Scheme != "spiffe" || identity.Host != "waf" {
+			continue
+		}
+		parsed, err := url.Parse(identity.String())
+		if err != nil {
+			continue
+		}
+		const prefix = "/edge/"
+		if len(parsed.Path) <= len(prefix) || parsed.Path[:len(prefix)] != prefix {
+			continue
+		}
+		id, err := uuid.Parse(parsed.Path[len(prefix):])
+		if err == nil && cert.Subject.CommonName == id.String() {
+			return id, true
+		}
+	}
+	return uuid.Nil, false
+}
+
+func loadEdgeAuthority(ctx context.Context, certificatePEM []byte, keyFile, appEnv string, store secret.Store) (*fleet.Authority, []byte, error) {
+	if store == nil {
+		return nil, nil, errors.New("edge CA SecretStore is required")
+	}
+	var privatePEM []byte
+	var err error
+	if keyFile == "" {
+		if strings.EqualFold(appEnv, "production") || len(certificatePEM) != 0 {
+			return nil, nil, errors.New("configured edge CA certificate requires EDGE_CA_KEY_FILE")
+		}
+		certificatePEM, privatePEM, err = fleet.NewDevelopmentAuthorityPEM(time.Now())
+	} else {
+		if len(certificatePEM) == 0 {
+			return nil, nil, errors.New("EDGE_CA_CERT_FILE is required with EDGE_CA_KEY_FILE")
+		}
+		privatePEM, err = readPrivateCAKeyFile(keyFile)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	defer clear(privatePEM)
+	const secretName = "edge-ca/private-key"
+	if err = store.Put(ctx, secretName, privatePEM); err != nil {
+		return nil, nil, errors.New("store edge CA private key")
+	}
+	storedPEM, err := store.Get(ctx, secretName)
+	if err != nil {
+		return nil, nil, errors.New("load edge CA private key from SecretStore")
+	}
+	defer clear(storedPEM)
+	authority, err := fleet.NewAuthorityFromPEM(certificatePEM, storedPEM)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load edge CA from SecretStore: %w", err)
+	}
+	return authority, append([]byte(nil), certificatePEM...), nil
+}
+
+func readPrivateCAKeyFile(path string) ([]byte, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, errors.New("resolve edge CA key path")
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return nil, errors.New("resolve edge CA key file")
+	}
+	if root := repositoryRoot(); root != "" {
+		root, err = filepath.EvalSymlinks(root)
+		if err == nil {
+			relative, relErr := filepath.Rel(root, resolved)
+			if relErr == nil && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))) {
+				return nil, errors.New("edge CA private key file must be outside the repository")
+			}
+		}
+	}
+	rootDir, err := os.OpenRoot(filepath.Dir(resolved))
+	if err != nil {
+		return nil, errors.New("open edge CA key directory")
+	}
+	defer func() { _ = rootDir.Close() }()
+	base := filepath.Base(resolved)
+	info, err := rootDir.Stat(base)
+	if err != nil {
+		return nil, errors.New("read edge CA key file metadata")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("edge CA key path must be a regular file")
+	}
+	permissions := info.Mode().Perm()
+	if runtime.GOOS != "windows" && permissions != 0o400 && permissions != 0o600 {
+		return nil, errors.New("edge CA private key file must have mode 0600 or stricter")
+	}
+	return rootDir.ReadFile(base)
+}
+
+func repositoryRoot() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for directory := cwd; ; directory = filepath.Dir(directory) {
+		if _, err := os.Stat(filepath.Join(directory, ".git")); err == nil {
+			return directory
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			return ""
+		}
+	}
+}
+
+func bytesEqualCertificates(a, b []byte) bool {
+	blockA, _ := pem.Decode(a)
+	blockB, _ := pem.Decode(b)
+	if blockA == nil || blockB == nil || blockA.Type != "CERTIFICATE" || blockB.Type != "CERTIFICATE" {
+		return false
+	}
+	certA, errA := x509.ParseCertificate(blockA.Bytes)
+	certB, errB := x509.ParseCertificate(blockB.Bytes)
+	return errA == nil && errB == nil && bytes.Equal(certA.Raw, certB.Raw)
 }
 
 func readConfiguredFile(path string) ([]byte, error) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log"
 	"net/http"
@@ -46,6 +47,14 @@ func run() error {
 		return err
 	}
 	srv := &http.Server{Addr: cfg.APIAddr, Handler: s.Router(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	if cfg.APITLSCertFile != "" || cfg.APITLSKeyFile != "" {
+		if cfg.APITLSCertFile == "" || cfg.APITLSKeyFile == "" {
+			return errors.New("API_TLS_CERT_FILE and API_TLS_KEY_FILE must be configured together")
+		}
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else if cfg.Environment == "production" {
+		return errors.New("production API requires API_TLS_CERT_FILE and API_TLS_KEY_FILE")
+	}
 	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
@@ -54,7 +63,13 @@ func run() error {
 		defer c()
 		_ = srv.Shutdown(shutdown)
 	}()
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	var serveErr error
+	if cfg.APITLSCertFile != "" {
+		serveErr = srv.ListenAndServeTLS(cfg.APITLSCertFile, cfg.APITLSKeyFile)
+	} else {
+		serveErr = srv.ListenAndServe()
+	}
+	if err := serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil

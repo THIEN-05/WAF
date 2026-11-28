@@ -12,9 +12,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/example/wafplatform/controlplane/internal/analytics"
 	"github.com/example/wafplatform/controlplane/internal/auth"
 	"github.com/example/wafplatform/controlplane/internal/entitlement"
 	"github.com/example/wafplatform/controlplane/internal/platform/config"
@@ -38,6 +40,7 @@ type Server struct {
 	private      ed25519.PrivateKey
 	tenant       tenant.Service
 	entitlements entitlement.Service
+	analytics    analytics.AnalyticsService
 }
 
 func New(cfg config.Config, pool *db.Pool, rc *redis.Client, log *slog.Logger) (*Server, error) {
@@ -55,7 +58,7 @@ func New(cfg config.Config, pool *db.Pool, rc *redis.Client, log *slog.Logger) (
 	if err != nil || len(totpKey) < 32 {
 		return nil, errors.New("TOTP_ENCRYPTION_KEY must be base64 encoded and contain at least 32 bytes")
 	}
-	s := &Server{cfg: cfg, pool: pool, redis: rc, log: log, private: ed25519.PrivateKey(privateRaw), auth: auth.Service{Pool: pool.Pool, Redis: rc, Mailer: auth.SMTPMailer{Addr: cfg.SMTPAddr, From: cfg.SMTPFrom}, JWTPrivate: ed25519.PrivateKey(privateRaw), JWTKeyID: "cp-1", TOTPEncryptionKey: totpKey}, tenant: tenant.Service{Pool: pool.Pool}, entitlements: entitlement.Service{Pool: pool.Pool}}
+	s := &Server{cfg: cfg, pool: pool, redis: rc, log: log, private: ed25519.PrivateKey(privateRaw), auth: auth.Service{Pool: pool.Pool, Redis: rc, Mailer: auth.SMTPMailer{Addr: cfg.SMTPAddr, From: cfg.SMTPFrom}, JWTPrivate: ed25519.PrivateKey(privateRaw), JWTKeyID: "cp-1", TOTPEncryptionKey: totpKey}, tenant: tenant.Service{Pool: pool.Pool}, entitlements: entitlement.Service{Pool: pool.Pool}, analytics: analytics.AnalyticsService{Pool: pool.Pool, Cache: rc, ClickHouse: analytics.ClickHouseHTTP{Endpoint: apiEnv("CLICKHOUSE_URL", "http://127.0.0.1:8123"), Database: apiEnv("CLICKHOUSE_DATABASE", "waf"), Username: os.Getenv("CLICKHOUSE_USER"), Password: os.Getenv("CLICKHOUSE_PASSWORD")}}}
 	return s, nil
 }
 func (s *Server) Router() http.Handler {
@@ -107,6 +110,7 @@ func (s *Server) Router() http.Handler {
 		v.With(s.requireAuth).Post("/tenants/{tenant_id}/sites", s.createSite)
 		v.With(s.requireAuth).Post("/tenants/{tenant_id}/sites/{site_id}/domains", s.addDomain)
 		v.With(s.requireAuth).Post("/tenants/{tenant_id}/sites/{site_id}/origins", s.addOrigin)
+		v.With(s.requireAuth).Get("/sites/{site_id}/analytics/{view:overview|timeseries|top}", s.siteAnalytics)
 	})
 	return r
 }

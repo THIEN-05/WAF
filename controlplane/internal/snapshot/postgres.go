@@ -290,7 +290,11 @@ func (p PostgresRepository) ResolveEdge(ctx context.Context, cert *x509.Certific
 	}
 	serial := strings.ToLower(cert.SerialNumber.Text(16))
 	var edgeID, region string
-	err := p.Pool.QueryRow(ctx, `SELECT id::text,region FROM public.edges WHERE lower(cert_serial)=$1 AND status IN ('ready','active')`, serial).Scan(&edgeID, &region)
+	err := p.Pool.QueryRow(ctx, `SELECT e.id::text,e.region
+  FROM public.edges e
+  JOIN public.edge_certificates c ON c.edge_id=e.id AND lower(c.serial)=lower($1)
+  WHERE lower(e.cert_serial)=lower($1) AND e.status IN ('ready','active')
+    AND e.compromised_at IS NULL AND c.status='active' AND c.not_after>now()`, serial).Scan(&edgeID, &region)
 	if err != nil {
 		return "", "", err
 	}
