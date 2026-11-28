@@ -440,11 +440,11 @@ func TestHTTPClientRequiresHTTPSAndPreservesSnapshotQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint, err := url.Parse(client.endpoint("/v1/snapshot?since=42"))
+	endpoint, err := url.Parse(client.endpoint("/internal/snapshot?since=42&edge_id=edge-1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if endpoint.Path != "/api/v1/snapshot" || endpoint.Query().Get("since") != "42" {
+	if endpoint.Path != "/api/internal/snapshot" || endpoint.Query().Get("since") != "42" || endpoint.Query().Get("edge_id") != "edge-1" {
 		t.Fatalf("snapshot endpoint path=%q query=%v", endpoint.Path, endpoint.Query())
 	}
 }

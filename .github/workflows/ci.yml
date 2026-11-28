@@ -132,6 +132,8 @@ jobs:
 
   cp-integration:
     runs-on: ubuntu-latest
+    env:
+      NATS_URL: nats://127.0.0.1:4222
     services:
       postgres:
         image: postgres:18.0
@@ -155,6 +157,10 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
+      nats:
+        image: nats:2.10.26-alpine
+        ports:
+          - 4222:4222
       mailhog:
         image: mailhog/mailhog:v1.0.1
         ports:

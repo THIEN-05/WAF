@@ -324,6 +324,7 @@ type Agent struct {
 	secrets      SecretSink
 	cfg          AgentConfig
 	mu           sync.Mutex
+	applyMu      sync.Mutex
 	edgeID       string
 	etag         string
 	version      uint64
@@ -512,10 +513,20 @@ func (a *Agent) ApplySnapshot(raw []byte, etag string) error {
 	return a.applySnapshot(context.Background(), raw, etag)
 }
 func (a *Agent) applySnapshot(ctx context.Context, raw []byte, etag string) error {
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
 	if len(raw) == 0 {
 		return errors.New("empty signed snapshot")
 	}
 	snapshot, err := wafcore.VerifySnapshot(raw, a.cfg.PublicKeys)
+	if err == nil {
+		a.mu.Lock()
+		current := a.version
+		a.mu.Unlock()
+		if snapshot.Version <= current {
+			err = fmt.Errorf("snapshot version %d is not newer than active version %d", snapshot.Version, current)
+		}
+	}
 	if err == nil && a.secrets != nil {
 		a.mu.Lock()
 		id := a.edgeID
