@@ -128,6 +128,14 @@ func (b *Builder) Build(ctx context.Context, region string) (Record, error) {
 		site := candidate.Site
 		if candidate.Err == nil {
 			applyEntitlementCaps(&site)
+			if site.Entitlements.BotJSChallenge && site.Secrets.ChallengeHMACKeyID == "" {
+				site.Entitlements.BotJSChallenge = false
+				if site.Bot.Mode == "challenge" {
+					site.Bot.Mode = "monitor"
+				}
+				b.warn(site.ID, "bot JS challenge disabled because its signing key reference is missing")
+				applyEntitlementCaps(&site)
+			}
 			candidate.Err = validateSite(site)
 		}
 		if candidate.Err != nil {

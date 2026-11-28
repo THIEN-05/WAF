@@ -73,3 +73,19 @@ func TestConfiguredEdgeCAKeyRequiresPrivateExternalFile(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkerNetworkBindRequiresExplicitOptIn(t *testing.T) {
+	for _, addr := range []string{"0.0.0.0:8082", ":8082", "[::]:8082", "192.0.2.10:8082"} {
+		if err := validateWorkerBind(addr, false); err == nil {
+			t.Errorf("non-loopback bind %q accepted without explicit network flag", addr)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1:8082", "[::1]:8082", "localhost:8082"} {
+		if err := validateWorkerBind(addr, false); err != nil {
+			t.Errorf("loopback bind %q rejected: %v", addr, err)
+		}
+	}
+	if err := validateWorkerBind("0.0.0.0:8082", true); err != nil {
+		t.Fatalf("explicit TLS network bind rejected: %v", err)
+	}
+}

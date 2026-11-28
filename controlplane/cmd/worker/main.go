@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -274,7 +275,11 @@ func run() error {
 			log.Printf("edge certificate renewal response failed")
 		}
 	})
-	server := &http.Server{Addr: env("WORKER_ADDR", "127.0.0.1:8082"), Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	workerAddr := env("WORKER_ADDR", "127.0.0.1:8082")
+	if err := validateWorkerBind(workerAddr, os.Getenv("WORKER_ALLOW_NETWORK") == "true"); err != nil {
+		return err
+	}
+	server := &http.Server{Addr: workerAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	// A new edge cannot present a client certificate during bootstrap. Registration
 	// therefore uses HTTPS plus its one-time token; all post-enrollment routes enforce
 	// verified client certificates in their handlers.
@@ -309,6 +314,24 @@ func run() error {
 		return ctx.Err()
 	}
 	return err
+}
+
+func validateWorkerBind(addr string, allowNetwork bool) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid WORKER_ADDR: %w", err)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	if !allowNetwork {
+		return errors.New("non-loopback WORKER_ADDR requires WORKER_ALLOW_NETWORK=true; TLS is mandatory")
+	}
+	return nil
 }
 
 func edgeIDFromCertificate(cert *x509.Certificate) (uuid.UUID, bool) {

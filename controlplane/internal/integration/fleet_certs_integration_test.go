@@ -132,6 +132,12 @@ func TestFleetEnrollmentHeartbeatDNSAndCertificateRevocationIntegration(t *testi
 	if service.CertificateActive(ctx, second.EdgeID, cert2.Serial) {
 		t.Fatal("compromised edge certificate remains active")
 	}
+	if err = service.Heartbeat(ctx, second.EdgeID, cert2.Serial, good); !errors.Is(err, fleet.ErrEdgeCertificateRejected) {
+		t.Fatalf("heartbeat accepted a revoked certificate: %v", err)
+	}
+	if err = service.Heartbeat(ctx, second.EdgeID, cert1.Serial, good); !errors.Is(err, fleet.ErrEdgeCertificateRejected) {
+		t.Fatalf("edge A certificate updated edge B heartbeat: %v", err)
+	}
 	if dns.Records[second.Region][second.EdgeID] {
 		t.Fatal("compromised edge DNS record remains")
 	}
@@ -175,6 +181,58 @@ func TestFleetEnrollmentHeartbeatDNSAndCertificateRevocationIntegration(t *testi
       (SELECT count(*) FROM public.edge_dns_withdrawal_limits WHERE region=ANY($2::text[]))`, cleanup.edges, cleanup.regions).Scan(&fleetResidue); err != nil || fleetResidue != 0 {
 		t.Fatalf("fleet fixture cleanup left %d rows: %v", fleetResidue, err)
 	}
+}
+
+func TestBootstrapTokenConcurrentRegistrationIsSingleUseIntegration(t *testing.T) {
+	ctx, admin, redisClient := integrationDeps(t)
+	cleanup := cleanupForTest(t, admin, redisClient)
+	worker := workerRolePool(t, ctx, admin, os.Getenv("DATABASE_URL"), cleanup)
+	ca, caPEM, err := fleet.NewDevelopmentAuthority(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := fleet.Service{Pool: worker, CA: ca}
+	bootstrap, err := service.CreateBootstrapToken(ctx, "it-race-"+uuid.NewString(), "integration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup.edge(bootstrap.EdgeID)
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "untrusted"}}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csr := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+	type outcome struct{ err error }
+	start := make(chan struct{})
+	results := make(chan outcome, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			_, registerErr := service.Register(ctx, bootstrap.Token, csr, caPEM)
+			results <- outcome{err: registerErr}
+		}()
+	}
+	close(start)
+	successes, rejected := 0, 0
+	for i := 0; i < 2; i++ {
+		result := <-results
+		switch {
+		case result.err == nil:
+			successes++
+		case errors.Is(result.err, fleet.ErrBootstrapRejected):
+			rejected++
+		default:
+			t.Fatalf("concurrent registration returned unexpected error: %v", result.err)
+		}
+	}
+	if successes != 1 || rejected != 1 {
+		t.Fatalf("single-use bootstrap race successes=%d rejected=%d", successes, rejected)
+	}
+	cleanup.runFixtureRows()
 }
 
 func TestCertificateRenewalBackoffAndSecretStoreIntegration(t *testing.T) {

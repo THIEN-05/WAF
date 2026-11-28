@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -129,6 +130,36 @@ func TestEntitlementCapsOnlyPublishChallengeKeyReferenceWhenEntitled(t *testing.
 	applyEntitlementCaps(&pro)
 	if pro.Secrets.ChallengeHMACKeyID != "pro-key-reference" {
 		t.Fatalf("entitled Pro snapshot lost challenge key reference: %+v", pro.Secrets)
+	}
+}
+
+func TestBuilderKeepsSiteAndDisablesChallengeWhenKeyReferenceMissing(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site := testSite("missing-challenge-key")
+	site.Entitlements.BotJSChallenge = true
+	site.Bot.Mode = "challenge"
+	repo := &memoryRepository{candidates: []Candidate{{Site: site}}}
+	warnings := make([]Warning, 0, 1)
+	builder := Builder{Repository: repo, Objects: &memoryObjects{values: map[string][]byte{}}, Signer: SecretSigner{Store: keyStore{key: private}, KeyID: "k"}, PublicKeys: map[string]ed25519.PublicKey{"k": public}, OnWarning: func(w Warning) { warnings = append(warnings, w) }}
+	record, err := builder.Build(context.Background(), "eu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := wafcore.VerifySnapshot(record.Signed, builder.PublicKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sites) != 1 || got.Sites[0].ID != site.ID {
+		t.Fatalf("missing optional challenge key removed site: sites=%+v", got.Sites)
+	}
+	if got.Sites[0].Entitlements.BotJSChallenge || got.Sites[0].Bot.Mode != "monitor" || got.Sites[0].Secrets.ChallengeHMACKeyID != "" {
+		t.Fatalf("challenge was not safely downgraded: %+v", got.Sites[0])
+	}
+	if len(warnings) != 1 || warnings[0].SiteID != site.ID || !strings.Contains(warnings[0].Message, "signing key reference is missing") {
+		t.Fatalf("missing-key warning=%+v", warnings)
 	}
 }
 

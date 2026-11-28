@@ -331,6 +331,16 @@ func TestSnapshotOutboxNATSSigningAndMTLSEndpointIntegration(t *testing.T) {
 	if err != nil || response.StatusCode != http.StatusForbidden {
 		t.Fatalf("unregistered client certificate serial=%s status=%v err=%v, want 403", unknownSerial, response.StatusCode, err)
 	}
+	if _, err = admin.Exec(ctx, `UPDATE public.edge_certificates SET status='revoked',revoked_at=now() WHERE serial=$1`, serial); err != nil {
+		t.Fatal(err)
+	}
+	response, _, err = requestSnapshot("&since=0")
+	if err != nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("revoked certificate serial was accepted while edge remained active: status=%v err=%v", response.StatusCode, err)
+	}
+	if _, err = admin.Exec(ctx, `UPDATE public.edge_certificates SET status='active',revoked_at=NULL WHERE serial=$1`, serial); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = admin.Exec(ctx, `UPDATE public.edges SET status='revoked' WHERE id=$1`, edgeID); err != nil {
 		t.Fatal(err)
 	}
