@@ -31,8 +31,6 @@ func (r RedisSiteResolver) ResolveSite(ctx context.Context, rawSiteID string) (S
 		if json.Unmarshal([]byte(raw), &identity) == nil && identity.TenantID != "" && identity.RetentionDay > 0 {
 			return identity, nil
 		}
-	} else if !errors.Is(cacheErr, redis.Nil) {
-		// The cache is an optimization. PostgreSQL remains the authority on cache outage.
 	}
 	var identity SiteIdentity
 	var entitlements string

@@ -45,11 +45,13 @@ func (d *FileDeadLetter) Put(_ context.Context, payload []byte, cause error) err
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 	if _, err = file.Write(append(encoded, '\n')); err != nil {
-		return err
+		return errors.Join(err, file.Close())
 	}
-	return file.Sync()
+	if err = file.Sync(); err != nil {
+		return errors.Join(err, file.Close())
+	}
+	return file.Close()
 }
 
 type queuedPayload struct{ raw []byte }

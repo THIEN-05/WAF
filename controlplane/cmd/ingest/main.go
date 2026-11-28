@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -31,7 +32,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (runErr error) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		return errors.New("DATABASE_URL is required")
@@ -49,7 +50,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("connect Redis: %w", err)
 	}
-	defer redisClient.Close()
+	defer func() { runErr = errors.Join(runErr, redisClient.Close()) }()
 	writer := analytics.ClickHouseHTTP{Endpoint: env("CLICKHOUSE_URL", "http://127.0.0.1:8123"), Database: env("CLICKHOUSE_DATABASE", "waf"), Username: os.Getenv("CLICKHOUSE_USER"), Password: os.Getenv("CLICKHOUSE_PASSWORD")}
 	batcher := &analytics.Batcher{Processor: analytics.Processor{Resolver: analytics.RedisSiteResolver{Cache: redisClient, Pool: pool.Pool, TTL: 30 * time.Second}}, Writer: writer, DeadLetters: &analytics.FileDeadLetter{Path: env("INGEST_DLQ_PATH", "var/ingest-dead-letter.jsonl")}, QueueSize: 4096, MaxRows: 10_000, FlushInterval: time.Second}
 	batcherDone, err := batcher.Start(ctx)
@@ -80,7 +81,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("subscribe NATS ingest subject: %w", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { runErr = errors.Join(runErr, sub.Unsubscribe()) }()
 	if err = natsConn.FlushTimeout(3 * time.Second); err != nil {
 		return fmt.Errorf("flush NATS subscription: %w", err)
 	}
@@ -159,7 +160,7 @@ func ingestServerTLS() (*tls.Config, error) {
 	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
 		return nil, fmt.Errorf("load ingest TLS identity: %w", err)
 	}
-	caPEM, err := os.ReadFile(caPath)
+	caPEM, err := readConfiguredCA(caPath, "INGEST_CLIENT_CA_FILE")
 	if err != nil {
 		return nil, fmt.Errorf("read ingest client CA: %w", err)
 	}
@@ -168,6 +169,28 @@ func ingestServerTLS() (*tls.Config, error) {
 		return nil, errors.New("INGEST_CLIENT_CA_FILE contains no certificates")
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS12, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool}, nil
+}
+
+func readConfiguredCA(path, variable string) ([]byte, error) {
+	cleanPath := filepath.Clean(path)
+	if !filepath.IsAbs(cleanPath) {
+		return nil, fmt.Errorf("%s must be an absolute path", variable)
+	}
+	root, err := os.OpenRoot(filepath.Dir(cleanPath))
+	if err != nil {
+		return nil, fmt.Errorf("open %s directory: %w", variable, err)
+	}
+	file, err := root.Open(filepath.Base(cleanPath))
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("open %s: %w", variable, err), root.Close())
+	}
+	data, readErr := io.ReadAll(file)
+	closeFileErr := file.Close()
+	closeRootErr := root.Close()
+	if err = errors.Join(readErr, closeFileErr, closeRootErr); err != nil {
+		return nil, fmt.Errorf("read %s: %w", variable, err)
+	}
+	return data, nil
 }
 
 func connectNATS(address string) (*nats.Conn, error) {
@@ -185,7 +208,7 @@ func connectNATS(address string) (*nats.Conn, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load NATS client identity: %w", err)
 		}
-		caPEM, err := os.ReadFile(caPath)
+		caPEM, err := readConfiguredCA(caPath, "INGEST_NATS_CA_FILE")
 		if err != nil {
 			return nil, fmt.Errorf("read NATS CA: %w", err)
 		}

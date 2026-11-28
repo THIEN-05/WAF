@@ -40,8 +40,11 @@ func encodeBatch(t *testing.T, batch CompressedBatch) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer encoder.Close()
-	return encoder.EncodeAll(raw, nil)
+	encoded := encoder.EncodeAll(raw, nil)
+	if err = encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func TestProcessorUsesCanonicalTenantAndPlanRetention(t *testing.T) {

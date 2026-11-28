@@ -269,7 +269,7 @@ type HTTPSFetcher struct {
 	Timeout time.Duration
 }
 
-func (f HTTPSFetcher) Fetch(ctx context.Context, source Source) ([]byte, error) {
+func (f HTTPSFetcher) Fetch(ctx context.Context, source Source) (_ []byte, retErr error) {
 	u, err := url.Parse(source.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, errors.New("reference source URL must be HTTPS")
@@ -291,7 +291,7 @@ func (f HTTPSFetcher) Fetch(ctx context.Context, source Source) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
+	defer func() { retErr = errors.Join(retErr, response.Body.Close()) }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, fmt.Errorf("reference fetch returned status %d", response.StatusCode)
 	}

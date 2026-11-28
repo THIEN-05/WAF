@@ -117,21 +117,19 @@ func (s AnalyticsService) Query(ctx context.Context, tenantID, siteID uuid.UUID,
 }
 
 func analyticsSQL(kind string, limit int) (string, error) {
-	whereEvents := `tenant_id={tenant_id:UUID} AND site_id={site_id:UUID} AND ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)}`
-	whereStats := `tenant_id={tenant_id:UUID} AND site_id={site_id:UUID} AND minute >= toStartOfMinute({from:DateTime64(3)}) AND minute < {to:DateTime64(3)}`
 	switch kind {
 	case "overview":
-		return `SELECT sum(requests) requests,sum(blocked) blocked,sum(challenged) challenged,sum(rate_limited) rate_limited,sum(cache_hits) cache_hits,sum(status_5xx) status_5xx FROM site_stats_1m WHERE ` + whereStats, nil
+		return `SELECT sum(requests) requests,sum(blocked) blocked,sum(challenged) challenged,sum(rate_limited) rate_limited,sum(cache_hits) cache_hits,sum(status_5xx) status_5xx FROM site_stats_1m WHERE tenant_id={tenant_id:UUID} AND site_id={site_id:UUID} AND minute >= toStartOfMinute({from:DateTime64(3)}) AND minute < {to:DateTime64(3)}`, nil
 	case "timeseries":
-		return `SELECT minute,sum(requests) requests,sum(blocked) blocked,sum(challenged) challenged,sum(rate_limited) rate_limited,sum(cache_hits) cache_hits,sum(bytes_out) bytes_out,sum(status_5xx) status_5xx FROM site_stats_1m WHERE ` + whereStats + ` GROUP BY minute ORDER BY minute LIMIT {limit:UInt32}`, nil
+		return `SELECT minute,sum(requests) requests,sum(blocked) blocked,sum(challenged) challenged,sum(rate_limited) rate_limited,sum(cache_hits) cache_hits,sum(bytes_out) bytes_out,sum(status_5xx) status_5xx FROM site_stats_1m WHERE tenant_id={tenant_id:UUID} AND site_id={site_id:UUID} AND minute >= toStartOfMinute({from:DateTime64(3)}) AND minute < {to:DateTime64(3)} GROUP BY minute ORDER BY minute LIMIT {limit:UInt32}`, nil
 	case "top":
-		return fmt.Sprintf(`SELECT rule_id,count() hits FROM security_events WHERE %s GROUP BY rule_id ORDER BY hits DESC,rule_id LIMIT {limit:UInt32}`, whereEvents), nil
+		return `SELECT rule_id,count() hits FROM security_events WHERE tenant_id={tenant_id:UUID} AND site_id={site_id:UUID} AND ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} GROUP BY rule_id ORDER BY hits DESC,rule_id LIMIT {limit:UInt32}`, nil
 	default:
 		return "", errors.New("unsupported analytics view")
 	}
 }
 
-func (c ClickHouseHTTP) query(ctx context.Context, sql string, params url.Values) ([]byte, error) {
+func (c ClickHouseHTTP) query(ctx context.Context, sql string, params url.Values) (_ []byte, retErr error) {
 	base, err := url.Parse(c.Endpoint)
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
 		return nil, errors.New("invalid ClickHouse endpoint")
@@ -160,7 +158,7 @@ func (c ClickHouseHTTP) query(ctx context.Context, sql string, params url.Values
 	if err != nil {
 		return nil, fmt.Errorf("ClickHouse query: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { retErr = errors.Join(retErr, resp.Body.Close()) }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20+1))
 	if err != nil {
 		return nil, err

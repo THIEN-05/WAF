@@ -78,7 +78,7 @@ func (c ClickHouseHTTP) Write(ctx context.Context, rows Rows) error {
 				return err
 			}
 		}
-		if err := c.insert(ctx, client, "security_events", body.Bytes()); err != nil {
+		if err := c.insert(ctx, client, "INSERT INTO security_events FORMAT JSONEachRow", body.Bytes()); err != nil {
 			return err
 		}
 	}
@@ -90,21 +90,21 @@ func (c ClickHouseHTTP) Write(ctx context.Context, rows Rows) error {
 				return err
 			}
 		}
-		if err := c.insert(ctx, client, "site_stats_1m", body.Bytes()); err != nil {
+		if err := c.insert(ctx, client, "INSERT INTO site_stats_1m FORMAT JSONEachRow", body.Bytes()); err != nil {
 			return &PartialWriteError{Failed: Rows{Stats: rows.Stats}, Cause: err}
 		}
 	}
 	return nil
 }
 
-func (c ClickHouseHTTP) insert(ctx context.Context, client *http.Client, table string, body []byte) error {
+func (c ClickHouseHTTP) insert(ctx context.Context, client *http.Client, statement string, body []byte) (retErr error) {
 	base, err := url.Parse(c.Endpoint)
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
 		return errors.New("invalid ClickHouse endpoint")
 	}
 	query := url.Values{}
 	query.Set("database", c.Database)
-	query.Set("query", "INSERT INTO "+table+" FORMAT JSONEachRow")
+	query.Set("query", statement)
 	base.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.String(), bytes.NewReader(body))
 	if err != nil {
@@ -118,7 +118,7 @@ func (c ClickHouseHTTP) insert(ctx context.Context, client *http.Client, table s
 	if err != nil {
 		return fmt.Errorf("ClickHouse insert: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { retErr = errors.Join(retErr, resp.Body.Close()) }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return fmt.Errorf("ClickHouse insert rejected (status %d): %s", resp.StatusCode, strings.TrimSpace(string(message)))
