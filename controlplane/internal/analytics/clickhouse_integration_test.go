@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -56,14 +57,19 @@ func TestClickHouseBatchRetentionAndTenantPredicatesIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	var actual struct {
-		Count     uint64 `json:"count"`
-		Retention uint16 `json:"retention_days"`
+		Count     json.RawMessage `json:"count"`
+		Retention uint16          `json:"retention_days"`
 	}
 	if err = json.Unmarshal(result, &actual); err != nil {
 		t.Fatal(err)
 	}
-	if actual.Count != 1 || actual.Retention != 7 {
-		t.Fatalf("tenant-scoped rows=%d retention=%d, want 1/7", actual.Count, actual.Retention)
+	countText := strings.Trim(string(actual.Count), `"`)
+	count, parseErr := strconv.ParseUint(countText, 10, 64)
+	if parseErr != nil {
+		t.Fatalf("parse ClickHouse UInt64 count %s: %v", actual.Count, parseErr)
+	}
+	if count != 1 || actual.Retention != 7 {
+		t.Fatalf("tenant-scoped rows=%d retention=%d, want 1/7", count, actual.Retention)
 	}
 	bad := Rows{Events: []EventRow{{Event: wafcore.LogEvent{TS: now, TenantID: "not-a-uuid", SiteID: siteA}, RetentionDays: 7}}}
 	if err = client.Write(context.Background(), bad); err == nil {
