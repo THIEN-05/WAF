@@ -249,6 +249,7 @@ func fixtureCleanupStatements(tenants, users []uuid.UUID, roles []cleanupRole, k
 		group := pgx.Identifier{role.group}.Sanitize()
 		statements = append(statements,
 			cleanupStatement{`REVOKE ` + group + ` FROM ` + ident, nil},
+			cleanupStatement{`DROP OWNED BY ` + ident, nil},
 			cleanupStatement{`DROP ROLE IF EXISTS ` + ident, nil},
 		)
 	}
